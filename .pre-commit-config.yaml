@@ -124,6 +124,14 @@ repos:
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
+      # DL begin
+      - id: dl-markers
+        name: DLIN marker check (# DL begin/end)
+        entry: python3 scripts/dl/check_dl_markers.py
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      # DL end
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:
