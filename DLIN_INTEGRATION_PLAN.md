@@ -272,3 +272,38 @@ NVIDIA CI.
 - **mooncake**: `run_mooncake.sh` (6-phase uv→bundle→compile→wheel→test),
   cmake `-DUSE_DLIN=ON -DDLIN_ROOT=$SDK`, exports
   `LD_LIBRARY_PATH=$SDK/lib:$SDK/lib/stub`.
+
+---
+
+## 7. Known runtime blocker — triton JIT crashes the DLIN host runtime
+
+**Status (2026-06-26): blocks end-to-end inference on the host. Deferred for
+follow-up; does NOT block the sglang-side wiring (all done, see §0/§2/§5).**
+
+Reproducible in-process with a clean env (`LD_LIBRARY_PATH=$SDK/lib` only,
+venv-first PATH): non-trivial triton kernels segfault on the DLIN device.
+
+| triton kernel | result |
+|---|---|
+| vector-add (1-D, elementwise) | sometimes rc=0 (flaky) |
+| **matmul** (`tl.dot` / tensor cores) | **rc=139 SIGSEGV** |
+| **softmax** (reductions, no `tl.dot`) | **rc=139 SIGSEGV** |
+
+Crash frame (gdb): `dl::hc::ModuleImpl::GenSingleKernel` → `loadBinary` — the
+DLIN runtime's kernel-binary loader crashes on triton-generated binaries.
+
+Ruled out: NOT sglang code, NOT the FA backend (DLIN FA2 works in isolation:
+varlen prefill returns correct output), NOT sgl-kernel (AOT ops run), NOT env
+contamination (reproduced with `env -u LD_LIBRARY_PATH` + clean PATH, across
+all local SDKs).
+
+Suspected fix (needs follow-up):
+- The installed triton is the **vanilla `manylinux_2_17`** from `dl-virtual`.
+  Denglin blesses a **`manylinux_2_28`** triton shipped inside the SDK tarball
+  (`artifactory/download` → `wheels/pytorch2.7.1/cp312/triton-3.1.0-cp312-cp312-manylinux_2_28_x86_64.whl`),
+  which is presumably patched to emit DLIN-loadable binaries. SDK repos need
+  auth (403 / `~/.netrc`) — not fetchable in this env.
+- Or run under Docker (`dev_ai.sh`); the dl-env skill notes host JIT is unreliable.
+
+Repro snippets: `/tmp/dl_triton_matmul.py`, `/tmp/dl_triton_softmax.py`,
+`/tmp/dl_fa2_test.py` (FA2, works). See memory `dlin-sglang-adaptation`.
