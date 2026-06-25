@@ -30,15 +30,24 @@ def _get_version():
 
 
 operator_namespace = "sgl_kernel"
-include_dirs = [root / "include", root / "include" / "impl", root / "csrc"]
+include_dirs = [
+    root / "include",
+    root / "include" / "impl",
+    root / "csrc",
+    root / "3rdparty" / "shims",  # DL: libcudacxx shim (cuda/functional -> cuda/std/functional)
+]
 
-# FlashInfer/CUTLASS/libcudacxx-free subset; each entry backs an op registered
-# in common_extension_dl.cc. Grow this set in later phases (needs FetchContent).
+# FlashInfer/CUTLASS-free subset; each entry backs an op registered in
+# common_extension_dl.cc. The libcudacxx shim (3rdparty/shims) covers the
+# `cuda/functional` include so the moe_topk kernels compile. Grow this set
+# further once FlashInfer/CUTLASS headers are vendored (plan §5).
 sources = [
     "csrc/common_extension_dl.cc",
     "csrc/elementwise/topk.cu",
     "csrc/elementwise/pos_enc.cu",
     "csrc/moe/moe_align_kernel.cu",
+    "csrc/moe/moe_topk_softmax_kernels.cu",
+    "csrc/moe/moe_topk_sigmoid_kernels.cu",
     "csrc/memory/weak_ref_tensor.cpp",
 ]
 

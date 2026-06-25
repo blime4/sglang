@@ -35,6 +35,17 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
+  // csrc/moe/moe_topk_{softmax,sigmoid}_kernels.cu (libcudacxx shim for cuda/functional)
+  m.def(
+      "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
+      "moe_softcapping, Tensor? correction_bias) -> ()");
+  m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
+
+  m.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
+
   // csrc/memory/weak_ref_tensor.cpp
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
