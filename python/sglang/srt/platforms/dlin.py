@@ -34,10 +34,10 @@ class DlinSRTPlatform(CudaSRTPlatform):
         return DeviceCapability(major=12, minor=0)
 
     def get_default_attention_backend(self) -> str:
-        # Phase 1: "triton" runs on-device via the DLIN torch. Phase 2 will
-        # register a DLIN flash-attention backend and return it here.
-        # TODO(DL): return the DLIN flash-attn backend once implemented.
-        return "triton"
+        # DLIN: use the FlashAttention backend, whose funcs are sourced from the
+        # DLIN flash_attn package (FA2) via jit_kernel/flash_attention_v3
+        # (`is_dlin()` branch). Mirrors vLLM's DlPlatform routing to FA2.
+        return "fa3"
 
 
 # DL end

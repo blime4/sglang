@@ -32,6 +32,9 @@ SDK: `MRrc-4.2.0-202606161052` (`SDK_DIR`). DLIN torch: `2.9.1+dl24.sdk202606031
 | **bf16 GPU matmul on DLIN device** (real JIT compile + run) | ✅ |
 | sglang editable install (`0.5.13.post2.dev560+…`) | ✅ |
 | Full `import sglang` + `current_platform`→`DlinSRTPlatform` | ✅ (triton-LLVM preload, §6) |
+| `sgl-kernel common_ops` **built with dlcc** (real ops run on DLIN GPU) | ✅ partial (§5: clean-source subset) |
+| `sglang.Engine` **imports** (was blocked by `sgl_kernel`) | ✅ |
+| `sglang.Engine(...)` actually loads a model + generates | ❌ next blocker: FlashInfer/CUTLASS ops (§5) |
 
 **Critical environment rule** (the root cause of every "DLIN segfault" seen
 during bring-up): `LD_LIBRARY_PATH` must contain **only the active SDK's

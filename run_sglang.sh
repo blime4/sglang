@@ -158,36 +158,41 @@ PY
 }
 
 #-------------------------------------------------------------------------------
-# Phase: build-kernel (best effort, dlcc)
-#   sgl-kernel's CMakeLists hardcodes NVIDIA gencode (sm_90/...) and FetchContent
-#   pulls CUTLASS/FlashInfer/FlashAttention. Building the FULL kernel set under
-#   dlcc needs arch overrides (+dl arch) and source filtering — that is the
-#   operator-integration plan (deliverable #4). Here we attempt a build and
-#   report the outcome without failing `all`.
+# Phase: build-kernel (dlcc, via setup_dl.py)
+#   Builds sgl-kernel's common_ops extension with dlcc using the per-backend
+#   setup_dl.py (torch CUDAExtension — torch's dl-aware cpp_extension drives
+#   dlcc + --cuda-gpu-arch=dlgput64 automatically). The default CMake/scikit-build
+#   path is NOT used: CMake's enable_language(CUDA) can't see dlcc, and the
+#   CMakeLists hardcode NVIDIA gencode.
+#   Source set is a flashinfer/CUTLASS/libcudacxx-free subset; coverage grows
+#   as those headers are fetched in later phases (see plan §5).
 #-------------------------------------------------------------------------------
 phase_build_kernel() {
-  log "Phase [build-kernel]: sgl-kernel from source with dlcc (best effort)"
+  log "Phase [build-kernel]: sgl-kernel common_ops via dlcc (setup_dl.py)"
   if [ "${SKIP_KERNEL:-0}" = "1" ]; then warn "SKIP_KERNEL=1 -> skipping"; return 0; fi
   [ -n "${VIRTUAL_ENV:-}" ] || die "run 'setup' first (venv not active)"
-  source "$SDK_DIR/env.sh" >/dev/null 2>&1
-  export CUDA_HOME="${CUDA_HOME:-$SDK_DIR}"
+  dlin_runtime_env   # CUDA_HOME=$SDK, PATH includes $SDK/bin (so nvcc->dlcc wrapper works)
 
-  local nproc_all; nproc_all=$(nproc)
   pushd "$SGLANG_DIR/sgl-kernel" >/dev/null
-  # Point CMake at dlcc instead of nvcc; cap parallelism to avoid OOM.
-  if CCACHE_NOHASHDIR=true \
-       CMAKE_CUDA_COMPILER="$SDK_DIR/bin/dlcc" \
-       TORCH_CUDA_ARCH_LIST="dl" \
-       MAX_JOBS="${MAX_JOBS:-$(( nproc_all / 2 > 16 ? 16 : nproc_all / 2 ))}" \
-       CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS:-$(( nproc_all / 2 > 16 ? 16 : nproc_all / 2 ))}" \
-       uv pip install -e . --no-build-isolation -v; then
-    ok "sgl-kernel built and installed."
-    python -c "import sgl_kernel; print('sgl_kernel', getattr(sgl_kernel,'__version__','?'))" \
-      || warn "sgl-kernel built but import failed at runtime"
+  # DL begin
+  # Swap in the DLIN pyproject (setuptools backend, package discovery) so the
+  # editable install does NOT trigger the default scikit-build/CMake path.
+  local py py_dl bak
+  py=pyproject.toml; py_dl=pyproject_dl.toml; bak=pyproject.toml.cuda-bak
+  [ -f "$py_dl" ] || die "missing $py_dl"
+  [ -f "$bak" ] || cp "$py" "$bak"
+  cp "$py_dl" "$py"
+  # Install the python wrapper package (editable), then build the dlcc .so in place.
+  uv pip install -e . --no-build-isolation
+  cp "$bak" "$py"   # restore original CUDA pyproject
+  if python setup_dl.py build_ext --inplace; then
+    # Editable install points at python/sgl_kernel/, where build_ext --inplace
+    # dropped the .so, so `import sgl_kernel` already sees it.
+    ok "sgl-kernel common_ops built (dlcc) and installed (editable)."
   else
-    warn "sgl-kernel full build did not complete under dlcc (expected for first pass)."
-    warn "sglang still imports without it (try/except fallback). See operator-integration plan."
+    warn "sgl-kernel build did not complete under dlcc. See plan §5 for the header-dep roadmap."
   fi
+  # DL end
   popd >/dev/null
 }
 

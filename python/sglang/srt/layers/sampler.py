@@ -26,14 +26,28 @@ from sglang.srt.utils.common import (
 )
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    # DL begin
+    # flashinfer and some sgl_kernel renorm ops are not available on DLIN. Guard
+    # the imports so the sampler module still loads; the "pytorch" sampling
+    # backend (top_k_top_p_min_p_sampling_from_probs_torch) handles sampling
+    # without flashinfer. Mirrors the is_musa()/aiter optional-import pattern.
+    try:
+        from flashinfer.sampling import (
+            min_p_sampling_from_probs,
+            top_k_top_p_sampling_from_probs,
+        )
+    except ImportError:
+        min_p_sampling_from_probs = None
+        top_k_top_p_sampling_from_probs = None
+    try:
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+        )
+    except (ImportError, AttributeError):
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
+    # DL end
 
 if is_musa():
     from sgl_kernel import (

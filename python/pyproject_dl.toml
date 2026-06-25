@@ -88,6 +88,7 @@ srt_dl = [
   "sglang[runtime_common]",
   "torch==2.9.1+dl24.sdk202606031721",
   "triton==3.1.0",
+  "flash-attn==2.8.4+torch291.sdk202606031721",  # DLIN Flash Attention (FA2)
 ]
 # DL end
 
