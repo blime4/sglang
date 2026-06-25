@@ -181,19 +181,20 @@ class FlashAttentionBackend(AttentionBackend):
         # Select version
         self.fa_impl_ver = fa_impl_ver
         # DL begin
-        # DLIN: use the DLIN Flash Attention (FA2) from the `flash_attn` package,
-        # routed through sglang.jit_kernel.flash_attention (whose loader returns
-        # DLIN FA2 via is_dlin() in flash_attention_v3). Mirrors vLLM's
-        # DlPlatform routing to FA2. FA3-only scheduler_metadata is unused.
+        # DLIN: use the DLIN Flash Attention (FA2) wrappers (dl_flash_attn) that
+        # translate the FA3-style call the backend makes into FA2 conventions
+        # (page_table->block_table, strip FA3-only kwargs, honor out=). This
+        # bypasses the FA3 shim, which builds FA3 positional args that segfault
+        # FA2. Mirrors vLLM's DlPlatform routing to FA2.
         from sglang.srt.utils.common import is_dlin
 
         if is_dlin():
-            from sglang.jit_kernel.flash_attention import (
+            from sglang.srt.layers.attention.dl_flash_attn import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
             )
 
-            self._get_scheduler_metadata = None
+            self._get_scheduler_metadata = None  # FA3-only; unused on DLIN FA2
         elif self.fa_impl_ver == 3:
         # DL end
             from sgl_kernel.flash_attn import (
