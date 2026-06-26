@@ -16,8 +16,9 @@
 #   gen          QUICK TEST: end-to-end Qwen3 generation on DLIN (in-process
 #                sglang.Engine). The handy one for verifying a model runs.
 #   serve        launch the OpenAI-compatible HTTP server (launch_server).
-#                NOTE: currently fails on DLIN (eager flashinfer import in
-#                multimodal models); use 'gen' until that is guarded.
+#   bench        concurrent serving benchmark (wraps sglang.bench_serving;
+#                auto-starts a server) or --offline per-batch latency
+#                (sglang.bench_one_batch, no server).
 #   all          setup -> build-kernel -> install -> test  (default)
 #
 # Usage:
@@ -27,6 +28,8 @@
 #   ./run_sglang.sh gen                   # quick e2e generation (default Qwen3-1.7B)
 #   ./run_sglang.sh gen -m /opt/dataset/Qwen3-1.7B -p "Hello" -n 32
 #   ./run_sglang.sh serve --port 30000
+#   ./run_sglang.sh bench -c 32 --num-prompts 200   # concurrent bench (autostarts server)
+#   ./run_sglang.sh bench --offline                  # per-batch latency, no server
 #
 # gen / serve options (override the env vars below):
 #   -m, --model PATH         model path           (default $MODEL_PATH)
@@ -35,6 +38,8 @@
 #   -b, --backend NAME       attention backend   (default fa3)
 #   -g, --cuda-graph         enable cuda graph   (default off; safer on DLIN)
 #   --port N / --host H      serve only          (default 30000 / 127.0.0.1)
+# bench options: -c/--concurrency, --num-prompts, --input-len/--output-len,
+#   --batch-size '1 4 8 16', --base-url URL, --offline
 #
 # Env overrides (all optional):
 #   SDK_DIR          DLIN SDK root (env.sh). Default: see below.
@@ -82,6 +87,20 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
 PROMPT="${PROMPT:-}"                          # empty -> builtin demo prompts
 SERVE_PORT="${SERVE_PORT:-30000}"
 SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
+
+# bench options (wraps sglang's official bench_serving / bench_one_batch).
+# NOTE: concurrency defaults to 1 -- the DLIN server crashes under batched
+# prefill (extend) once >~2 requests overlap, because the DLIN FA2 wrapper's
+# q.reshape (jit_kernel/flash_attention.py, flash_attn_with_kvcache DLIN branch)
+# assumes a uniform seqlen per batch row. Raising -c probes the ceiling; real
+# concurrency needs that wrapper routed to flash_attn_varlen_func (ragged).
+BENCH_CONCURRENCY="${BENCH_CONCURRENCY:-1}"      # --max-concurrency (online)
+BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-64}"     # total requests (online)
+BENCH_INPUT_LEN="${BENCH_INPUT_LEN:-1024}"       # random prompt len (online)
+BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-128}"      # random output len (online)
+BATCH_SIZE="${BATCH_SIZE:-1 4 8 16}"             # --batch-size sweep (offline)
+BENCH_BASE_URL="${BENCH_BASE_URL:-}"             # nonempty -> bench external server
+BENCH_OFFLINE="${BENCH_OFFLINE:-0}"              # 1 -> bench_one_batch (no server)
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -330,7 +349,9 @@ Usage:
 Quick tests (handy for verifying a model runs on DLIN):
   ./run_sglang.sh gen                   # end-to-end generation (default Qwen3-1.7B)
   ./run_sglang.sh gen -m <model> -p "prompt" -n 32 -b fa3
-  ./run_sglang.sh serve --port 30000    # HTTP server (NOTE: blocked by flashinfer on DLIN)
+  ./run_sglang.sh serve --port 30000    # HTTP server (OpenAI-compatible)
+  ./run_sglang.sh bench -c 16           # concurrent bench (auto-starts a server)
+  ./run_sglang.sh bench --offline       # per-batch latency, no server (bench_one_batch)
 
 gen/serve options:
   -m, --model PATH          model path        (default /opt/dataset/Qwen3-1.7B)
@@ -340,6 +361,19 @@ gen/serve options:
   -g, --cuda-graph          enable cuda graph (default off; safer on DLIN)
   --port N / --host H       serve only        (default 30000 / 127.0.0.1)
 
+bench options (wraps sglang's official bench_serving / bench_one_batch):
+  -c, --concurrency N       max concurrent requests   (default 1; see note)
+  --num-prompts N           total requests            (default 64)
+  --input-len/--output-len  random prompt/output lens (default 1024 / 128)
+  --batch-size '1 4 8 16'   offline batch-size sweep
+  --base-url URL            bench an external server (skip autostart)
+  --offline                 bench_one_batch (no server; per-batch latency)
+  Online bench auto-starts a server on --port if none is up, runs bench_serving
+  (throughput, TTFT, ITL, p50/p99), then stops it. Result JSON: /tmp/sglang_bench_*.json
+  NOTE: concurrency defaults to 1 -- on DLIN the server crashes once >~2 requests
+  overlap a prefill batch (DLIN FA2 q.reshape in jit_kernel/flash_attention.py).
+  Raise -c to probe the ceiling; fix = route batched extend to flash_attn_varlen_func.
+
 Env overrides: SDK_DIR, VENV_DIR, TORCH_SPEC, SKIP_KERNEL,
                MODEL_PATH, ATTN_BACKEND, USE_CUDA_GRAPH, MAX_NEW_TOKENS, PROMPT, ...
 EOF
@@ -348,15 +382,23 @@ EOF
 parse_test_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      -m|--model)         MODEL_PATH="$2"; shift 2;;
-      -p|--prompt)        PROMPT="$2"; shift 2;;
+      -m|--model)          MODEL_PATH="$2"; shift 2;;
+      -p|--prompt)         PROMPT="$2"; shift 2;;
       -n|--max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
-      -b|--backend)       ATTN_BACKEND="$2"; shift 2;;
-      -g|--cuda-graph)    USE_CUDA_GRAPH=1; shift;;
-      --port)             SERVE_PORT="$2"; shift 2;;
-      --host)             SERVE_HOST="$2"; shift 2;;
-      -h|--help)          usage; exit 0;;
-      *) die "unknown option '$1' for '$PHASE' (see -h: -m -p -n -b -g --port --host)";;
+      -b|--backend)        ATTN_BACKEND="$2"; shift 2;;
+      -g|--cuda-graph)     USE_CUDA_GRAPH=1; shift;;
+      --port)              SERVE_PORT="$2"; shift 2;;
+      --host)              SERVE_HOST="$2"; shift 2;;
+      # bench
+      -c|--concurrency)    BENCH_CONCURRENCY="$2"; shift 2;;
+      --num-prompts)       BENCH_NUM_PROMPTS="$2"; shift 2;;
+      --input-len)         BENCH_INPUT_LEN="$2"; shift 2;;
+      --output-len)        BENCH_OUTPUT_LEN="$2"; shift 2;;
+      --batch-size)        BATCH_SIZE="$2"; shift 2;;
+      --base-url)          BENCH_BASE_URL="$2"; shift 2;;
+      --offline)           BENCH_OFFLINE=1; shift;;
+      -h|--help)           usage; exit 0;;
+      *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
   done
 }
@@ -390,8 +432,6 @@ phase_gen() {
 #-------------------------------------------------------------------------------
 phase_serve() {
   log "Phase [serve]: HTTP server on DLIN (launch_server)"
-  warn "launch_server currently fails on DLIN: ModuleNotFoundError: flashinfer"
-  warn "(eager multimodal-model import; in-process 'gen' works). Proceeding anyway..."
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
   dlin_runtime_env
   local cg_flag=""
@@ -404,12 +444,115 @@ phase_serve() {
 }
 
 #-------------------------------------------------------------------------------
+# Server lifecycle helpers (shared by serve-foreground and bench-autostart).
+# launch_server spawns scheduler subprocesses, so we kill the whole process group.
+#-------------------------------------------------------------------------------
+health_up() {  # $1=url -> 0 if /health responds
+  curl -s -o /dev/null --max-time 3 "$1/health" 2>/dev/null
+}
+wait_for_server() {  # $1=url  $2=timeout_s
+  local url="$1" t="${2:-240}" elapsed=0
+  while [ "$elapsed" -lt "$t" ]; do
+    health_up "$url" && return 0
+    sleep 5; elapsed=$((elapsed + 5))
+  done
+  return 1
+}
+start_server_bg() {  # launches launch_server detached; sets SERVER_PID
+  local cg_flag=""
+  [ "$USE_CUDA_GRAPH" = "1" ] || cg_flag="--disable-cuda-graph"
+  BENCH_LOG="${BENCH_LOG:-/tmp/sglang_bench_server.log}"
+  nohup python -m sglang.launch_server \
+    --model-path "$MODEL_PATH" --page-size 16 --dtype bfloat16 \
+    --attention-backend "$ATTN_BACKEND" $cg_flag \
+    --port "$SERVE_PORT" --host "$SERVE_HOST" \
+    > "$BENCH_LOG" 2>&1 &
+  SERVER_PID=$!
+}
+stop_server() {
+  [ -n "${SERVER_PID:-}" ] || return 0
+  local pgid
+  pgid=$(ps -o pgid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')
+  if [ -n "$pgid" ]; then
+    kill -TERM -"$pgid" 2>/dev/null; sleep 3
+    kill -KILL -"$pgid" 2>/dev/null || true
+  fi
+  SERVER_PID=""
+}
+
+#-------------------------------------------------------------------------------
+# Phase: bench -- concurrent serving benchmark. Wraps sglang's official tools:
+#   * online (default): bench_serving vs a server. Auto-starts one on
+#     $SERVE_HOST:$SERVE_PORT if none is up (or use --base-url for external).
+#   * --offline: bench_one_batch spins its own engine (no server), sweeps
+#     --batch-size for per-batch prefill/decode latency.
+#-------------------------------------------------------------------------------
+phase_bench() {
+  log "Phase [bench]: concurrent serving benchmark"
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+  dlin_runtime_env
+  command -v curl >/dev/null || die "curl is required for bench"
+
+  # Force local-only HF/transformers: the bench client loads a tokenizer, and on
+  # an offline host huggingface_hub's httpx client throws "client has been
+  # closed"; offline mode makes it read the model dir directly. Also picks the
+  # ShareGPT-free 'random-ids' dataset (the 'random' one downloads ShareGPT).
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  if [ "$BENCH_CONCURRENCY" -gt 1 ] 2>/dev/null; then
+    warn "concurrency=$BENCH_CONCURRENCY: the DLIN server crashes once >~2 requests"
+    warn "overlap a prefill batch (DLIN FA2 q.reshape, jit_kernel/flash_attention.py)."
+    warn "If it dies, retry with -c 1 (stable single-stream)."
+  fi
+
+  if [ "$BENCH_OFFLINE" = "1" ]; then
+    log "[offline] bench_one_batch | model=$MODEL_PATH backend=$ATTN_BACKEND batch-size='$BATCH_SIZE'"
+    python -m sglang.bench_one_batch \
+      --model-path "$MODEL_PATH" --page-size 16 --dtype bfloat16 \
+      --attention-backend "$ATTN_BACKEND" \
+      $( [ "$USE_CUDA_GRAPH" = "1" ] || echo --disable-cuda-graph ) \
+      --batch-size $BATCH_SIZE --input-len "$BENCH_INPUT_LEN" --output-len "$BENCH_OUTPUT_LEN"
+    return
+  fi
+
+  local url autostarted=0
+  if [ -n "$BENCH_BASE_URL" ]; then
+    url="$BENCH_BASE_URL"
+  else
+    url="http://$SERVE_HOST:$SERVE_PORT"
+    if ! health_up "$url"; then
+      log "no server at $url -> autostarting (log: /tmp/sglang_bench_server.log)"
+      start_server_bg
+      autostarted=1
+      wait_for_server "$url" 300 || { warn "server log tail:"; tail -n 15 /tmp/sglang_bench_server.log; stop_server; die "server did not become ready"; }
+      ok "server ready at $url"
+    else
+      log "using existing server at $url"
+    fi
+  fi
+  [ "$autostarted" = "1" ] && trap stop_server EXIT INT TERM
+
+  local outfile="/tmp/sglang_bench_$(basename "$MODEL_PATH").json"
+  log "[online] bench_serving | url=$url concurrency=$BENCH_CONCURRENCY num-prompts=$BENCH_NUM_PROMPTS in/out=$BENCH_INPUT_LEN/$BENCH_OUTPUT_LEN"
+  python -m sglang.bench_serving \
+    --backend sglang-oai --base-url "$url" --model "$MODEL_PATH" \
+    --tokenizer "$MODEL_PATH" \
+    --dataset-name random-ids --num-prompts "$BENCH_NUM_PROMPTS" \
+    --random-input-len "$BENCH_INPUT_LEN" --random-output-len "$BENCH_OUTPUT_LEN" \
+    --max-concurrency "$BENCH_CONCURRENCY" \
+    --output-file "$outfile"
+  local rc=$?
+  [ "$autostarted" = "1" ] && { log "stopping autostarted server"; stop_server; }
+  [ $rc -eq 0 ] && ok "bench done. results: $outfile"
+  return $rc
+}
+
+#-------------------------------------------------------------------------------
 # Dispatch. gen/serve parse their trailing flags first; everything else ignores
 # extra args (backward compatible with the original positional phases).
 #-------------------------------------------------------------------------------
 PHASE="${1:-all}"; shift || true
 case "$PHASE" in
-  gen|serve) parse_test_args "$@" ;;
+  gen|serve|bench) parse_test_args "$@" ;;
 esac
 
 case "$PHASE" in
@@ -419,6 +562,7 @@ case "$PHASE" in
   test|smoke)   source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_test ;;
   gen)          source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_gen ;;
   serve)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_serve ;;
+  bench)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_bench ;;
   all)
     phase_setup
     phase_build_kernel || warn "build-kernel phase best-effort; continuing"
@@ -426,6 +570,6 @@ case "$PHASE" in
     phase_test
     ;;
   -h|--help|help) usage; exit 0 ;;
-  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|all)" ;;
+  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|all)" ;;
 esac
 ok "Done ($PHASE)."
