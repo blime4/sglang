@@ -39,7 +39,9 @@ EXEMPT_GLOBS = [
 ]
 
 # Source files whose inline edits must carry DL markers.
-CHECKABLE_EXT = {".py", ".cc", ".cu", ".cpp", ".c", ".h", ".cuh", ".hpp",
+# C/C++ headers (.h/.cuh/.hpp) use #if defined(SGL_ON_DLIN) preprocessor guards
+# (greppable) instead of comment markers — excluded from per-line checks.
+CHECKABLE_EXT = {".py", ".cc", ".cu", ".cpp", ".c",
                  ".toml", ".cmake", ".in", ".sh", ".yaml", ".yml"}
 CMAKEFILE_RE = re.compile(r"(^|/)CMakeLists\.txt$")
 
@@ -47,6 +49,10 @@ CMAKEFILE_RE = re.compile(r"(^|/)CMakeLists\.txt$")
 DL_BEGIN = re.compile(r"^\s*(#|//)\s*DL\s+begin\b")
 DL_END = re.compile(r"^\s*(#|//)\s*DL\s+end\b")
 DL_INLINE = re.compile(r"(#|//)\s*DL(:|\b)")  # '# DL:' / '// DL:' / '# DL end'
+# C/C++ preprocessor DL guards also count as DL markers.
+DL_GUARD = re.compile(r"SGL_ON_DLIN|USE_DLIN")
+# Preprocessor directives are structural, not content — tolerate like blank lines.
+PREPROC = re.compile(r"^\s*#(if|elif|else|endif|ifdef|ifndef|pragma)\b")
 
 
 def is_exempt(path: str) -> bool:
@@ -74,7 +80,7 @@ def dl_marked_lines(text: str) -> set[int]:
             marked.add(i)
             in_dl = False
             continue
-        if in_dl or DL_INLINE.search(line):
+        if in_dl or DL_INLINE.search(line) or DL_GUARD.search(line):
             marked.add(i)
     return marked
 
@@ -119,6 +125,8 @@ def check_file(path: str) -> list[str]:
             continue
         content = lines[ln - 1] if 0 < ln <= len(lines) else ""
         if not content.strip():  # blank lines are tolerated
+            continue
+        if PREPROC.search(content):  # preprocessor directives are structural
             continue
         if content.strip() in removed:  # pure move (line shifted, not a DL edit)
             continue

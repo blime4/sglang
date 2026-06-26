@@ -260,6 +260,14 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        # DL begin
+        # DLIN: the AOT sgl_kernel rmsnorm/fused_add_rmsnorm are not yet built
+        # (need FlashInfer headers); use the torch forward_native path until then.
+        from sglang.srt.utils.common import is_dlin
+
+        if is_dlin():
+            return self.forward_native(x, residual, post_residual_addition)
+        # DL end
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:

@@ -133,6 +133,45 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
+    # DL begin
+    # DLIN: call FA2 (flash_attn pkg) directly with FA2 conventions, bypassing
+    # the FA3 shim (which passes FA3 positional args / num_splits / sinks that
+    # FA2 doesn't accept). The shim's named params map cleanly to FA2.
+    from sglang.srt.utils.common import is_dlin as _is_dlin
+
+    if _is_dlin():
+        from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
+
+        # FA2 expects q as (batch, seqlen_q, nheads, headdim); sglang passes the
+        # flattened (num_tokens, nheads, headdim). For the paged decode path each
+        # batch row has seqlen_q=1 -> reshape.
+        # FA2 expects q as (batch, seqlen_q, nheads, headdim); sglang passes the
+        # flattened (num_tokens, nheads, headdim). Derive batch from cache_seqlens
+        # (prefill: batch=1, seqlen=N; decode: batch=N, seqlen=1).
+        _batch = cache_seqlens.shape[0] if torch.is_tensor(cache_seqlens) else 1
+        _seqq = q.shape[0] // _batch
+        _q = q.view(_batch, _seqq, q.shape[1], q.shape[2])
+        _o = _fa2_kvcache(
+            _q,
+            k_cache,
+            v_cache,
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens,
+            block_table=page_table,  # FA2 names paged-KV table "block_table"
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        # FA2 returns (batch, seqlen_q, nheads, headdim); flatten back to sglang layout.
+        _o = _o.view(-1, _o.shape[-2], _o.shape[-1]) if _o.dim() == 4 and q.dim() != 4 else _o
+        if out is not None:
+            out.copy_(_o)
+            return out
+        return _o
+    # DL end
+
     if ver == 3:
         return fa3_flash_attn_with_kvcache(
             q,
@@ -239,6 +278,32 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
 ):
+
+    # DL begin
+    # DLIN: call FA2 (flash_attn pkg) directly for the prefill/varlen path.
+    from sglang.srt.utils.common import is_dlin as _is_dlin
+
+    if _is_dlin():
+        from flash_attn import flash_attn_varlen_func as _fa2_varlen
+
+        _o = _fa2_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        if out is not None:
+            out.copy_(_o)
+            return out
+        return _o
+    # DL end
 
     if ver == 3:
         return fa3_flash_attn_varlen_func(

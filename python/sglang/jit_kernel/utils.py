@@ -389,12 +389,17 @@ def _get_default_target_flags() -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     else:
-        return [
-            get_jit_cuda_arch().jit_flag,
-            "-std=c++20",
-            "-O3",
-            "--expt-relaxed-constexpr",
-        ]
+        # DL begin
+        # DLIN's dlcc: no nvcc-only `--expt-relaxed-constexpr`; and the JIT shared
+        # header (utils.cuh) needs SGL_CUDA_ARCH to match dlgput64's
+        # __CUDA_ARCH__ (700) and a SGL_ON_DLIN define to take the DLIN launch
+        # path (no cudaLaunchKernelEx / cluster / PDL).
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+
+        if _is_dlin():
+            return ["-DSGL_CUDA_ARCH=700", "-DSGL_ON_DLIN=1", "-std=c++20", "-O3"]
+        return [get_jit_cuda_arch().jit_flag, "-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+        # DL end
 
 
 @contextmanager
