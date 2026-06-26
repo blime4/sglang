@@ -12,13 +12,29 @@
 #                 integration plan; this phase may be partial by design.)
 #   install      editable-install the sglang python package using the DLIN
 #                pyproject (python/pyproject_dl.toml). Non-destructive.
-#   test         import smoke (torch.version.dl + import sglang) + a CPU UT.
+#   test|smoke   import smoke (torch.version.dl + import sglang) + a GPU UT.
+#   gen          QUICK TEST: end-to-end Qwen3 generation on DLIN (in-process
+#                sglang.Engine). The handy one for verifying a model runs.
+#   serve        launch the OpenAI-compatible HTTP server (launch_server).
+#                NOTE: currently fails on DLIN (eager flashinfer import in
+#                multimodal models); use 'gen' until that is guarded.
 #   all          setup -> build-kernel -> install -> test  (default)
 #
 # Usage:
-#   ./run_sglang.sh             # run all phases
-#   ./run_sglang.sh setup       # just create/refresh the env
-#   ./run_sglang.sh test        # run the basic UT against an existing env
+#   ./run_sglang.sh                       # run all phases
+#   ./run_sglang.sh setup                 # just create/refresh the env
+#   ./run_sglang.sh test                  # import + GPU smoke against an existing env
+#   ./run_sglang.sh gen                   # quick e2e generation (default Qwen3-1.7B)
+#   ./run_sglang.sh gen -m /opt/dataset/Qwen3-1.7B -p "Hello" -n 32
+#   ./run_sglang.sh serve --port 30000
+#
+# gen / serve options (override the env vars below):
+#   -m, --model PATH         model path           (default $MODEL_PATH)
+#   -p, --prompt TEXT        single prompt       (default builtin demos)
+#   -n, --max-new-tokens N   decode length       (default 16)
+#   -b, --backend NAME       attention backend   (default fa3)
+#   -g, --cuda-graph         enable cuda graph   (default off; safer on DLIN)
+#   --port N / --host H      serve only          (default 30000 / 127.0.0.1)
 #
 # Env overrides (all optional):
 #   SDK_DIR          DLIN SDK root (env.sh). Default: see below.
@@ -27,6 +43,8 @@
 #   PYTHON_VERSION   default 3.12.
 #   TORCH_SPEC       torch pin (default: 2.9.1+dl24.sdk202606031721).
 #   SKIP_KERNEL=1    skip the build-kernel phase.
+#   Quick-test (gen/serve): MODEL_PATH, ATTN_BACKEND, USE_CUDA_GRAPH,
+#   MAX_NEW_TOKENS, PROMPT, SERVE_PORT, SERVE_HOST.
 #===============================================================================
 set -eo pipefail
 
@@ -53,7 +71,17 @@ DL_PYPI_INDEX="http://ext-artifactory.denglin.com:8082/artifactory/api/pypi/dl-p
 DL_VIRTUAL_INDEX="http://ext-artifactory.denglin.com:8082/artifactory/api/pypi/dl-virtual/simple"
 DL_HOST="ext-artifactory.denglin.com"
 
-PHASE="${1:-all}"
+#-------------------------------------------------------------------------------
+# Quick-test (gen/serve) config. Overridable by env vars AND by the gen/serve
+# CLI flags (-m/-p/-n/-b/-g, --port/--host). See header for the full list.
+#-------------------------------------------------------------------------------
+MODEL_PATH="${MODEL_PATH:-/opt/dataset/Qwen3-1.7B}"
+ATTN_BACKEND="${ATTN_BACKEND:-fa3}"          # fa3 -> FlashAttention -> DLIN FA2
+USE_CUDA_GRAPH="${USE_CUDA_GRAPH:-0}"         # 0 = disable_cuda_graph (safer on DLIN)
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
+PROMPT="${PROMPT:-}"                          # empty -> builtin demo prompts
+SERVE_PORT="${SERVE_PORT:-30000}"
+SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -286,17 +314,118 @@ PY
 }
 
 #-------------------------------------------------------------------------------
+# Usage + arg parsing for the quick-test phases (gen/serve).
+#-------------------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+run_sglang.sh — build/run SGLang on DLIN (登临) GPUs.
+
+Usage:
+  ./run_sglang.sh                       # all phases: setup -> build-kernel -> install -> test
+  ./run_sglang.sh setup                 # create/refresh the DLIN uv venv + torch
+  ./run_sglang.sh build-kernel          # build sgl-kernel with dlcc (best-effort)
+  ./run_sglang.sh install               # editable-install sglang (DLIN pyproject)
+  ./run_sglang.sh test | smoke          # import + GPU smoke (torch.version.dl, matmul, platform)
+
+Quick tests (handy for verifying a model runs on DLIN):
+  ./run_sglang.sh gen                   # end-to-end generation (default Qwen3-1.7B)
+  ./run_sglang.sh gen -m <model> -p "prompt" -n 32 -b fa3
+  ./run_sglang.sh serve --port 30000    # HTTP server (NOTE: blocked by flashinfer on DLIN)
+
+gen/serve options:
+  -m, --model PATH          model path        (default /opt/dataset/Qwen3-1.7B)
+  -p, --prompt TEXT         single prompt     (default: builtin demos)
+  -n, --max-new-tokens N    decode length     (default 16)
+  -b, --backend NAME        attention backend (default fa3; do not use 'triton' on DLIN)
+  -g, --cuda-graph          enable cuda graph (default off; safer on DLIN)
+  --port N / --host H       serve only        (default 30000 / 127.0.0.1)
+
+Env overrides: SDK_DIR, VENV_DIR, TORCH_SPEC, SKIP_KERNEL,
+               MODEL_PATH, ATTN_BACKEND, USE_CUDA_GRAPH, MAX_NEW_TOKENS, PROMPT, ...
+EOF
+}
+
+parse_test_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model)         MODEL_PATH="$2"; shift 2;;
+      -p|--prompt)        PROMPT="$2"; shift 2;;
+      -n|--max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
+      -b|--backend)       ATTN_BACKEND="$2"; shift 2;;
+      -g|--cuda-graph)    USE_CUDA_GRAPH=1; shift;;
+      --port)             SERVE_PORT="$2"; shift 2;;
+      --host)             SERVE_HOST="$2"; shift 2;;
+      -h|--help)          usage; exit 0;;
+      *) die "unknown option '$1' for '$PHASE' (see -h: -m -p -n -b -g --port --host)";;
+    esac
+  done
+}
+
+#-------------------------------------------------------------------------------
+# Phase: gen -- quick end-to-end generation on DLIN (in-process sglang.Engine).
+#   Reuses scripts/dl/run_qwen3_1_7b.py, driven by env vars.
+#   attention_backend=fa3 + disable_cuda_graph are the DLIN defaults (see header);
+#   they can be overridden with -b / -g, but the defaults are what actually runs.
+#-------------------------------------------------------------------------------
+phase_gen() {
+  log "Phase [gen]: end-to-end generation on DLIN (in-process Engine)"
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+  dlin_runtime_env
+  local gen_py="$SGLANG_DIR/scripts/dl/run_qwen3_1_7b.py"
+  [ -f "$gen_py" ] || die "missing $gen_py"
+
+  export MODEL_PATH ATTN_BACKEND USE_CUDA_GRAPH MAX_NEW_TOKENS PROMPT
+  log "model=$MODEL_PATH | backend=$ATTN_BACKEND | cuda_graph=$USE_CUDA_GRAPH | max_new_tokens=$MAX_NEW_TOKENS"
+  [ -n "$PROMPT" ] && log "prompt: $PROMPT" || log "prompt: <builtin demos>"
+  log "(first run JIT-compiles ~42 buckets, ~5 min; cached after -> <90s)"
+  python "$gen_py"
+}
+
+#-------------------------------------------------------------------------------
+# Phase: serve -- OpenAI-compatible HTTP server (launch_server) on DLIN.
+#   WARNING: currently exits at import time with ModuleNotFoundError: flashinfer
+#   (launch_server eagerly imports multimodal models that need flashinfer, which
+#   DLIN lacks). The in-process 'gen' path is unaffected. Kept here so it works
+#   unchanged once the flashinfer imports are guarded.
+#-------------------------------------------------------------------------------
+phase_serve() {
+  log "Phase [serve]: HTTP server on DLIN (launch_server)"
+  warn "launch_server currently fails on DLIN: ModuleNotFoundError: flashinfer"
+  warn "(eager multimodal-model import; in-process 'gen' works). Proceeding anyway..."
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+  dlin_runtime_env
+  local cg_flag=""
+  [ "$USE_CUDA_GRAPH" = "1" ] || cg_flag="--disable-cuda-graph"
+  log "model=$MODEL_PATH | backend=$ATTN_BACKEND | host=$SERVE_HOST:$SERVE_PORT"
+  exec python -m sglang.launch_server \
+    --model-path "$MODEL_PATH" --page-size 16 --dtype bfloat16 \
+    --attention-backend "$ATTN_BACKEND" $cg_flag \
+    --port "$SERVE_PORT" --host "$SERVE_HOST"
+}
+
+#-------------------------------------------------------------------------------
+# Dispatch. gen/serve parse their trailing flags first; everything else ignores
+# extra args (backward compatible with the original positional phases).
+#-------------------------------------------------------------------------------
+PHASE="${1:-all}"; shift || true
+case "$PHASE" in
+  gen|serve) parse_test_args "$@" ;;
+esac
+
 case "$PHASE" in
   setup)        phase_setup ;;
   build-kernel) phase_setup 2>/dev/null || true; source "$VENV_DIR/bin/activate" 2>/dev/null || true; phase_build_kernel ;;
   install)      source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_install ;;
-  test)         source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_test ;;
+  test|smoke)   source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_test ;;
+  gen)          source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_gen ;;
+  serve)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_serve ;;
   all)
     phase_setup
     phase_build_kernel || warn "build-kernel phase best-effort; continuing"
     phase_install
     phase_test
     ;;
-  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|all)" ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|all)" ;;
 esac
 ok "Done ($PHASE)."
