@@ -11,14 +11,21 @@ NEW = int(os.environ.get("MAX_NEW_TOKENS", "64"))
 RUNS = int(os.environ.get("RUNS", "3"))
 CG = os.environ.get("CUDA_GRAPH", "0") == "1"
 MEM_FRAC = float(os.environ.get("MEM_FRAC", "0.88"))
+CG_MAX_BS = int(os.environ.get("CG_MAX_BS", "0"))   # cuda_graph_max_bs_decode (0=default)
+CTX = int(os.environ.get("CONTEXT_LEN", "0"))        # context_length override (0=model default)
 
 
 def main():
-    engine = sglang.Engine(
+    kw = dict(
         model_path=MODEL, page_size=16, dtype="bfloat16",
         attention_backend=BACKEND, disable_cuda_graph=not CG,
         mem_fraction_static=MEM_FRAC,
     )
+    if CG and CG_MAX_BS:
+        kw["cuda_graph_max_bs_decode"] = CG_MAX_BS
+    if CTX:
+        kw["context_length"] = CTX
+    engine = sglang.Engine(**kw)
     prompt = "The capital of France is"
     # warmup (JIT compile + cuda-graph capture if enabled)
     engine.generate([prompt], sampling_params={"max_new_tokens": 8})

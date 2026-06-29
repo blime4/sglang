@@ -207,18 +207,18 @@ def flash_attn_with_kvcache(
                 return out
             return _o
 
-        # Workaround when no compiled DLIN vllm_flash_attn: gather the paged KV
-        # cache into a packed varlen layout and call flash_attn_varlen_func (the
-        # plain flash_attn pkg). Works but is NOT cuda-graph-capturable.
-        # DLIN dleol's paged-DECODE kernel (flash_attn_with_kvcache) crashes with
-        # "to bc failed" (driver bitcode-load bug, config-independent). The PREFILL
-        # kernel (flash_attn_varlen_func) works. Workaround for the standard decode
-        # path (paged, 1 q-token/seq, no new k/v): gather the paged KV cache into a
-        # packed varlen layout and call flash_attn_varlen_func. Validated vs torch
-        # SDPA to bf16 precision (scripts/dl/test_varlen_decode.py).
-        # NOTE: the boolean-mask gather materializes B*max_blocks*Pg*Hkv*D — fine
-        # for modest batch x context (the Qwen3 test); needs a fused gather kernel
-        # before large-batch production use.
+        # Workaround when no compiled DLIN vllm_flash_attn: pack the paged KV
+        # cache into a varlen layout and call flash_attn_varlen_func (plain
+        # flash_attn pkg). dleol's paged-DECODE kernel (flash_attn_with_kvcache)
+        # crashes ("to bc failed"); the prefill varlen kernel works.
+        # NOTE: the boolean-index gather (_gk[_mask]) and the int(_sl.max().item())
+        # host-sync make this path NOT cuda-graph-capturable (capture fails with
+        # "operation not permitted when stream is capturing"). A graph-safe
+        # scatter-packing variant was prototyped (scripts/dl/test_graphsafe_packed_
+        # decode.py) and CAPTURE succeeds with it, but it produced wrong output
+        # under the model (correctness bug, root cause not pinpointed) -- so the
+        # correct-but-non-graph gather is kept as the default until the DLIN
+        # vllm_flash_attn wheel lands (clean varlen+block_table, graph-safe).
         if (
             page_table is not None
             and torch.is_tensor(cache_seqlens)
