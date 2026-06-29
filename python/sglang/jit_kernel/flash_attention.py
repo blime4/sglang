@@ -6,6 +6,31 @@ from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
 
 
+# DL begin
+# Probe (once) whether a WORKING DLIN vllm_flash_attn is importable: it must
+# have the compiled _vllm_fa2_C extension that exposes varlen_fwd (the plain
+# pure-python stub does NOT). When present, decode can take the clean graph-safe
+# varlen+block_table path (the one vLLM uses); otherwise sglang falls back to
+# the gather workaround. See docs/dl/request-dl24-vllm-flash-attn-wheel.md.
+_DLIN_VLLM_FA_PROBED: Optional[bool] = None
+
+
+def _dlin_vllm_flash_attn_ok() -> bool:
+    global _DLIN_VLLM_FA_PROBED
+    if _DLIN_VLLM_FA_PROBED is None:
+        try:
+            import vllm_flash_attn  # noqa: F401
+
+            _ = torch.ops._vllm_fa2_C.varlen_fwd  # raises if no compiled _C
+            _DLIN_VLLM_FA_PROBED = True
+        except Exception:
+            _DLIN_VLLM_FA_PROBED = False
+    return _DLIN_VLLM_FA_PROBED
+
+
+# DL end
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -140,16 +165,108 @@ def flash_attn_with_kvcache(
     from sglang.srt.utils.common import is_dlin as _is_dlin
 
     if _is_dlin():
-        from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
-
-        # FA2 expects q as (batch, seqlen_q, nheads, headdim); sglang passes the
-        # flattened (num_tokens, nheads, headdim). For the paged decode path each
-        # batch row has seqlen_q=1 -> reshape.
-        # FA2 expects q as (batch, seqlen_q, nheads, headdim); sglang passes the
-        # flattened (num_tokens, nheads, headdim). Derive batch from cache_seqlens
-        # (prefill: batch=1, seqlen=N; decode: batch=N, seqlen=1).
         _batch = cache_seqlens.shape[0] if torch.is_tensor(cache_seqlens) else 1
         _seqq = q.shape[0] // _batch
+
+        # Prefer the CLEAN, graph-safe path when a compiled DLIN vllm_flash_attn
+        # is available: varlen + block_table (the path vLLM uses ->
+        # cudnnMHAVarlenForward*, which works and is cuda-graph-capturable).
+        # All tensors are fixed-shape; seqused_k carries per-seq lengths as a
+        # runtime value; max_seqlen_k is a shape-derived upper bound (no .item()
+        # host-sync) so this path stays graph-safe. See
+        # docs/dl/request-dl24-vllm-flash-attn-wheel.md.
+        if (
+            _dlin_vllm_flash_attn_ok()
+            and page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and _seqq == 1
+            and k is None
+            and v is None
+        ):
+            import vllm_flash_attn as _vfa
+
+            _cu_q = torch.arange(
+                0, _batch + 1, dtype=torch.int32, device=q.device
+            )
+            _max_k_ub = page_table.shape[1] * k_cache.shape[1]  # upper bound
+            _o = _vfa.flash_attn_varlen_func(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                max_seqlen_q=1,
+                cu_seqlens_q=_cu_q,
+                max_seqlen_k=_max_k_ub,
+                seqused_k=cache_seqlens,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=list(window_size) if window_size is not None else None,
+                block_table=page_table,
+            )
+            if out is not None:
+                out.copy_(_o)
+                return out
+            return _o
+
+        # Workaround when no compiled DLIN vllm_flash_attn: gather the paged KV
+        # cache into a packed varlen layout and call flash_attn_varlen_func (the
+        # plain flash_attn pkg). Works but is NOT cuda-graph-capturable.
+        # DLIN dleol's paged-DECODE kernel (flash_attn_with_kvcache) crashes with
+        # "to bc failed" (driver bitcode-load bug, config-independent). The PREFILL
+        # kernel (flash_attn_varlen_func) works. Workaround for the standard decode
+        # path (paged, 1 q-token/seq, no new k/v): gather the paged KV cache into a
+        # packed varlen layout and call flash_attn_varlen_func. Validated vs torch
+        # SDPA to bf16 precision (scripts/dl/test_varlen_decode.py).
+        # NOTE: the boolean-mask gather materializes B*max_blocks*Pg*Hkv*D — fine
+        # for modest batch x context (the Qwen3 test); needs a fused gather kernel
+        # before large-batch production use.
+        if (
+            page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and _seqq == 1
+            and k is None
+            and v is None
+        ):
+            from flash_attn import flash_attn_varlen_func as _fa2_varlen
+
+            _Pg = k_cache.shape[1]
+            _Hkv = k_cache.shape[2]
+            _Dm = k_cache.shape[3]
+            _max_blocks = page_table.shape[1]
+            _sl = cache_seqlens.long()
+            _gk = k_cache[page_table].reshape(_batch, _max_blocks * _Pg, _Hkv, _Dm)
+            _gv = v_cache[page_table].reshape(_batch, _max_blocks * _Pg, _Hkv, _Dm)
+            _pos = torch.arange(
+                _max_blocks * _Pg, device=k_cache.device
+            ).unsqueeze(0)
+            _mask = _pos < _sl.unsqueeze(1)  # [batch, max_blocks*Pg]
+            _k_packed = _gk[_mask]  # [total_k, Hkv, D]
+            _v_packed = _gv[_mask]
+            _cu_k = torch.zeros(_batch + 1, dtype=torch.int32, device=k_cache.device)
+            _cu_k[1:] = _sl.cumsum(0)
+            _cu_q = torch.arange(
+                0, _batch + 1, dtype=torch.int32, device=k_cache.device
+            )  # 1 q token / seq
+            _max_k = int(_sl.max().item())
+            _o = _fa2_varlen(
+                q,  # [num_tokens=batch, Hq, D]
+                _k_packed,
+                _v_packed,
+                _cu_q,
+                _cu_k,
+                max_seqlen_q=1,
+                max_seqlen_k=_max_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+            )
+            if out is not None:
+                out.copy_(_o)
+                return out
+            return _o
+
+        # Fallback: original FA2 paged call (for non-decode / unsupported cases).
+        from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
+
         _q = q.view(_batch, _seqq, q.shape[1], q.shape[2])
         _o = _fa2_kvcache(
             _q,

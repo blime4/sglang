@@ -16,6 +16,18 @@
 
 #include "sgl_kernel_ops.h"
 
+// DL begin
+// csrc/elementwise/rmsnorm_dl.cu — standalone RMSNorm (no FlashInfer dep).
+// Schemas match the python wrappers in sgl_kernel/elementwise.py
+// (torch.ops.sgl_kernel.{rmsnorm,fused_add_rmsnorm}.default).
+namespace sgl_kernel_dl {
+void rmsnorm(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+             double eps, bool enable_pdl);
+void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual,
+                       torch::Tensor weight, double eps, bool enable_pdl);
+}  // namespace sgl_kernel_dl
+// DL end
+
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   // csrc/elementwise/topk.cu
   m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
@@ -49,6 +61,18 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   // csrc/memory/weak_ref_tensor.cpp
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+
+  // DL begin
+  // csrc/elementwise/rmsnorm_dl.cu — standard RMSNorm + fused(residual_add).
+  // Replaces the torch forward_native fallback; no FlashInfer header needed.
+  m.def(
+      "rmsnorm(Tensor! out, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+  m.impl("rmsnorm", torch::kCUDA, &sgl_kernel_dl::rmsnorm);
+  m.def(
+      "fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, "
+      "bool enable_pdl) -> ()");
+  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_kernel_dl::fused_add_rmsnorm);
+  // DL end
 
   // STUB (no impl): sglang registers a module-level
   // @torch.library.register_fake("sgl_kernel::moe_fused_gate") (topk.py) which

@@ -261,12 +261,34 @@ class RMSNorm(MultiPlatformOp):
                 return x, residual
             return x
         # DL begin
-        # DLIN: the AOT sgl_kernel rmsnorm/fused_add_rmsnorm are not yet built
-        # (need FlashInfer headers); use the torch forward_native path until then.
+        # DLIN: use the standalone sgl_kernel rmsnorm/fused_add_rmsnorm (built
+        # from csrc/elementwise/rmsnorm_dl.cu, no FlashInfer dep) for the
+        # standard bf16/fp16 path. Fall back to forward_native for edge cases
+        # that path doesn't cover (so DL stays correct, just not yet optimized).
         from sglang.srt.utils.common import is_dlin
 
         if is_dlin():
-            return self.forward_native(x, residual, post_residual_addition)
+            if (
+                self.variance_size_override is not None
+                or is_batch_invariant_mode_enabled()
+                or self.cast_x_before_out_mul
+                or getattr(self, "fp32_residual", False)
+                or x.dtype not in (torch.float16, torch.bfloat16)
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            needs_reshape_dl = x.dim() != 2 and residual is None
+            if needs_reshape_dl:
+                original_shape_dl = x.shape
+                x = x.contiguous().reshape(-1, original_shape_dl[-1])
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            if needs_reshape_dl:
+                out = out.reshape(original_shape_dl)
+            return out
         # DL end
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None

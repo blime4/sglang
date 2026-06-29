@@ -45,6 +45,9 @@ sources = [
     "csrc/common_extension_dl.cc",
     "csrc/elementwise/topk.cu",
     "csrc/elementwise/pos_enc.cu",
+    # DL begin: standalone RMSNorm (no FlashInfer dep) — see rmsnorm_dl.cu header.
+    "csrc/elementwise/rmsnorm_dl.cu",
+    # DL end
     "csrc/moe/moe_align_kernel.cu",
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
