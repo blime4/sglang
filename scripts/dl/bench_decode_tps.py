@@ -13,6 +13,7 @@ CG = os.environ.get("CUDA_GRAPH", "0") == "1"
 MEM_FRAC = float(os.environ.get("MEM_FRAC", "0.88"))
 CG_MAX_BS = int(os.environ.get("CG_MAX_BS", "0"))   # cuda_graph_max_bs_decode (0=default)
 CTX = int(os.environ.get("CONTEXT_LEN", "0"))        # context_length override (0=model default)
+CG_BACKEND = os.environ.get("CG_BACKEND", "")        # cuda_graph_backend_decode (""=default full)
 
 
 def main():
@@ -23,6 +24,8 @@ def main():
     )
     if CG and CG_MAX_BS:
         kw["cuda_graph_max_bs_decode"] = CG_MAX_BS
+    if CG and CG_BACKEND:
+        kw["cuda_graph_backend_decode"] = CG_BACKEND
     if CTX:
         kw["context_length"] = CTX
     engine = sglang.Engine(**kw)

@@ -140,7 +140,9 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
-        raise TypeError(f"Unsupported BCG output type: {type(output)}")
+        # DL begin: pass through non-tensor outputs (e.g., LogitsProcessor metadata).
+        return output
+        # DL end
 
     def _copy_output_to_buffer(
         self, output: Any, output_buffer: Any, num_tokens: int
@@ -179,6 +181,10 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
             return
+        # DL begin: non-tensor outputs (e.g., LogitsProcessor metadata) — no copy.
+        if type(output) == type(output_buffer):
+            return
+        # DL end
         raise TypeError(
             "Unsupported BCG output buffer pair: "
             f"{type(output)} vs {type(output_buffer)}"
