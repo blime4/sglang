@@ -298,10 +298,12 @@ sglang **没有这条 DLIN FP8 路由**，落到 NVIDIA Hopper 专用的 marlin/
 | 3 | FLA linear-attn Triton kernel 用 Hopper PDL extras `gdc_wait`/`gdc_launch_dependents`（DLIN Triton 无） | ✅ 修 | `is_arch_support_pdl()` DLIN 返回 False（`USE_GDC=False`）+ 空 `@triton.jit` stub（AST hash 需要） |
 | 4 | `gemma_fused_add_rmsnorm` 缺失（per-op guard 漏掉） | ✅ 修 | `layernorm.py`：每个 norm op 独立 hasattr guard |
 | 5 | （forward 跑通到 100% GPU — linear-attn + MoE 在执行） | — | — |
-| 6 | Triton FP8/mask bitcast `Cannot bitcast size-8 to size-1`（blockwise-FP8 GEMM Triton 内核） | ❌ **未修** | 需 DLIN FP8 GEMM（dlblas），见 §7.3 |
+| 6 | **linear-attn Triton bitcast** `Cannot bitcast size-8 to size-1`（在 `hybrid_linear_attn_backend` / GDN / Lightning 的 Triton kernel，`track_mask` 处；模型有 30 层 linear-attn） | ❌ **未修** | linear-attn 的 Hopper Triton 内核（TMA/wgmma/FP8 bitcast）需 DLIN 等价或 fallback（§7.3 O4） |
+| 7 | （未触及）blockwise-FP8 GEMM：auto 路径在 DLIN 走 CUTLASS/Triton，需 `_scaled_mm` 或 dlblas | ❌ 未触及 | 见 §7.3 O1（dlblas FP8） |
 
-修到 #5 时 forward 已能执行（GPU 100%），说明 norm/linear-attn/marlin 绕过都生效；#6 是 FP8 GEMM 内核本身
-在 DLIN Triton 上的 bitcast 不兼容——这是 dlblas FP8 要解决的，不是小补丁。
+修到 #5 时 forward 已能执行（GPU 100%），说明 norm/marlin/gdc 绕过都生效。**剩余 #6/#7 是 linear-attn 与
+FP8 GEMM 的 Hopper 专用 Triton/CUTLASS 内核**——属 DLIN kernel porting，非小补丁。**根因：Qwen3.5 深度
+依赖 NVIDIA Hopper 特性（marlin PTX、Hopper Triton PDL/TMA/wgmma/FP8-bitcast），DLIN 无等价实现。**
 
 ### 7.3 优化路线图（goal 3：消除 enablement gap）
 
