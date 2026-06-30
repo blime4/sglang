@@ -45,8 +45,10 @@ def main():
     print(f"{'bs':>5} {'tok/s_min':>10} {'step_min':>9} {'step_med':>9} {'step_max':>9}")
     for bs in BATCHES:
         prompts = [PROMPT] * bs
-        for _ in range(2):  # thorough warmup (JIT + cache)
-            engine.generate(prompts, sampling_params={"max_new_tokens": WARMUP})
+        for _ in range(2):  # thorough warmup (JIT + cache) — MUST match timed sampling
+            engine.generate(
+                prompts, sampling_params={"max_new_tokens": WARMUP, "temperature": 0}
+            )
         steps = []
         for _ in range(RUNS):
             t0 = time.time()

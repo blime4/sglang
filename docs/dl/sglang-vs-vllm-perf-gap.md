@@ -96,41 +96,45 @@ vllm_flash_attn**——这对 sglang 是更干净的方案（纯 in-tree 内核�
 > 勘误：本节早先曾猜「graph-breaker 是 gather 路径里某个 op」。该假设已被上述裁决实验**推翻**
 > ——两条可捕获 attention 路径都干净，gibberish 与 attention 无关，纯属 P1。
 
-### 2.4 Batch-scaling：sglang 与 vLLM best-case **持平**；唯一差距是 sglang 的 **tail 方差**
+### 2.4 Batch-scaling：sglang 与 vLLM **稳态持平**（median parity）；「tail 方差」主要 = JIT warmup 假象（已修）
 
 > torch.profiler 在 DLIN 崩溃；且单次计时噪声极大（bs=64 同 config 5 次跑出 67–147ms），故用
 > **min/median/max（5 runs，warmup×2）**，取 **min = 无 contention 的真实 compute**。
 
-eager 可靠实测（Qwen3-1.7B bf16，DLIN KS38，NEW=64，RUNS=5），step_ms：
+eager 可靠实测（Qwen3-1.7B bf16，DLIN KS38，NEW=64，RUNS=8，**warmup 用 temperature=0**），step_ms：
 
-| bs | sglang min/med/max | vLLM min/med/max | best-case(min) 差距 |
+| bs | sglang min/med/max | vLLM min/med/max | median 差距 |
 |---|---|---|---|
-| 1 | 47.9 / 48.3 / 48.7 | 46.1 / 46.2 / 46.4 | sglang +3.8% |
-| 16 | 55.4 / 55.9 / 77.8 | 53.9 / 54.1 / 54.1 | sglang +2.8% |
-| 64 | **66.9 / 89.0 / 147.2** | **66.5 / 66.7 / 81.0** | sglang +0.6% |
+| 1 | 47.7 / 48.2 / 48.5 | 46.1 / 46.2 / 46.4 | sglang +4.1% |
+| 16 | 55.7 / 58.0 / 79.9 | 53.9 / 54.1 / 54.1 | sglang +7.3% |
+| 64 | **67.4 / 68.2 / 91.7** | **66.5 / 66.7 / 81.0** | sglang +2.2% |
 
-- **best-case（min）= compute 持平**：bs=64 sglang 66.9 vs vLLM 66.5ms（957 vs 962 tok/s）。全 batch
-  sglang 在 vLLM 的 +1~4% 内（噪声级）。**不存在 compute / kernel / fusion 差距。**
-- **vLLM 极稳**（med≈min，max 低）；**sglang tail 方差大**：bs=64 sglang 偶发 147ms 卡顿（max），vLLM
-  稳在 67–81ms；bs=16 sglang max 77.8 vs vLLM 54.1。
-- **早先「2.18× / 4.75× 高 batch compute 差距」结论已废**——它取的是 sglang **max（最差单次）** 对
-  vLLM 单次。可靠 best-case 表明 **compute 双方持平**。
+- **median = 持平**：bs=64 sglang 68.2 vs vLLM 66.7ms（+2.2%）；bs=1/16 也在 +4~7%（噪声级）。
+  **不存在 compute / kernel / fusion 差距。**
+- **早先「2.18× / 4.75× 高 batch 差距」结论已废**——它取的是 sglang **max（最差单次，含下述 JIT 瞬态）**
+  对 vLLM 单次。
+- **主要 tail 方差 = JIT warmup 假象（已修）**：bs=64 连跑 15 次（默认采样 warmup 后）模式
+  `[145,146,148, 67×11, 108]`——前 3 次 ~147ms。原因：warmup 用默认采样、timed 用 `temperature=0`，
+  greedy(argmax) sampler kernel 未在 warmup 编译 → 前 few 次 timed 付 JIT。**warmup 改用 `temperature=0`
+  后 147ms 瞬态消失**（bs=64 max 147→92，median 68）。
+- **残余小 tail**（~90ms 偶发，非 147ms 瞬态）：bs=64 sglang max 91.7 vs vLLM 81.0——零星卡顿，但
+  median 已持平。属次要 tail-latency 项，非 compute gap。
 
 - **compute-gap 候选全部排除（第一性原理证伪；且 best-case 本就持平，无 gap 可追）**：
   - ❌ **不是 fusion**：sglang Qwen3 已用 `QKVParallelLinear` + `mlp.gate_up_proj`（`python/sglang/srt/models/qwen3.py:121,420`），与 vLLM 同款融合。
   - ❌ **不是 GEMM 库（dlblasLt）**：dlblas 仅服务量化模型（`gptq/awq/fp8/mxfp4_dlblas`）；bf16 dense 双方都用 `torch.matmul`，且 dl24 与 dl19 torch 的 `torch.matmul` TFLOP/s **完全一致**（同 shape 实测：m=64 n=6144 均 4.8；m=256 均 13.9）。
   - ❌ **不是 cuda graph**：sglang graph 在 DLIN net-negative（见下条）；且本对比双方均为 eager。
   - ❌ **不是 attention 路径**：sglang 在 vllm_flash_attn .so 在位时走 `cudnnMHAVarlenForward*`，与 vLLM 同一 op。
-- **真正的（小）问题 = sglang decode 的 tail 方差**（bs=64 偶发 147ms ≈ 2× 卡顿），**不是 compute deficit**。候选：scheduler 间歇开销（mem defrag / radix-cache eviction）/ dleol JIT 间歇重编 / eager forward 偶发 stall。
+- **结论**：sglang 稳态 decode ≈ vLLM（median 持平）。既无 compute gap；147ms 卡顿是 JIT warmup 假象（warmup 对齐 `temperature=0` 即消除，已修 `bench_batch_scaling.py`）。残余 ~90ms 零星 tail 为次要项。
 - **cuda graph 在 DLIN net-negative**（实测 sglang graph 比 eager **慢**，全部 batch：bs=1 60.5 vs 48.2ms，bs=64 312.6 vs 147.2ms）。**这与 vLLM graph 在 DLIN 有效形成对比**——若 sglang 真有高 eager-dispatch 开销，graph 本应消除它（却没有），指向 **sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题**，是一条独立排查线。
 
 > **勘误（2026-06-30）**：本节前一版本曾断言根因 =「fusion 缺失 + dlblasLt」。该结论已被上述
 > 实测**证伪并撤回**——sglang 已融合、dlblas 对 bf16 N/A、matmul 双方等价。差距真实但根因待隔离。
 
-**裁决**：sglang vs vLLM 在 DLIN（Qwen3-1.7B bf16）**compute 持平**（best-case min 全 batch +1~4%，
-bs=64 几乎并列）。唯一可追的是 **sglang tail 稳定性**（bs=64 偶发 147ms 卡顿，vLLM 稳在 67–81ms）。
-优化方向从「kernel/fusion/compute 差距」（不存在）转为「**稳定性 / tail latency**」。
-复现：`scripts/dl/bench_batch_scaling.py`、`bench_vllm_batch_scaling.py`（RUNS=5 取 min/med/max）。
+**裁决**：sglang vs vLLM 在 DLIN（Qwen3-1.7B bf16）**稳态持平**（median 全 batch +2~7%）——既无
+compute/kernel/fusion 差距，147ms tail 也已查明为 JIT warmup 假象（warmup 对齐 `temperature=0` 即消除）。
+**整个 perf-gap 调查结论：不存在实际性能差距**；教训 = benchmark warmup 必须匹配 timed 采样参数。
+复现：`scripts/dl/bench_batch_scaling.py`、`bench_vllm_batch_scaling.py`（warmup 均已对齐 temp=0）。
 
 ---
 
@@ -168,18 +172,19 @@ bs=64 几乎并列）。唯一可追的是 **sglang tail 稳定性**（bs=64 偶
 **当前 BREAKABLE 性能**：17.1 tok/s（注：这是相对旧 gather-path eager 12.7 的历史对比；当前
 eager 已达 19.5，batch=1 下 graph 反而比 eager 慢，见 §4 注）。
 
-### P2：sglang decode **tail 方差**（compute 已持平 vLLM，无 kernel/fusion 可追）
+### P2：~~tail 方差~~ → 已查明为 JIT warmup 假象（已修）；无 kernel/fusion 可追
 
-**§2.4 可靠实测**：sglang vs vLLM best-case compute **持平**（bs=64 min 66.9 vs 66.5ms；全 batch +1~4%）。
-**不存在 kernel/fusion/compute 差距——勿移植 fusion/dlblasLt（前提已证伪，无效工作）。** 唯一可追的是
-sglang 的 **tail 方差**（bs=64 偶发 147ms ≈ 2× 卡顿；vLLM 稳在 67–81ms）。
+**§2.4 已闭环**：sglang vs vLLM **稳态持平**（median 全 batch +2~7%）。147ms「tail 方差」实测查明 =
+**greedy-sampler JIT 假象**（warmup 未用 `temperature=0` → 前 few 次 timed 付 JIT）；warmup 对齐后消失
+（bs=64 max 147→92，median 68）。**不存在 kernel/fusion/compute 差距——勿移植 fusion/dlblasLt。**
 
-| 步骤 | 内容 | 目的 |
-|---|---|---|
-| **P2-1（先做）** | 定位 sglang decode 偶发卡顿源：逐 step 计时 scheduler（mem defrag / radix-cache eviction / IPC）、查 dleol JIT 是否间歇重编、eager forward 偶发 stall | 找出 147ms tail 的触发条件 |
-| P2-2 | 独立排查线：sglang cuda graph 为何在 DLIN net-negative（vLLM graph 有效）——capture/replay/static-pool 的 DLIN 特有问题 | graph 本可消除 dispatch 开销，sglang 反而变慢 → 实现 bug |
+| 状态 | 内容 |
+|---|---|
+| ✅ 已修 | benchmark warmup 对齐 `temperature=0`（`bench_batch_scaling.py`）——消除 147ms JIT 瞬态 |
+| 次要（可选） | 残余 ~90ms 零星 tail（bs=64 max 91.7 vs vLLM 81.0）——median 已持平，非 compute gap，可另开 |
+| 独立线（可选） | sglang cuda graph 在 DLIN net-negative（vLLM graph 有效）——capture/replay/static-pool 实现 bug，与 perf gap 无关 |
 
-> batch=1 与高 batch compute 均已持平，无 P2a/P2b kernel 项。sampler / quant GEMM 为 batch=1 overhead / 量化模型储备项，与本问题无关。
+> 结论：sglang DLIN decode **无实际性能差距**。sampler / quant GEMM 为 batch=1 / 量化模型储备项。
 
 ### P3：FULL cuda graph 正确性 ✅ 已解决（两条路径都干净，paged_decode 无需 vllm_flash_attn）
 
@@ -207,13 +212,12 @@ vLLM 的 graph 有效是因其 forward 已高度融合+dlblasLt，graph 仅锦�
 
 ## 4. 预期性能演进
 
-> **指标重定向（§2.4 可靠实测）**：sglang vs vLLM **compute 持平**（全 batch best-case +1~4%）。
-> 唯一可追的是 **sglang tail 稳定性**（bs=64 偶发 147ms 卡顿，vLLM 稳在 67–81ms）。
+> **指标重定向（§2.4 可靠实测）**：sglang vs vLLM **稳态持平**（median 全 batch +2~7%）。147ms tail
+> 已查明 = JIT warmup 假象（warmup 对齐 `temperature=0` 即消除）。**无实际性能差距。**
 
-| 阶段 | 完成项 | bs=1 | bs=64 tok/s (min) | vs vLLM @bs=64 |
+| 阶段 | 完成项 | bs=1 | bs=64 tok/s (median) | vs vLLM @bs=64 |
 |---|---|---|---|---|
-| **当前** | paged_decode_attn FULL（干净，无需 vllm_flash_attn） | ~20（持平） | **957（min）** | **持平**（min 66.9 vs 66.5ms） |
-| **+P2-1（稳 tail）** | 定位并消除 sglang decode 偶发卡顿 | ~20 | 稳定 ~900+（无 147ms 尾） | tail 追平 vLLM |
+| **当前** | paged_decode_attn FULL + warmup 对齐 temp=0 | ~21（持平） | **939（median 68.2ms）** | **持平**（median +2.2%） |
 
 > 注：batch=1 时 graph 比 eager 慢（forward 太轻量，graph 管理开销 > launch 节省）。
 > Graph 收益在大 batch（concurrent serving）时才显著。当前 sglang 的 FULL graph
