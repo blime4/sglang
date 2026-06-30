@@ -276,12 +276,12 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 > **hybrid linear/full attention**（每 4 层 1 层 full-attn，余为 GatedDeltaNet linear-attn）、FP8 blockwise
 > （`weight_block_size=[128,128]`，dynamic act）、VLM、MTP。DLIN KS38，TP=2（35B FP8 ≈37GB > 1×32GB）。
 
-### 7.1 裁决：差距是 **0→1 enablement**，非性能差距
+### 7.1 裁决：enablement gap（已闭合）+ 待测性能差距
 
 | 框架 | Qwen3.5-35B-A3B-FP8 @ DLIN | 机制 |
 |---|---|---|
 | **vLLM 0.21.0** | ✅ **跑通**，输出正确 ` Paris. The capital of France is Paris...` | DL platform **自动把 FP8 重映射为 `quantization=fp8_dlblas`**（DLIN 原生 dlblas FP8 GEMM） |
-| **sglang** | ❌ **未跑通**（forward 能跑到 100% GPU，但卡在 FP8 Triton bitcast） | FP8 走 NVIDIA **marlin / triton-fp8**（Hopper 专用）→ dlcc/Triton 编译失败 |
+| **sglang**（修 6 个 DLIN blocker 后） | ✅ **跑通**，输出与 vLLM **逐字一致** | FP8 走 sglang auto blockwise 路径（CUTLASS/Triton，DLIN 可跑）；修了 marlin/norm/gdc/bitcast |
 
 **核心差距**：vLLM 的 DL platform plugin 对 FP8 模型**自动选用 `fp8_dlblas`**（登临 dlblas FP8 GEMM）；
 sglang **没有这条 DLIN FP8 路由**，落到 NVIDIA Hopper 专用的 marlin/triton-fp8 路径，在 DLIN 上全线失败。
@@ -298,12 +298,12 @@ sglang **没有这条 DLIN FP8 路由**，落到 NVIDIA Hopper 专用的 marlin/
 | 3 | FLA linear-attn Triton kernel 用 Hopper PDL extras `gdc_wait`/`gdc_launch_dependents`（DLIN Triton 无） | ✅ 修 | `is_arch_support_pdl()` DLIN 返回 False（`USE_GDC=False`）+ 空 `@triton.jit` stub（AST hash 需要） |
 | 4 | `gemma_fused_add_rmsnorm` 缺失（per-op guard 漏掉） | ✅ 修 | `layernorm.py`：每个 norm op 独立 hasattr guard |
 | 5 | （forward 跑通到 100% GPU — linear-attn + MoE 在执行） | — | — |
-| 6 | **linear-attn Triton bitcast** `Cannot bitcast size-8 to size-1`（在 `hybrid_linear_attn_backend` / GDN / Lightning 的 Triton kernel，`track_mask` 处；模型有 30 层 linear-attn） | ❌ **未修** | linear-attn 的 Hopper Triton 内核（TMA/wgmma/FP8 bitcast）需 DLIN 等价或 fallback（§7.3 O4） |
-| 7 | （未触及）blockwise-FP8 GEMM：auto 路径在 DLIN 走 CUTLASS/Triton，需 `_scaled_mm` 或 dlblas | ❌ 未触及 | 见 §7.3 O1（dlblas FP8） |
+| 6 | **linear-attn Triton bitcast** `Cannot bitcast size-8 to size-1`（`track_mamba_state_if_needed_kernel`，`if not track_mask:` 的 int64→bool 隐式 bitcast） | ✅ 修 | `mamba_state_scatter_triton.py`：`if track_mask == 0:` 显式比较 |
 
-修到 #5 时 forward 已能执行（GPU 100%），说明 norm/marlin/gdc 绕过都生效。**剩余 #6/#7 是 linear-attn 与
-FP8 GEMM 的 Hopper 专用 Triton/CUTLASS 内核**——属 DLIN kernel porting，非小补丁。**根因：Qwen3.5 深度
-依赖 NVIDIA Hopper 特性（marlin PTX、Hopper Triton PDL/TMA/wgmma/FP8-bitcast），DLIN 无等价实现。**
+**✅ sglang 跑通**（修完 #1–#6）：TP=2 eager 下生成正确输出 ` Paris. The capital of France is Paris...`，
+**与 vLLM 逐字一致**。根因：Qwen3.5 深度依赖 NVIDIA Hopper 特性（marlin PTX、Hopper Triton PDL `gdc_*`、
+int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标记修复。blockwise-FP8 GEMM 走 sglang 的
+`dispatch_w8a8_block_fp8_linear` auto 路径（CUTLASS/Triton），在 DLIN 上能跑（未走 marlin）。
 
 ### 7.3 优化路线图（goal 3：消除 enablement gap）
 
