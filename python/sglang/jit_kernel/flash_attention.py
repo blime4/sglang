@@ -207,6 +207,27 @@ def flash_attn_with_kvcache(
                 return out
             return _o
 
+        # Graph-safe custom paged-decode attention kernel (sgl_kernel). Reads the
+        # paged KV cache DIRECTLY (no gather/scatter/packing) via page_table +
+        # seqlens. Single kernel launch -> captures + replays cleanly under cuda
+        # graph. All inputs are sglang's own fixed-shape tensors (graph pool).
+        # Validated EXACT vs torch SDPA (max_err=0). This is the PRIMARY DLIN
+        # decode path -- it unblocks cuda graph without needing vllm_flash_attn.
+        if (
+            page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and _seqq == 1
+            and k is None
+            and v is None
+        ):
+            _scale = softmax_scale if softmax_scale is not None else (q.shape[-1] ** -0.5)
+            if out is None:
+                out = torch.empty_like(q)
+            torch.ops.sgl_kernel.paged_decode_attn(
+                q, k_cache, v_cache, page_table, cache_seqlens, out, _scale
+            )
+            return out
+
         # Workaround when no compiled DLIN vllm_flash_attn: pack the paged KV
         # cache into a varlen layout and call flash_attn_varlen_func (plain
         # flash_attn pkg). dleol's paged-DECODE kernel (flash_attn_with_kvcache)

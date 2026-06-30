@@ -25,6 +25,9 @@ void rmsnorm(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
              double eps, bool enable_pdl);
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual,
                        torch::Tensor weight, double eps, bool enable_pdl);
+void paged_decode_attn(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
+                       torch::Tensor page_table, torch::Tensor seqlens,
+                       torch::Tensor out, double softmax_scale);
 }  // namespace sgl_kernel_dl
 // DL end
 
@@ -72,6 +75,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, "
       "bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_kernel_dl::fused_add_rmsnorm);
+
+  // csrc/elementwise/paged_decode_attn_dl.cu — graph-safe paged-decode attention
+  // (no gather/scatter/packing; reads paged KV directly; single kernel launch).
+  m.def(
+      "paged_decode_attn(Tensor q, Tensor k_cache, Tensor v_cache, "
+      "Tensor page_table, Tensor seqlens, Tensor(a!) out, float softmax_scale) -> ()");
+  m.impl("paged_decode_attn", torch::kCUDA, &sgl_kernel_dl::paged_decode_attn);
   // DL end
 
   // STUB (no impl): sglang registers a module-level
