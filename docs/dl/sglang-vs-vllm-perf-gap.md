@@ -114,26 +114,20 @@ eager 模式实测（Qwen3-1.7B，DLIN KS38，NEW=64）：
 - **截距相同（~46.5ms overhead）**：batch=1 双方等价；engine round-trip overhead 非差距来源。
 - **sglang per-seq 斜率 1.57ms = vLLM 0.33ms 的 4.75×**：真差距，**只在高 batch 显现**
   （bs=64：vLLM 947 vs sglang 435 tok/s）。
-- **matmul 微基准 + FLOPs 核算**（bs=64 decode ≈180 GFLOP/step）：
+- **根因排查（第一性原理，逐一证伪）**——下列候选**全部被实测排除**：
+  - ❌ **不是 fusion**：sglang Qwen3 已用 `QKVParallelLinear` + `mlp.gate_up_proj`（`python/sglang/srt/models/qwen3.py:121,420`），与 vLLM 同款融合。
+  - ❌ **不是 GEMM 库（dlblasLt）**：dlblas 仅服务量化模型（`gptq/awq/fp8/mxfp4_dlblas`）；bf16 dense 双方都用 `torch.matmul`，且 dl24 与 dl19 torch 的 `torch.matmul` TFLOP/s **完全一致**（同 shape 实测：m=64 n=6144 均 4.8；m=256 均 13.9）。
+  - ❌ **不是 cuda graph**：sglang graph 在 DLIN net-negative（见下条）；且本对比双方均为 eager。
+  - ❌ **不是 attention 路径**：sglang 在 vllm_flash_attn .so 在位时走 `cudnnMHAVarlenForward*`，与 vLLM 同一 op。
+- **未被隔离的真相**：matmul / fusion / attention-path 三者双方等价，sglang eager 却仍慢 4.76×（bs=64 compute 100 vs 21ms）。剩余差异只能在 **per-op eager dispatch 开销** 或 **非-matmul op（RMSNorm/RoPE/activation）效率** 或 **attention 细节**。**确切根因尚未隔离**——非侵入手段（profiler 在 DLIN 崩溃）已用尽，需 **per-layer 计时**（在 qwen3 forward 用 `torch.cuda.Event` 切分 attention vs MLP）。
+- **cuda graph 在 DLIN net-negative**（实测 sglang graph 比 eager **慢**，全部 batch：bs=1 60.5 vs 48.2ms，bs=64 312.6 vs 147.2ms）。**这与 vLLM graph 在 DLIN 有效形成对比**——若 sglang 真有高 eager-dispatch 开销，graph 本应消除它（却没有），指向 **sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题**，是一条独立排查线。
 
-  | | in-model TFLOP/s | vs isolated `torch.matmul`(4.8) |
-  |---|---|---|
-  | isolated `torch.matmul` [64,2048]×[2048,6144] | 4.8 | 1.0× |
-  | **sglang eager（in-model）** | ~1.8 | **0.37×（2.7× 损耗）** |
-  | **vLLM eager（in-model）** | ~8.5 | 1.77×（**超过 isolated**） |
+> **勘误（2026-06-30）**：本节前一版本曾断言根因 =「fusion 缺失 + dlblasLt」。该结论已被上述
+> 实测**证伪并撤回**——sglang 已融合、dlblas 对 bf16 N/A、matmul 双方等价。差距真实但根因待隔离。
 
-  sglang 把 matmul 跑在 isolated 速率的 0.37× —— **未融合的小 matmul**（28层×~5个，shape 小 → 低
-  TFLOP/s）+ launch 开销；vLLM 靠 **fusion（QKV/gate_up 融合→更大 matmul）+ dlblasLt** 反超 isolated。
-  二者相乘 ≈ 4.75× 斜率。
-
-- **cuda graph 在 DLIN 上 net-negative**（实测 sglang graph 比 eager **慢**，全部 batch：bs=1 60.5 vs
-  48.2ms，bs=64 312.6 vs 147.2ms）。graph replay/static-pool 开销 > launch 节省，且随 batch 增长。
-  ∴ **graph 不是 sglang 的解法**。
-
-**裁决**：本报告早先聚焦的「batch=1 -9% eager 差距」是**测错对象**——batch=1 双方 overhead-bound
-等价（差距 <3%，run 间方差）。真差距是**高 batch 的 per-seq compute 效率**（2.18× @ bs=64），根因
-= **fusion 缺失（主）+ dlblasLt（次 ~1.9×）**，**不是** graph。复现：
-`scripts/dl/bench_batch_scaling.py`（sglang eager/graph）、`bench_vllm_batch_scaling.py`（vLLM）。
+**裁决**：batch=1 双方 overhead-bound 等价（差距 <3%，run 间方差）——测这个无意义。真差距是
+**高 batch per-seq compute（2.18× @ bs=64）**，但**根因未隔离**（fusion/GEMM/SDK/graph/attention 路径
+均已排除）。复现：`scripts/dl/bench_batch_scaling.py`（sglang eager/graph）、`bench_vllm_batch_scaling.py`（vLLM）。
 
 ---
 
@@ -171,23 +165,19 @@ eager 模式实测（Qwen3-1.7B，DLIN KS38，NEW=64）：
 **当前 BREAKABLE 性能**：17.1 tok/s（注：这是相对旧 gather-path eager 12.7 的历史对比；当前
 eager 已达 19.5，batch=1 下 graph 反而比 eager 慢，见 §4 注）。
 
-### P2：fusion + dlblasLt（高 batch 差距的根治，~4.75× per-seq）⬆ 最高优先级
+### P2：高 batch compute 差距 — 根因待隔离（勿在错误前提下移植算子）
 
-**§2.4 裁决**：真差距是高 batch 的 per-seq compute 效率（sglang 斜率 1.57ms = vLLM 0.33ms 的 4.75×）。
-matmul 微基准证因：sglang in-model 仅 ~1.8 TFLOP/s（isolated `torch.matmul` 的 0.37×，因**未融合的
-小 matmul** + launch 开销）；vLLM 靠 **fusion + dlblasLt** 达 ~8.5 TFLOP/s（超 isolated）。**graph 在
-DLIN net-negative（非解法，见 §2.4）**。这取代原「batch=1 -9% eager」目标——P2 在 batch=1 无收益，
-在 serving batch 是 **2-5× 吞吐**。
+**§2.4 勘误**：早先的「fusion 缺失 + dlblasLt」根因**已证伪撤回**。sglang 已融合 QKV/gate_up、bf16 双方
+都用 `torch.matmul`（dl19≡dl24）、attention 同 op、graph net-negative。差距真实（2.18× @ bs=64）但根因
+**未隔离**。**隔离根因前不要移植 fusion/dlblasLt——前提已证伪，会是无效工作。**
 
-| 优先级 | 算子 | sglang 接入点 | 工作量 | 预估收益（高 batch） |
-|---|---|---|---|---|
-| **P2a** | **fused QKV / fused gate_up MLP**（小 matmul→大 matmul，提 TFLOP/s） | model layer / `layers/linear.py` | 2-3 天 | **主杠杆**（in-model 0.37×→接近 1×） |
-| P2b | **Linear GEMM → dlblasLt** | `layers/linear.py` | 2-3 天 | 次（~1.9× raw GEMM） |
-| P2c | **Sampler**（DL flashinfer-ext） | `layers/sampler.py` | 1 天 | 小（batch=1 overhead 侧） |
-| P2d | **MoE gate / FP8-W8A8 GEMM**（dlblasExt） | `layers/{moe,quantization}/*` | 5 天 | N/A（dense/bf16，储备） |
+| 步骤 | 内容 | 目的 |
+|---|---|---|
+| **P2-0（先做）** | 在 `qwen3.DecoderLayer.forward` 用 `torch.cuda.Event` 切分 attention vs MLP vs norm 时间 @ bs=64 | 隔离差距在哪个子段 |
+| P2-1 | 查 sglang graph 为何在 DLIN net-negative（vLLM graph 有效）——capture/replay/static-pool 的 DLIN 问题 | 若差距是 eager-dispatch 开销，graph 本应消除它；没有则 graph 实现 itself 有 bug |
+| P2-2 | 据 P2-0 定靶（MLP 慢→查 Linear 路径；attention 慢→查 decode attn kernel；norm/RoPE 慢→换 DLIN kernel） | 针对性修，而非盲改 |
 
-> P2a（fusion）杠杆 > P2b（dlblasLt）：sglang 的 2.7× in-model 损耗主要来自未融合小 matmul，融合后
-> TFLOP/s 才逼近 isolated，dlblasLt 再叠加 ~1.9×。详见 `dlin-vllm-sglang-gap-analysis.md`。
+> P2c/P2d（sampler / quant GEMM）仍为 batch=1 / 量化模型储备项，与本根因无关。
 
 ### P3：FULL cuda graph 正确性 ✅ 已解决（两条路径都干净，paged_decode 无需 vllm_flash_attn）
 
@@ -221,8 +211,8 @@ vLLM 的 graph 有效是因其 forward 已高度融合+dlblasLt，graph 仅锦�
 | 阶段 | 完成项 | bs=1（parity） | bs=64 tok/s | vs vLLM @bs=64 |
 |---|---|---|---|---|
 | **当前** | paged_decode_attn FULL（干净，无需 vllm_flash_attn） | ~20（等价） | 435 | **-54%**（2.18× 慢） |
-| **+P2a（dlblasLt GEMM）** | Linear 走 dlblasLt | ~20 | ~700-900 | -5% to -25% |
-| **+P2b（fused QKV/MLP）** | 进一步降 kernel 数/提效 | ~20 | **~900+** | **~0%**（追平 vLLM） |
+| **+P2-0（隔离根因）** | per-layer 计时切分 attention/MLP/norm + 查 graph net-negative | ~20 | 435（先诊断） | 不变（先定位再改） |
+| **+P2-2（按诊断定靶修复）** | 据 P2-0 结果针对性修（待根因明确） | ~20 | 待定 | 目标 ~0%（追平 vLLM） |
 
 > 注：batch=1 时 graph 比 eager 慢（forward 太轻量，graph 管理开销 > launch 节省）。
 > Graph 收益在大 batch（concurrent serving）时才显著。当前 sglang 的 FULL graph
