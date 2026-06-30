@@ -140,7 +140,21 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
-        # DL begin: pass through non-tensor outputs (e.g., LogitsProcessor metadata).
+        # DL begin: slice tensor fields inside LogitsProcessorOutput, pass-through rest.
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=(
+                    output.next_token_logits[:num_tokens]
+                    if output.next_token_logits is not None
+                    else None
+                ),
+                hidden_states=(
+                    output.hidden_states[:num_tokens]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
         return output
         # DL end
 
@@ -181,7 +195,21 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
             return
-        # DL begin: non-tensor outputs (e.g., LogitsProcessor metadata) — no copy.
+        # DL begin: copy tensor fields inside LogitsProcessorOutput, skip non-tensor.
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        if (
+            isinstance(output, LogitsProcessorOutput)
+            and isinstance(output_buffer, LogitsProcessorOutput)
+        ):
+            if output.next_token_logits is not None:
+                output_buffer.next_token_logits[:num_tokens].copy_(
+                    output.next_token_logits[:num_tokens]
+                )
+            if output.hidden_states is not None:
+                output_buffer.hidden_states[:num_tokens].copy_(
+                    output.hidden_states[:num_tokens]
+                )
+            return
         if type(output) == type(output_buffer):
             return
         # DL end
