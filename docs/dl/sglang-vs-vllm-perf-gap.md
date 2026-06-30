@@ -3,7 +3,7 @@
 > 基于 Qwen3-1.7B（bf16, batch=1, DLIN KS38）实测数据，量化 sglang 与 vLLM 的 decode
 > 性能差距，分析根因，给出按优先级排列的优化路线图。
 >
-> 测试日期：2026-06-30 ｜ sglang dl-main (5 commits) ｜ vLLM 0.21.0 (dl19 torch)
+> 测试日期：2026-06-30 ｜ sglang dl-main (7 commits) ｜ vLLM 0.21.0 (dl19 torch)
 >
 > 所有数据为同一 GPU（cuda:3, KS38 QUAD 32GB）、同一模型（/opt/dataset/Qwen3-1.7B）、
 > 同一 prompt（"The capital of France is", greedy, 64 tokens）下的实测。
@@ -18,16 +18,16 @@
 |---|---|---|---|---|
 | **vLLM 0.21.0** | FULL cuda graph | **23.0** | ✅ 正常 | "Paris..." ✅ |
 | **vLLM 0.21.0** | eager | **21.4** | — | "Paris..." ✅ |
-| **sglang** | BREAKABLE graph | **18.0** | ✅ (minor "?") | "Paris..." ✅ |
-| **sglang** | eager (gather workaround) | **12.7** | — | "Paris..." ✅ |
+| **sglang** | BREAKABLE graph (LogitsProcessor fixed) | **17.1** | ✅ 干净 | "Paris..." ✅ |
+| **sglang** | eager (paged_decode_attn kernel) | **12.7** | — | "Paris..." ✅ |
 
 ### 性能差距分解
 
 | 指标 | vLLM | sglang | 差距 | 根因 |
 |---|---|---|---|---|
 | **Eager tok/s** | 21.4 | 12.7 | **-41%** | gather 开销 + 缺失 DLIN 算子 |
-| **Graph tok/s** | 23.0 | 18.0 | **-22%** | BREAKABLE 开销 + 残留 torch-native ops |
-| **Graph vs Eager 提升** | +7.5% | +42% | — | sglang 从低基数提升更大比例 |
+| **Graph tok/s** | 23.0 | 17.1 | **-26%** | BREAKABLE 开销 + 残留 torch-native ops |
+| **Graph vs Eager 提升** | +7.5% | +35% | — | sglang 从低基数提升更大比例 |
 
 ---
 
@@ -98,15 +98,14 @@ forward 走 dleol → graph-safe），但依赖登临出 wheel。
 **建议**：方案 C 保留为 eager 路径（替代 gather，减少开销），同时推进方案 A（wheel 到手后
 自动切到 dleol 直读 paged cache 路径）。
 
-### P1：BREAKABLE graph 修复（+~2 tok/s, +输出干净）
+### P1：BREAKABLE graph 修复 ✅ 已完成
 
-**当前**：BREAKABLE graph 产出 "Paris"（18 tok/s，42% 比 eager 快），但首 token 有 "?"。
-**根因**：`breakable_cuda_graph_backend.py` 的 LogitsProcessor pass-through 不完美。
+**已修复**：`breakable_cuda_graph_backend.py` 的 `_slice_output` /
+`_copy_output_to_buffer` 现在正确处理 `LogitsProcessorOutput`（切分
+`next_token_logits` tensor，pass-through 其他字段）。输出从 ` ?\n...` 变为干净的
+` Paris...`。Commit `5ab2426401`。
 
-**修复**：
-- 在 `_slice_output` / `_copy_output_to_buffer` 中正确处理 `LogitsProcessorOutput`（切分
-  `next_token_logits` tensor，pass-through 其他字段）。
-- 工作量：0.5 天。
+**当前 BREAKABLE 性能**：17.1 tok/s（比 eager 12.7 快 35%）。
 
 ### P2：接入 DLIN 算子（减少 torch-native ops, +~2-3 tok/s eager, +解锁 FULL graph）
 
@@ -144,10 +143,10 @@ forward 走 dleol → graph-safe），但依赖登临出 wheel。
 
 | 阶段 | 完成项 | Eager tok/s | Graph tok/s | vs vLLM |
 |---|---|---|---|---|
-| **当前** | gather workaround + paged_decode_attn + BREAKABLE | 12.7 | 18.0 | -22% |
-| **P0 完成** | paged_decode_attn 替代 gather（eager） | ~15-16 | 18.0 (BREAKABLE) | -22% to -30% |
-| **P0+P1 完成** | + BREAKABLE 干净 + LogitsProcessor 修复 | ~15-16 | ~19-20 | -10% to -15% |
-| **P0+P1+P2 完成** | + DLIN sampler + head-padding | ~17-18 | ~20-21 | -5% to -10% |
+| **当前** | paged_decode_attn + BREAKABLE (LogitsProcessor fixed) | 12.7 | 17.1 | -26% |
+| **P0 完成** | paged_decode_attn 替代 gather（eager） | ~15-16 | 17.1 (BREAKABLE) | -26% to -30% |
+| **P0+P1 ✅** | + BREAKABLE 干净 ✅ | ~15-16 | ~17-18 | -22% to -26% |
+| **P0+P1+P2 完成** | + DLIN sampler + head-padding | ~17-18 | ~19-20 | -10% to -15% |
 | **+P3 (FULL graph)** | 登临修 graph replay 或 ops 够少 | ~17-18 | **~22-23** | **~0%**（追平 vLLM） |
 
 ---
@@ -182,6 +181,8 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 | `fe8fe97e90` | vllm_flash_attn clean path（休眠） + scatter 实验 |
 | `9986422670` | paged_decode_attn kernel（graph-safe, 精确 vs SDPA） |
 | `735c8e8d87` | BREAKABLE cuda graph backend fix + DLIN graph-size limit workaround |
+| `eb84a27db6` | sglang vs vLLM 性能差距分析 + vLLM bench 脚本 |
+| `5ab2426401` | BREAKABLE LogitsProcessor 切分修复（消除 "?" artifact） |
 
 ### 已交付的 sglang 侧资产
 
