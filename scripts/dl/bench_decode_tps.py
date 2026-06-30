@@ -36,7 +36,7 @@ def main():
     print(f"{'run':>4} {'tokens':>7} {'wall_s':>8} {'tok/s':>8}")
     for r in range(RUNS):
         t0 = time.time()
-        out = engine.generate([prompt], sampling_params={"max_new_tokens": NEW})
+        out = engine.generate([prompt], sampling_params={"max_new_tokens": NEW, "temperature": 0})
         dt = time.time() - t0
         text = out[0]["text"] if isinstance(out, list) else out["text"]
         print(f"{r:>4} {NEW:>7} {dt:>8.3f} {NEW/dt:>8.2f}")

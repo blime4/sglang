@@ -108,6 +108,41 @@ flash_attn_with_kvcache(q, kc, vc, cache_seqlens=csl, block_table=bt, causal=Tru
 
 Expected: returns `[B,1,Hq,D]` + softmax_lse. Actual: SIGSEGV.
 
+## Workaround (sglang-side, verified)
+
+The crash is specific to the paged-KV-cache op `flash_attn_with_kvcache`
+(`cudnnMHAForwardKVCacheWithSinks`). sglang does NOT need that op: its DLIN
+decode path routes through `vllm_flash_attn.flash_attn_varlen_func(block_table=)`
+instead, which hits a DIFFERENT dldnn op -- `cudnnMHAVarlenForward*` (the prefill
+varlen op, which works and is cuda-graph-capturable). See
+`python/sglang/jit_kernel/flash_attention.py` (`_dlin_vllm_flash_attn_ok()` branch).
+
+What unblocks sglang serving in practice:
+
++---+--------------------------------------------+----------------------------------------+
+| # | Step                                      | Where                                  |
++---+--------------------------------------------+----------------------------------------+
+| 1 | Copy the DLIN-patched `_vllm_fa2_C.so`    | `scripts/dl/setup_vllm_flash_attn.sh`  |
+|   | from a vLLM DL venv (dl19 build,          |                                        |
+|   | ABI-compatible with dl24 torch) into the  |                                        |
+|   | sglang venv.                              |                                        |
++---+--------------------------------------------+----------------------------------------+
+| 2 | Let model warmup run first -- per the     | sglang engine warmup                   |
+|   | setup script, this preheats the dleol JIT |                                        |
+|   | cache so decode never hits the cold-JIT   |                                        |
+|   | "to bc failed" path at serve time.        |                                        |
++---+--------------------------------------------+----------------------------------------+
+
+Measured result (Qwen3-1.7B, batch=1, KS38): eager **19.52 tok/s** and a CLEAN
+FULL cuda graph **16.64 tok/s** (output "Paris..." correct). See
+`docs/dl/sglang-vs-vllm-perf-gap.md`.
+
+Caveat: this ROUTES AROUND the bug, it does not fix `flash_attn_with_kvcache`
+itself. Any framework that must call `flash_attn_with_kvcache` directly still
+hits the crash and needs the DLIN-side fix below. The standalone repro
+(`repro_fa2_decode_crash.py`) still crashes because it calls the kvcache op
+cold, with no warmup.
+
 ## How to fix
 
 The bug is in closed `libdleol.so` (the kvcache op's bitcode load). DLIN-side
