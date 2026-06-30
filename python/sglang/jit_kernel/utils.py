@@ -424,6 +424,16 @@ def get_jit_cuda_arch() -> ArchInfo:
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
+    # DL begin: DLIN has no Hopper PDL — tl.extra.cuda.gdc_wait/gdc_launch_dependents
+    # are absent from DLIN Triton, so the FLA linear-attn kernels must compile without GDC.
+    try:
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+
+        if _is_dlin():
+            return False
+    except Exception:
+        pass
+    # DL end
     return get_jit_cuda_arch().major >= 9
 
 

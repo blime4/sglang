@@ -349,6 +349,16 @@ class Fp8LinearMethod(LinearMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+            # DL begin: DLIN dlcc cannot compile the NVIDIA-specific marlin PTX kernels
+            # (device::marlin::marlin_mm). Force the blockwise-FP8 DeepGemm/_scaled_mm path.
+            try:
+                from sglang.srt.utils.common import is_dlin as _is_dlin
+
+                if _is_dlin():
+                    self.use_marlin = False
+            except Exception:
+                pass
+            # DL end
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (

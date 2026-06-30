@@ -266,3 +266,60 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 - **vllm_flash_attn dormant path**：wheel 到手即自动切换
 - **docs/dl/**：gap analysis + bug report + wheel request
 - **scripts/dl/**：repro, bench (sglang + vLLM), 5 个 correctness tests
+
+---
+
+## 7. Qwen3.5-35B-A3B-FP8 补充（2026-07-01，与 §1–6 的 Qwen3-1.7B bf16 不同模型）
+
+> 模型：`/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/`（本地副本 `/LocalRun/xi.chen/...`，35G）。
+> 架构 `Qwen3_5MoeForConditionalGeneration`：**35B MoE、A3B（256 experts×8 active + shared expert）**、
+> **hybrid linear/full attention**（每 4 层 1 层 full-attn，余为 GatedDeltaNet linear-attn）、FP8 blockwise
+> （`weight_block_size=[128,128]`，dynamic act）、VLM、MTP。DLIN KS38，TP=2（35B FP8 ≈37GB > 1×32GB）。
+
+### 7.1 裁决：差距是 **0→1 enablement**，非性能差距
+
+| 框架 | Qwen3.5-35B-A3B-FP8 @ DLIN | 机制 |
+|---|---|---|
+| **vLLM 0.21.0** | ✅ **跑通**，输出正确 ` Paris. The capital of France is Paris...` | DL platform **自动把 FP8 重映射为 `quantization=fp8_dlblas`**（DLIN 原生 dlblas FP8 GEMM） |
+| **sglang** | ❌ **未跑通**（forward 能跑到 100% GPU，但卡在 FP8 Triton bitcast） | FP8 走 NVIDIA **marlin / triton-fp8**（Hopper 专用）→ dlcc/Triton 编译失败 |
+
+**核心差距**：vLLM 的 DL platform plugin 对 FP8 模型**自动选用 `fp8_dlblas`**（登临 dlblas FP8 GEMM）；
+sglang **没有这条 DLIN FP8 路由**，落到 NVIDIA Hopper 专用的 marlin/triton-fp8 路径，在 DLIN 上全线失败。
+**所以这不是 tok/s 性能差距，而是 sglang 能不能跑该模型的 enablement 差距。**
+
+### 7.2 sglang 跑通过程：NVIDIA-Hopper 依赖级联（已修 4，剩 FP8 GEMM）
+
+模型深度依赖 NVIDIA Hopper 特性，DLIN 上逐个暴露并修复（均带 `# DL` 标记）：
+
+| # | blocker | 状态 | 修复 |
+|---|---|---|---|
+| 1 | sgl_kernel 缺 `gemma_rmsnorm` 等 norm ops（DLIN 构建未含） | ✅ 修 | `layernorm.py`：检测 op 缺失则用 native torch RMSNorm fallback（per-op 独立 guard） |
+| 2 | FP8 MoE 路由到 `gptq_marlin`（NVIDIA PTX，dlcc 编译失败 `device::marlin::marlin_mm`） | ✅ 修 | `fp8.py`：DLIN 上 `use_marlin=False` → 走 blockwise-FP8 DeepGemm/triton 路径 |
+| 3 | FLA linear-attn Triton kernel 用 Hopper PDL extras `gdc_wait`/`gdc_launch_dependents`（DLIN Triton 无） | ✅ 修 | `is_arch_support_pdl()` DLIN 返回 False（`USE_GDC=False`）+ 空 `@triton.jit` stub（AST hash 需要） |
+| 4 | `gemma_fused_add_rmsnorm` 缺失（per-op guard 漏掉） | ✅ 修 | `layernorm.py`：每个 norm op 独立 hasattr guard |
+| 5 | （forward 跑通到 100% GPU — linear-attn + MoE 在执行） | — | — |
+| 6 | Triton FP8/mask bitcast `Cannot bitcast size-8 to size-1`（blockwise-FP8 GEMM Triton 内核） | ❌ **未修** | 需 DLIN FP8 GEMM（dlblas），见 §7.3 |
+
+修到 #5 时 forward 已能执行（GPU 100%），说明 norm/linear-attn/marlin 绕过都生效；#6 是 FP8 GEMM 内核本身
+在 DLIN Triton 上的 bitcast 不兼容——这是 dlblas FP8 要解决的，不是小补丁。
+
+### 7.3 优化路线图（goal 3：消除 enablement gap）
+
+主攻 **把 dlblas FP8 GEMM 接入 sglang**（复刻 vLLM 的 `fp8_dlblas` 路由）：
+
+| 优先级 | 项 | 做法 | 依赖 |
+|---|---|---|---|
+| **O1（根治）** | **sglang FP8 → dlblas** | 在 sglang FP8 quant method 里：DLIN + fp8 → 调 dlblas fp8 GEMM（blockwise 128×128）。先确认 dlblas fp8 的 Python 入口（vLLM 走 `torch.ops._dl_C.*` / dlblas plugin；sglang 需同等 binding） | dlblas fp8 op binding |
+| O2 | 解决 #6 Triton FP8 bitcast | O1 接入 dlblas 后，FP8 GEMM 不再走 Triton → bitcast 自然消失 | O1 |
+| O3 | 补齐 sgl_kernel DLIN 构建 | 把 `gemma_rmsnorm`/`rmsnorm`/`fused_add_rmsnorm` 等 norm ops 编进 DLIN sgl_kernel .so（替代 #1/#4 的 native fallback，提性能） | DLIN sgl_kernel 编译 |
+| O4 | linear-attn 的 Hopper Triton extras | 评估 FLA kernels 还依赖哪些 Hopper Triton 特性（TMA/wgmma 等），逐个提供 DLIN 等价或 fallback | DLIN Triton 能力 |
+
+> 注：sglang 与 vLLM 的 **tok/s 性能对比暂不可得**——sglang 跑不通该模型，无法 bench。vLLM 已跑通（可作
+> sglang 移植后的目标基线）。**先把 sglang FP8 跑通（O1/O2），再谈 perf 差距。**
+
+### 7.4 复现
+
+- sglang（卡 #6）：`bash` 源 `SDK_DIR/env.sh` + `CUDA_VISIBLE_DEVICES=1,2` + `MODEL_PATH=/LocalRun/xi.chen/Qwen3.5-35B-A3B-FP8` → `python scripts/dl/run_qwen35_35b.py`（TP=2 eager；已带 #1–#4 修复）
+- vLLM（跑通）：同 env（dl19 SDK + `venv-vllm021`）→ `python scripts/dl/run_qwen35_35b_vllm.py`（TP=2 eager；自动 `fp8_dlblas`）
+- /mars NFS 读速 ~5 MB/s（慢），**用本地副本** `/LocalRun/xi.chen/Qwen3.5-35B-A3B-FP8` 加载。
+

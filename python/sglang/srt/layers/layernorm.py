@@ -92,6 +92,36 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
+    # DL begin — DLIN sgl_kernel build lacks the rmsnorm-family C++ ops; native torch fallbacks
+    def _dl_has_op(_n):
+        try:
+            getattr(torch.ops.sgl_kernel, _n)
+            return True
+        except Exception:
+            return False
+
+    def _dl_rms(input, weight, eps=1e-6, out=None, shift=0.0):
+        o = torch.empty_like(input) if out is None else out
+        xf = input.float()
+        r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        o.copy_((xf * r).to(input.dtype) * (weight + shift))
+        return o
+
+    def _dl_fused(input, residual, weight, eps=1e-6, shift=0.0):
+        residual.add_(input)  # in-place: residual += input
+        rf = residual.float()
+        r = torch.rsqrt(rf.pow(2).mean(-1, keepdim=True) + eps)
+        input.copy_((rf * r).to(input.dtype) * (weight + shift))  # in-place into input
+
+    if not _dl_has_op("gemma_rmsnorm"):
+        gemma_rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 1.0)
+    if not _dl_has_op("rmsnorm"):
+        rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 0.0)
+    if not _dl_has_op("fused_add_rmsnorm"):
+        fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 0.0)
+    if not _dl_has_op("gemma_fused_add_rmsnorm"):
+        gemma_fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 1.0)
+    # DL end
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 if _use_aiter:
