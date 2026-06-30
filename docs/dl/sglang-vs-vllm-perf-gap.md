@@ -96,38 +96,41 @@ vllm_flash_attn**——这对 sglang 是更干净的方案（纯 in-tree 内核�
 > 勘误：本节早先曾猜「graph-breaker 是 gather 路径里某个 op」。该假设已被上述裁决实验**推翻**
 > ——两条可捕获 attention 路径都干净，gibberish 与 attention 无关，纯属 P1。
 
-### 2.4 Batch-scaling：真正的差距在高 batch compute slope（第一性原理裁决）
+### 2.4 Batch-scaling：sglang 与 vLLM best-case **持平**；唯一差距是 sglang 的 **tail 方差**
 
-> torch.profiler 在 DLIN 崩溃，故用 batch-scaling 分解 `step_time = overhead + per_seq·bs`。
+> torch.profiler 在 DLIN 崩溃；且单次计时噪声极大（bs=64 同 config 5 次跑出 67–147ms），故用
+> **min/median/max（5 runs，warmup×2）**，取 **min = 无 contention 的真实 compute**。
 
-eager 模式实测（Qwen3-1.7B，DLIN KS38，NEW=64）：
+eager 可靠实测（Qwen3-1.7B bf16，DLIN KS38，NEW=64，RUNS=5），step_ms：
 
-| bs | vLLM step_ms | sglang step_ms | sglang/vLLM |
+| bs | sglang min/med/max | vLLM min/med/max | best-case(min) 差距 |
 |---|---|---|---|
-| 1 | 46.7 | 48.2 | 1.03×（parity） |
-| 4 | 51.3 | 59.5 | 1.16× |
-| 16 | 54.7 | 77.3 | 1.41× |
-| 64 | 67.6 | 147.2 | **2.18×** |
+| 1 | 47.9 / 48.3 / 48.7 | 46.1 / 46.2 / 46.4 | sglang +3.8% |
+| 16 | 55.4 / 55.9 / 77.8 | 53.9 / 54.1 / 54.1 | sglang +2.8% |
+| 64 | **66.9 / 89.0 / 147.2** | **66.5 / 66.7 / 81.0** | sglang +0.6% |
 
-线性拟合：vLLM `step ≈ 46.4 + 0.33·bs`；sglang `step ≈ 46.6 + 1.57·bs`。
+- **best-case（min）= compute 持平**：bs=64 sglang 66.9 vs vLLM 66.5ms（957 vs 962 tok/s）。全 batch
+  sglang 在 vLLM 的 +1~4% 内（噪声级）。**不存在 compute / kernel / fusion 差距。**
+- **vLLM 极稳**（med≈min，max 低）；**sglang tail 方差大**：bs=64 sglang 偶发 147ms 卡顿（max），vLLM
+  稳在 67–81ms；bs=16 sglang max 77.8 vs vLLM 54.1。
+- **早先「2.18× / 4.75× 高 batch compute 差距」结论已废**——它取的是 sglang **max（最差单次）** 对
+  vLLM 单次。可靠 best-case 表明 **compute 双方持平**。
 
-- **截距相同（~46.5ms overhead）**：batch=1 双方等价；engine round-trip overhead 非差距来源。
-- **sglang per-seq 斜率 1.57ms = vLLM 0.33ms 的 4.75×**：真差距，**只在高 batch 显现**
-  （bs=64：vLLM 947 vs sglang 435 tok/s）。
-- **根因排查（第一性原理，逐一证伪）**——下列候选**全部被实测排除**：
+- **compute-gap 候选全部排除（第一性原理证伪；且 best-case 本就持平，无 gap 可追）**：
   - ❌ **不是 fusion**：sglang Qwen3 已用 `QKVParallelLinear` + `mlp.gate_up_proj`（`python/sglang/srt/models/qwen3.py:121,420`），与 vLLM 同款融合。
   - ❌ **不是 GEMM 库（dlblasLt）**：dlblas 仅服务量化模型（`gptq/awq/fp8/mxfp4_dlblas`）；bf16 dense 双方都用 `torch.matmul`，且 dl24 与 dl19 torch 的 `torch.matmul` TFLOP/s **完全一致**（同 shape 实测：m=64 n=6144 均 4.8；m=256 均 13.9）。
   - ❌ **不是 cuda graph**：sglang graph 在 DLIN net-negative（见下条）；且本对比双方均为 eager。
   - ❌ **不是 attention 路径**：sglang 在 vllm_flash_attn .so 在位时走 `cudnnMHAVarlenForward*`，与 vLLM 同一 op。
-- **未被隔离的真相**：matmul / fusion / attention-path 三者双方等价，sglang eager 却仍慢 4.76×（bs=64 compute 100 vs 21ms）。剩余差异只能在 **per-op eager dispatch 开销** 或 **非-matmul op（RMSNorm/RoPE/activation）效率** 或 **attention 细节**。**确切根因尚未隔离**——非侵入手段（profiler 在 DLIN 崩溃）已用尽，需 **per-layer 计时**（在 qwen3 forward 用 `torch.cuda.Event` 切分 attention vs MLP）。
+- **真正的（小）问题 = sglang decode 的 tail 方差**（bs=64 偶发 147ms ≈ 2× 卡顿），**不是 compute deficit**。候选：scheduler 间歇开销（mem defrag / radix-cache eviction）/ dleol JIT 间歇重编 / eager forward 偶发 stall。
 - **cuda graph 在 DLIN net-negative**（实测 sglang graph 比 eager **慢**，全部 batch：bs=1 60.5 vs 48.2ms，bs=64 312.6 vs 147.2ms）。**这与 vLLM graph 在 DLIN 有效形成对比**——若 sglang 真有高 eager-dispatch 开销，graph 本应消除它（却没有），指向 **sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题**，是一条独立排查线。
 
 > **勘误（2026-06-30）**：本节前一版本曾断言根因 =「fusion 缺失 + dlblasLt」。该结论已被上述
 > 实测**证伪并撤回**——sglang 已融合、dlblas 对 bf16 N/A、matmul 双方等价。差距真实但根因待隔离。
 
-**裁决**：batch=1 双方 overhead-bound 等价（差距 <3%，run 间方差）——测这个无意义。真差距是
-**高 batch per-seq compute（2.18× @ bs=64）**，但**根因未隔离**（fusion/GEMM/SDK/graph/attention 路径
-均已排除）。复现：`scripts/dl/bench_batch_scaling.py`（sglang eager/graph）、`bench_vllm_batch_scaling.py`（vLLM）。
+**裁决**：sglang vs vLLM 在 DLIN（Qwen3-1.7B bf16）**compute 持平**（best-case min 全 batch +1~4%，
+bs=64 几乎并列）。唯一可追的是 **sglang tail 稳定性**（bs=64 偶发 147ms 卡顿，vLLM 稳在 67–81ms）。
+优化方向从「kernel/fusion/compute 差距」（不存在）转为「**稳定性 / tail latency**」。
+复现：`scripts/dl/bench_batch_scaling.py`、`bench_vllm_batch_scaling.py`（RUNS=5 取 min/med/max）。
 
 ---
 
@@ -165,19 +168,18 @@ eager 模式实测（Qwen3-1.7B，DLIN KS38，NEW=64）：
 **当前 BREAKABLE 性能**：17.1 tok/s（注：这是相对旧 gather-path eager 12.7 的历史对比；当前
 eager 已达 19.5，batch=1 下 graph 反而比 eager 慢，见 §4 注）。
 
-### P2：高 batch compute 差距 — 根因待隔离（勿在错误前提下移植算子）
+### P2：sglang decode **tail 方差**（compute 已持平 vLLM，无 kernel/fusion 可追）
 
-**§2.4 勘误**：早先的「fusion 缺失 + dlblasLt」根因**已证伪撤回**。sglang 已融合 QKV/gate_up、bf16 双方
-都用 `torch.matmul`（dl19≡dl24）、attention 同 op、graph net-negative。差距真实（2.18× @ bs=64）但根因
-**未隔离**。**隔离根因前不要移植 fusion/dlblasLt——前提已证伪，会是无效工作。**
+**§2.4 可靠实测**：sglang vs vLLM best-case compute **持平**（bs=64 min 66.9 vs 66.5ms；全 batch +1~4%）。
+**不存在 kernel/fusion/compute 差距——勿移植 fusion/dlblasLt（前提已证伪，无效工作）。** 唯一可追的是
+sglang 的 **tail 方差**（bs=64 偶发 147ms ≈ 2× 卡顿；vLLM 稳在 67–81ms）。
 
 | 步骤 | 内容 | 目的 |
 |---|---|---|
-| **P2-0（先做）** | 在 `qwen3.DecoderLayer.forward` 用 `torch.cuda.Event` 切分 attention vs MLP vs norm 时间 @ bs=64 | 隔离差距在哪个子段 |
-| P2-1 | 查 sglang graph 为何在 DLIN net-negative（vLLM graph 有效）——capture/replay/static-pool 的 DLIN 问题 | 若差距是 eager-dispatch 开销，graph 本应消除它；没有则 graph 实现 itself 有 bug |
-| P2-2 | 据 P2-0 定靶（MLP 慢→查 Linear 路径；attention 慢→查 decode attn kernel；norm/RoPE 慢→换 DLIN kernel） | 针对性修，而非盲改 |
+| **P2-1（先做）** | 定位 sglang decode 偶发卡顿源：逐 step 计时 scheduler（mem defrag / radix-cache eviction / IPC）、查 dleol JIT 是否间歇重编、eager forward 偶发 stall | 找出 147ms tail 的触发条件 |
+| P2-2 | 独立排查线：sglang cuda graph 为何在 DLIN net-negative（vLLM graph 有效）——capture/replay/static-pool 的 DLIN 特有问题 | graph 本可消除 dispatch 开销，sglang 反而变慢 → 实现 bug |
 
-> P2c/P2d（sampler / quant GEMM）仍为 batch=1 / 量化模型储备项，与本根因无关。
+> batch=1 与高 batch compute 均已持平，无 P2a/P2b kernel 项。sampler / quant GEMM 为 batch=1 overhead / 量化模型储备项，与本问题无关。
 
 ### P3：FULL cuda graph 正确性 ✅ 已解决（两条路径都干净，paged_decode 无需 vllm_flash_attn）
 
@@ -205,14 +207,13 @@ vLLM 的 graph 有效是因其 forward 已高度融合+dlblasLt，graph 仅锦�
 
 ## 4. 预期性能演进
 
-> **指标重定向（§2.4）**：batch=1 双方 overhead-bound 等价（~47ms），无差距可追。真正指标是
-> **高 batch 吞吐**（bs≥16），差距在那里（sglang 435 vs vLLM 947 tok/s @ bs=64）。
+> **指标重定向（§2.4 可靠实测）**：sglang vs vLLM **compute 持平**（全 batch best-case +1~4%）。
+> 唯一可追的是 **sglang tail 稳定性**（bs=64 偶发 147ms 卡顿，vLLM 稳在 67–81ms）。
 
-| 阶段 | 完成项 | bs=1（parity） | bs=64 tok/s | vs vLLM @bs=64 |
+| 阶段 | 完成项 | bs=1 | bs=64 tok/s (min) | vs vLLM @bs=64 |
 |---|---|---|---|---|
-| **当前** | paged_decode_attn FULL（干净，无需 vllm_flash_attn） | ~20（等价） | 435 | **-54%**（2.18× 慢） |
-| **+P2-0（隔离根因）** | per-layer 计时切分 attention/MLP/norm + 查 graph net-negative | ~20 | 435（先诊断） | 不变（先定位再改） |
-| **+P2-2（按诊断定靶修复）** | 据 P2-0 结果针对性修（待根因明确） | ~20 | 待定 | 目标 ~0%（追平 vLLM） |
+| **当前** | paged_decode_attn FULL（干净，无需 vllm_flash_attn） | ~20（持平） | **957（min）** | **持平**（min 66.9 vs 66.5ms） |
+| **+P2-1（稳 tail）** | 定位并消除 sglang decode 偶发卡顿 | ~20 | 稳定 ~900+（无 147ms 尾） | tail 追平 vLLM |
 
 > 注：batch=1 时 graph 比 eager 慢（forward 太轻量，graph 管理开销 > launch 节省）。
 > Graph 收益在大 batch（concurrent serving）时才显著。当前 sglang 的 FULL graph

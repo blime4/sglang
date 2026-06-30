@@ -11,6 +11,7 @@
 # the scheduler subprocess via spawn, which re-imports this module; an unguarded
 # top-level Engine() recursively respawns the scheduler and dies at init.
 import os
+import statistics
 import time
 
 import sglang
@@ -22,6 +23,8 @@ BATCHES = [int(x) for x in os.environ.get("BATCHES", "1,4,16,64").split(",")]
 MEM_FRAC = float(os.environ.get("MEM_FRAC", "0.88"))
 CG = os.environ.get("CUDA_GRAPH", "0") == "1"
 CG_MAX_BS = int(os.environ.get("CG_MAX_BS", "0"))  # cuda_graph_max_bs_decode (0=default)
+RUNS = int(os.environ.get("RUNS", "5"))  # timed runs per batch (min=least contention)
+WARMUP = int(os.environ.get("WARMUP_TOKENS", "32"))
 
 
 def main():
@@ -38,19 +41,22 @@ def main():
     engine = sglang.Engine(**kw)
     PROMPT = "The capital of France is"
 
-    print(f"\n[cuda_graph={'ON' if CG else 'OFF'}] step_time(batch) decomposition (NEW={NEW} tokens/seq)")
-    print(f"{'bs':>5} {'tok/s':>9} {'step_ms':>9}")
+    print(f"\n[cuda_graph={'ON' if CG else 'OFF'}] step_time(batch) (NEW={NEW}, RUNS={RUNS}, min=best/least-contention)")
+    print(f"{'bs':>5} {'tok/s_min':>10} {'step_min':>9} {'step_med':>9} {'step_max':>9}")
     for bs in BATCHES:
         prompts = [PROMPT] * bs
-        engine.generate(prompts, sampling_params={"max_new_tokens": 8})  # warmup
-        t0 = time.time()
-        engine.generate(
-            prompts, sampling_params={"max_new_tokens": NEW, "temperature": 0}
-        )
-        dt = time.time() - t0
-        step_ms = dt / NEW * 1000.0
-        tps = bs * NEW / dt
-        print(f"{bs:>5} {tps:>9.1f} {step_ms:>9.2f}")
+        for _ in range(2):  # thorough warmup (JIT + cache)
+            engine.generate(prompts, sampling_params={"max_new_tokens": WARMUP})
+        steps = []
+        for _ in range(RUNS):
+            t0 = time.time()
+            engine.generate(
+                prompts, sampling_params={"max_new_tokens": NEW, "temperature": 0}
+            )
+            steps.append((time.time() - t0) / NEW * 1000.0)
+        smin, smed, smax = min(steps), statistics.median(steps), max(steps)
+        tps_min = bs * 1000.0 / smin
+        print(f"{bs:>5} {tps_min:>10.1f} {smin:>9.2f} {smed:>9.2f} {smax:>9.2f}")
 
 
 if __name__ == "__main__":
