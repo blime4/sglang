@@ -12,6 +12,7 @@ MODEL = os.environ.get("MODEL_PATH", "/opt/dataset/Qwen3-1.7B")
 NEW = int(os.environ.get("MAX_NEW_TOKENS", "64"))
 BATCHES = [int(x) for x in os.environ.get("BATCHES", "1,4,16,64").split(",")]
 CG = os.environ.get("CUDA_GRAPH", "0") == "1"  # default eager (clean slope compare)
+TP = int(os.environ.get("TP", "1"))  # tensor-parallel size (35B FP8 needs TP>=2)
 RUNS = int(os.environ.get("RUNS", "5"))
 WARMUP = int(os.environ.get("WARMUP_TOKENS", "32"))
 
@@ -23,6 +24,7 @@ def main():
         max_model_len=512,
         gpu_memory_utilization=0.5,
         enforce_eager=not CG,
+        tensor_parallel_size=TP,
     )
     prompt = "The capital of France is"
     sp = SamplingParams(temperature=0, max_tokens=NEW)

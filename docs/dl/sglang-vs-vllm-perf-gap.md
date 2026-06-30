@@ -316,8 +316,10 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 | O3 | 补齐 sgl_kernel DLIN 构建 | 把 `gemma_rmsnorm`/`rmsnorm`/`fused_add_rmsnorm` 等 norm ops 编进 DLIN sgl_kernel .so（替代 #1/#4 的 native fallback，提性能） | DLIN sgl_kernel 编译 |
 | O4 | linear-attn 的 Hopper Triton extras | 评估 FLA kernels 还依赖哪些 Hopper Triton 特性（TMA/wgmma 等），逐个提供 DLIN 等价或 fallback | DLIN Triton 能力 |
 
-> 注：sglang 与 vLLM 的 **tok/s 性能对比暂不可得**——sglang 跑不通该模型，无法 bench。vLLM 已跑通（可作
-> sglang 移植后的目标基线）。**先把 sglang FP8 跑通（O1/O2），再谈 perf 差距。**
+> 注：**实测性能差距（eager, TP=2, batch=1）**：vLLM **12.63 tok/s**（16 tokens / 1.27s，dlblas FP8）。
+> sglang 跑通但 **decode 极慢：0.047 tok/s**（4 tokens / 85s）——sglang 的 FP8 MoE（256 experts × 40 层，
+> 每 token ~10240 个 expert FP8 GEMM）走未优化的 CUTLASS/Triton 路径 + eager 无 cuda-graph。
+> **差距 ~268×**（vLLM 快 268 倍）。O1（FP8→dlblas）+ cuda-graph 是缩小差距的核心。
 
 ### 7.4 复现
 

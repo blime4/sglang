@@ -14,6 +14,23 @@ import os
 import statistics
 import time
 
+# DL: DLIN Triton lacks Hopper PDL extras gdc_wait/gdc_launch_dependents (FLA linear-attn
+# kernels reference them in the AST; USE_GDC=False at runtime but AST hash needs them to
+# resolve). Empty @triton.jit no-ops satisfy the hash + compile to nothing.
+import triton
+import triton.language.extra.cuda as _tlc
+
+if not hasattr(_tlc, "gdc_wait"):
+    @triton.jit
+    def _gdc_wait():
+        pass
+    _tlc.gdc_wait = _gdc_wait
+if not hasattr(_tlc, "gdc_launch_dependents"):
+    @triton.jit
+    def _gdc_launch_dependents():
+        pass
+    _tlc.gdc_launch_dependents = _gdc_launch_dependents
+
 import sglang
 
 MODEL = os.environ.get("MODEL_PATH", "/opt/dataset/Qwen3-1.7B")
@@ -23,6 +40,7 @@ BATCHES = [int(x) for x in os.environ.get("BATCHES", "1,4,16,64").split(",")]
 MEM_FRAC = float(os.environ.get("MEM_FRAC", "0.88"))
 CG = os.environ.get("CUDA_GRAPH", "0") == "1"
 CG_MAX_BS = int(os.environ.get("CG_MAX_BS", "0"))  # cuda_graph_max_bs_decode (0=default)
+TP = int(os.environ.get("TP", "1"))  # tensor-parallel size (35B FP8 needs TP>=2)
 RUNS = int(os.environ.get("RUNS", "5"))  # timed runs per batch (min=least contention)
 WARMUP = int(os.environ.get("WARMUP_TOKENS", "32"))
 
@@ -35,6 +53,7 @@ def main():
         attention_backend=BACKEND,
         disable_cuda_graph=not CG,
         mem_fraction_static=MEM_FRAC,
+        tp_size=TP,
     )
     if CG and CG_MAX_BS:
         kw["cuda_graph_max_bs_decode"] = CG_MAX_BS
