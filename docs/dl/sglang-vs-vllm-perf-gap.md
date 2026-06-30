@@ -18,16 +18,16 @@
 |---|---|---|---|---|
 | **vLLM 0.21.0** | FULL cuda graph | **23.0** | ✅ 正常 | "Paris..." ✅ |
 | **vLLM 0.21.0** | eager | **21.4** | — | "Paris..." ✅ |
+| **sglang** | eager (paged_decode_attn kernel) | **19.45** | — | "Paris..." ✅ |
 | **sglang** | BREAKABLE graph (LogitsProcessor fixed) | **17.1** | ✅ 干净 | "Paris..." ✅ |
-| **sglang** | eager (paged_decode_attn kernel) | **12.7** | — | "Paris..." ✅ |
 
 ### 性能差距分解
 
 | 指标 | vLLM | sglang | 差距 | 根因 |
 |---|---|---|---|---|
-| **Eager tok/s** | 21.4 | 12.7 | **-41%** | gather 开销 + 缺失 DLIN 算子 |
-| **Graph tok/s** | 23.0 | 17.1 | **-26%** | BREAKABLE 开销 + 残留 torch-native ops |
-| **Graph vs Eager 提升** | +7.5% | +35% | — | sglang 从低基数提升更大比例 |
+| **Eager tok/s** | 21.4 | 19.45 | **-9%** | attention kernel 差异（cudnnMHAVarlenForward* vs 自写） + sampler 差异 |
+| **Graph tok/s** | 23.0 | 17.1 | **-26%** | BREAKABLE 开销（batch=1 graph 不划算） |
+| **Graph vs Eager** | +7.5% | -12% | — | sglang batch=1: graph 比 eager 慢（forward 太轻量） |
 
 ---
 
@@ -143,11 +143,13 @@ forward 走 dleol → graph-safe），但依赖登临出 wheel。
 
 | 阶段 | 完成项 | Eager tok/s | Graph tok/s | vs vLLM |
 |---|---|---|---|---|
-| **当前** | paged_decode_attn + BREAKABLE (LogitsProcessor fixed) | 12.7 | 17.1 | -26% |
-| **P0 完成** | paged_decode_attn 替代 gather（eager） | ~15-16 | 17.1 (BREAKABLE) | -26% to -30% |
-| **P0+P1 ✅** | + BREAKABLE 干净 ✅ | ~15-16 | ~17-18 | -22% to -26% |
-| **P0+P1+P2 完成** | + DLIN sampler + head-padding | ~17-18 | ~19-20 | -10% to -15% |
-| **+P3 (FULL graph)** | 登临修 graph replay 或 ops 够少 | ~17-18 | **~22-23** | **~0%**（追平 vLLM） |
+| **当前** | paged_decode_attn + BREAKABLE (LogitsProcessor fixed) | 19.45 | 17.1 | -9% (eager) |
+| **+P2 完成** | + DLIN sampler + 优化 attention kernel | ~20-21 | ~19-20 | -0% to -5% |
+| **+P3 (FULL graph)** | 登临修 graph replay 或 ops 够少 | ~20-21 | **~22-23** | **~0%**（追平 vLLM） |
+
+> 注：batch=1 时 graph 比 eager 慢（forward 太轻量，graph 管理开销 > launch 节省）。
+> Graph 收益在大 batch（concurrent serving）时才显著。当前 sglang 的 BREAKABLE graph
+> 为大 batch 场景准备就绪（正确 + 干净），但 batch=1 bench 不体现其价值。
 
 ---
 
