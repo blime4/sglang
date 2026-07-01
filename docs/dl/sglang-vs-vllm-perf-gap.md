@@ -328,6 +328,21 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 > 无法跑。**下一步（GPU 空闲后）**：跑 instrumentation → 若 MoE 主导则 O1 dlblas port；若 linear-attn
 > 主导则 FLA kernel 适配。
 
+**O1 实现指南（dlblas FP8 port，待 stable GPU 实现+验证）**：
+
+1. **C++ extension**（sgl-kernel 或新 `dl_` op）：定义 torch op `dlblas_fp8_blockwise_linear(A_fp8, B_fp8, weight_scale_inv[128×128 block], input_scale)` → 返回 bf16 输出。内部走 `dlblasLtMatmul`（`sdk/include/dlblasLt_ext.h:208`）。
+2. **调用序列**（cublasLt 风格）：
+   - `dlblasLtMatrixLayoutCreate` ×4（A/B/C/D，类型 CUDA_R_8F_E4M3 / output bf16）；
+   - `dlblasLtMatmulDescCreate`（transposes、scale type）；
+   - **量化**：`dlblasLtQuantParamsConfigCreate` → `dlblasLtQuantParamsConfigSet`(fp8 e4m3) → 对 B（权重）`ConfigSetGroupSize(128,128)`（blockwise），对 A（激活）per-token；
+   - `dlblasLtMatmulGetWorkspace` + `dlblasLtMatmul(handle, desc, alpha, A,Adesc,Aq, B,Bdesc,Bq, ..., workspace, stream)`。
+3. **sglang 集成**：在 `python/sglang/srt/layers/quantization/fp8.py` 的 `dispatch_w8a8_block_fp8_linear`（linear）和 FusedMoE FP8 method（`moe_runner/`，expert GEMM）加 **DLIN 分支** → 调上述 op（替代 triton/cutlass）。条件 `_is_dlin`（与已提交的 marlin-disable 同处）。
+4. **参考**：vLLM `plugins/dl_quantization_plugin/fp8_dlblas.py`（`apply_w8a8_block_fp8_linear` + `torch.ops._dl_C.*`）——sglang 复刻同等 binding。
+5. **验证**：小 shape correctness vs `torch._scaled_mm`；perf vs 当前 triton（目标：单 GEMM ~65ms → <1ms，token decode 0.047→接近 vLLM 12.63）。
+
+> 瓶颈定位（MoE vs linear-attn）虽因集群 contention 未实测，但 vLLM 的 win 完全在 **FP8 MoE（dlblas）**，
+> 故 O1（dlblas FP8 MoE port）是高置信度首要项。
+
 ### 7.4 复现
 
 - sglang（卡 #6）：`bash` 源 `SDK_DIR/env.sh` + `CUDA_VISIBLE_DEVICES=1,2` + `MODEL_PATH=/LocalRun/xi.chen/Qwen3.5-35B-A3B-FP8` → `python scripts/dl/run_qwen35_35b.py`（TP=2 eager；已带 #1–#4 修复）
