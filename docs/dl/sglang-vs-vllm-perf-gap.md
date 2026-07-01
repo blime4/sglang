@@ -311,7 +311,7 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 
 | 优先级 | 项 | 做法 | 依赖 |
 |---|---|---|---|
-| **O1（根治）** | **sglang FP8 → dlblas** | 在 sglang FP8 quant method 里：DLIN + fp8 → 调 dlblas fp8 GEMM（blockwise 128×128）。先确认 dlblas fp8 的 Python 入口（vLLM 走 `torch.ops._dl_C.*` / dlblas plugin；sglang 需同等 binding） | dlblas fp8 op binding |
+| **O1（根治）** | **sglang FP8 MoE → dlblas** | 根因已确认：sglang 对 FP8 MoE 用 **triton backend**（DLIN 上极慢，~65ms/GEMM）——因 `deep_gemm`/`flashinfer`/`dlblas` 在 DLIN 上**都不可用**（`import deep_gemm` 失败；dlblas 无 Python binding，`libdlblas.so` 仅 C++）。vLLM 走 `fp8_dlblas`（`torch.ops._dl_C.*`，vLLM C++ extension 注册）→ <1ms/GEMM。**优化 = 给 sglang 建 dlblas FP8 MoE 的 C++ extension**（blockwise 128×128，仿 vLLM `_dl_C`）并接入 FusedMoE FP8 method。属 substantial kernel 工程。 | dlblas fp8 C++ extension build |
 | O2 | 解决 #6 Triton FP8 bitcast | O1 接入 dlblas 后，FP8 GEMM 不再走 Triton → bitcast 自然消失 | O1 |
 | O3 | 补齐 sgl_kernel DLIN 构建 | 把 `gemma_rmsnorm`/`rmsnorm`/`fused_add_rmsnorm` 等 norm ops 编进 DLIN sgl_kernel .so（替代 #1/#4 的 native fallback，提性能） | DLIN sgl_kernel 编译 |
 | O4 | linear-attn 的 Hopper Triton extras | 评估 FLA kernels 还依赖哪些 Hopper Triton 特性（TMA/wgmma 等），逐个提供 DLIN 等价或 fallback | DLIN Triton 能力 |
