@@ -7,6 +7,11 @@
 >
 > 所有数据为同一 GPU（cuda:3, KS38 QUAD 32GB）、同一模型（/opt/dataset/Qwen3-1.7B）、
 > 同一 prompt（"The capital of France is", greedy, 64 tokens）下的实测。
+>
+> **状态更新（2026-07-01）**：Route B 完成——sglang 用 `scripts/dl/build_dlin_vllm_flash_attn.sh`
+> 从 DLIN flash-attn 源码**自编 `_vllm_fa2_C.so`**（纯 C++，dlcc 编译），不再从 vLLM venv 复制
+> （Route A 废弃，降级为 Route B 的 shim）。构建产物与旧 copied .so 逐 bit 一致（max diff 0.0，
+> vs SDPA 5e-4），故下表性能数据不变。详见 §3 P0。
 
 ---
 
@@ -28,7 +33,7 @@
 
 | 指标 | vLLM | sglang | 差距 | 根因 |
 |---|---|---|---|---|
-| **Eager tok/s** | 21.4 | 19.5 | **-9%** | attention 路径已对齐（Route A），剩余差 sampler + 少量 kernel（vllm_flash_attn 19.52 ≈ paged_decode_attn 19.45） |
+| **Eager tok/s** | 21.4 | 19.5 | **-9%** | attention 路径已对齐（vllm_flash_attn，.so 由 Route B 自编），剩余差 sampler + 少量 kernel（vllm_flash_attn 19.52 ≈ paged_decode_attn 19.45） |
 | **Graph tok/s** | 23.0 | 16.6–17.1 | **~-27%** | batch=1 graph 不划算：FULL(vllm_flash_attn) 16.64 ✅干净 / BREAKABLE(paged_decode) 17.1 ✅干净 |
 | **Graph vs Eager** | +7.5% | -15% | — | sglang batch=1: graph 比 eager 慢（forward 太轻量） |
 
@@ -36,9 +41,9 @@
 
 ## 2. 根因分析
 
-### 2.1 Attention 路径差异（Route A 后基本消除）
+### 2.1 Attention 路径差异（vllm_flash_attn 路径接入后基本消除）
 
-| | vLLM | sglang（旧 gather 路径） | sglang（Route A: vllm_flash_attn） |
+| | vLLM | sglang（旧 gather 路径） | sglang（vllm_flash_attn；.so 由 Route B 自编） |
 |---|---|---|---|
 | **Decode attention API** | `vllm_flash_attn.flash_attn_varlen_func(block_table=)` | `flash_attn.flash_attn_varlen_func`（gather 后调用） | 同 vLLM：`vllm_flash_attn.flash_attn_varlen_func(block_table=)` |
 | **底层 dldnn op** | `cudnnMHAVarlenForward*`（直接读分页 cache） | `cudnnMHAVarlenForward*`（先 gather 成 packed 再调用） | 同 vLLM（直读分页 cache） |
@@ -46,7 +51,8 @@
 | **每层额外 GPU ops** | 0 | ~5（gather + mask + cumsum + reshape + varlen） | 0 |
 | **eager tok/s** | 21.4 | （未单独 bench） | **19.52** |
 
-**结论**：Route A 让 sglang decode 走与 vLLM **完全相同**的 attention 路径（无 gather），attention
+**结论**：vllm_flash_attn 路径让 sglang decode 走与 vLLM **完全相同**的 attention 路径（无 gather；
+其 `_vllm_fa2_C.so` 现由 **Route B 从源码自编**，不再依赖 vLLM venv），attention
 单项差距基本消除。剩余 eager 差距（19.52 vs 21.4 = -9%）来自 sampler + 少量 matmul/kernel 差异
 （见 §2.2），不再是 gather 开销。
 
@@ -55,7 +61,7 @@
 | 算子类别 | vLLM（登临优化） | sglang（当前） | 估计性能损失 |
 |---|---|---|---|
 | **RMSNorm** | dleol kernel | dlcc kernel ✅（已接入） | ~0 |
-| **Attention decode** | dleol `cudnnMHAVarlenForward*` | dleol `cudnnMHAVarlenForward*`（Route A: vllm_flash_attn）✅ | ~0（旧 gather 路径曾损 ~6 tok/s，Route A 已消除） |
+| **Attention decode** | dleol `cudnnMHAVarlenForward*` | dleol `cudnnMHAVarlenForward*`（vllm_flash_attn；.so 由 Route B 自编）✅ | ~0（旧 gather 路径曾损 ~6 tok/s，已消除） |
 | **RoPE** | dlcc `rotary_embedding` | dlcc `rotary_embedding` ✅ | ~0 |
 | **Linear / matmul** | dlblasLt（DLIN-optimized GEMM） | torch `nn.Linear`（DLIN torch 内置） | ~1 tok/s |
 | **Sampler** | DL flashinfer-ext | pytorch fallback | ~0.5 tok/s |
@@ -129,7 +135,8 @@ eager 可靠实测（Qwen3-1.7B bf16，DLIN KS38，NEW=64，RUNS=8，**warmup �
 - **cuda graph 在 DLIN net-negative**（实测 sglang graph 比 eager **慢**，全部 batch：bs=1 60.5 vs 48.2ms，bs=64 312.6 vs 147.2ms）。**这与 vLLM graph 在 DLIN 有效形成对比**——若 sglang 真有高 eager-dispatch 开销，graph 本应消除它（却没有），指向 **sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题**，是一条独立排查线。
 
 > **勘误（2026-06-30）**：本节前一版本曾断言根因 =「fusion 缺失 + dlblasLt」。该结论已被上述
-> 实测**证伪并撤回**——sglang 已融合、dlblas 对 bf16 N/A、matmul 双方等价。差距真实但根因待隔离。
+> 实测**证伪并撤回**——sglang 已融合、dlblas 对 bf16 N/A、matmul 双方等价。后续查明所谓的「tail
+> 差距」= JIT warmup 假象（见下条裁决），并非真实 compute 差距。
 
 **裁决**：sglang vs vLLM 在 DLIN（Qwen3-1.7B bf16）**稳态持平**（median 全 batch +2~7%）——既无
 compute/kernel/fusion 差距，147ms tail 也已查明为 JIT warmup 假象（warmup 对齐 `temperature=0` 即消除）。
@@ -142,25 +149,31 @@ compute/kernel/fusion 差距，147ms tail 也已查明为 JIT warmup 假象（wa
 
 每项标注：预估收益、工作量、依赖。
 
-### P0：消除 gather 开销 ✅ 已达成（Route A）
+### P0：消除 gather 开销 ✅ 已达成（现走 Route B：从源码自编 _vllm_fa2_C.so）
 
 **目标**：让 sglang decode 直接走 `cudnnMHAVarlenForward*`（和 vLLM 一样），不 gather。
 
 | 方案 | 做法 | 依赖 | 状态 |
 |---|---|---|---|
-| **A. vllm_flash_attn** ✅ | 复用 vLLM DL venv 里的 DLIN-patched `_vllm_fa2_C.so`（dl19 build，与 dl24 torch ABI 兼容）；`scripts/dl/setup_vllm_flash_attn.sh` 自动复制 | 无新依赖 | **已生效**：eager 19.52 + FULL graph 16.64 ✅干净 |
-| **B. 自编 vllm_flash_attn** | 本地 flash-attention 源码 + vLLM CMake 壳，dlcc 编译 | 复刻 vLLM CMake FetchContent | 3-5 天（A 已够用，无需） |
+| **A. vllm_flash_attn**（已废弃） | ~~从 vLLM DL venv 复制 DLIN-patched `_vllm_fa2_C.so`（dl19 build）~~；`setup_vllm_flash_attn.sh` 现降级为 Route B 的薄 shim | 无 | 被 Route B 取代（不再从 vLLM venv 复制）。历史数据：eager 19.52 + FULL graph 16.64 ✅ |
+| **B. 自编 vllm_flash_attn** ✅ | 直接驱动 DLIN flash-attn 仓库自带 `CMakeLists.txt` 作顶层项目（`_vllm_fa2_C` = 纯 C++：`flash_api.cpp`+`flash_attn_dlgpu.cpp`，无 .cu/gencode），dlcc 编译 | `scripts/dl/build_dlin_vllm_flash_attn.sh`（无需复刻 vLLM CMake，原估 3-5 天被高估） | **已完成**：370KB Release .so，与 copied 逐 bit 一致（max diff 0.0），vs SDPA max_err 5e-4 |
 | **C. 自写 paged-decode kernel** ✅ | `sgl-kernel/csrc/elementwise/paged_decode_attn_dl.cu`（精确 vs SDPA, graph-safe） | 无 | 已提交 `9986422670`；eager 19.45 |
 
-**当前状态**：Route A 已达成——**无需登临再出匹配 wheel**，dl19 的 `_vllm_fa2_C.so` 直接复用
-即可（见 `setup_vllm_flash_attn.sh`；冷启动 JIT "to bc failed" 由 model warmup 预热 dleol 缓存
-绕过，见 `dlin-fa2-decode-bug-report.md`）。`jit_kernel/flash_attention.py` 的
-`_dlin_vllm_flash_attn_ok()` 分支已就绪，.so 在位即自动走 varlen+block_table 直读路径。**意外
-收获**：Route A 让 FULL graph 输出干净（见 §2.3 修正）。
+**当前状态**：**Route B 已达成**——sglang 用自己的 driver（`scripts/dl/build_dlin_vllm_flash_attn.sh`）
+直接驱动 DLIN flash-attn 仓库自带 `CMakeLists.txt`，dlcc 编译出 `_vllm_fa2_C.so`（370KB Release），
+**不再从 vLLM venv 复制**。关键简化：DLIN 版 `_vllm_fa2_C` 是纯 C++（无 .cu/gencode），仓库自带
+CMake 即可作顶层项目编译，原「复刻 vLLM CMake / 3-5 天」被高估。构建产物与原 copied .so **逐 bit
+一致**（max diff 0.0）、vs SDPA max_err 5e-4（`scripts/dl/test_dlin_vllm_fa2_correctness.py`）。
+冷启动 JIT "to bc failed" 仍由 model warmup 预热 dleol 缓存绕过（见 `dlin-fa2-decode-bug-report.md`）。
+`jit_kernel/flash_attention.py` 的 `_dlin_vllm_flash_attn_ok()` 分支已就绪，.so 在位即自动走
+varlen+block_table 直读路径。Route A 的 venv 复制法（`setup_vllm_flash_attn.sh`）现已降级为
+Route B 的薄 shim。**意外收获**：vllm_flash_attn 路径让 FULL graph 输出干净（见 §2.3 修正）。
 
 **当前最优 = Route C**：`paged_decode_attn` 已能单独跑干净 FULL graph（≈17.9 tok/s，见 §2.3 裁决
-实验），**无需 vllm_flash_attn**——比 Route A 的 FULL（16.6）更快且无外部 .so 依赖。Route A
-降级为对照/备用。
+实验），比 vllm_flash_attn 的 FULL（16.6）更快且纯 in-tree 无任何 .so 依赖——decode 默认走它。
+**Route B**（自编 `_vllm_fa2_C.so`，现已从源码构建完成）作为 vllm_flash_attn 路径的自给自足来源
+（不再依赖 vLLM venv），与 Route C 并存：Route C 胜在性能/零依赖，Route B 胜在与 vLLM attention
+路径完全对齐（对照/备用）。Route A 的 venv 复制法已废弃。
 
 ### P1：BREAKABLE graph 修复 ✅ 已完成
 
@@ -196,9 +209,10 @@ decode 方案。
 
 **graph 性能：DLIN 上 net-negative（非解法）。** 实测 sglang FULL graph 比 eager **慢**，全部 batch
 （bs=1: 60.5 vs 48.2ms；bs=64: 312.6 vs 147.2ms），penalty 随 batch 增长——replay/static-pool 开销
-> launch 节省。∴ sglang 的性能路径是 **eager + fusion（P2a）+ dlblasLt（P2b）**，不是 graph。
-vLLM 的 graph 有效是因其 forward 已高度融合+dlblasLt，graph 仅锦上添花；sglang 反被 per-batch
-静态池开销拖累。
+> launch 节省。∴ 对 bf16 dense 模型，sglang 的性能路径就是 **eager**（§2.4 已证不存在 fusion/dlblasLt
+差距，勿移植）；graph 在 DLIN 上对 sglang 当前实现不划算。vLLM 的 graph 在 DLIN 有效而 sglang 无效，
+指向 **sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题**（§2.4 末条独立排查线），
+而非 fusion/dlblasLt 差异（bf16 下双方等价）。
 
 ### P4：vLLM 独有优化（路线图储备）
 
@@ -222,7 +236,7 @@ vLLM 的 graph 有效是因其 forward 已高度融合+dlblasLt，graph 仅锦�
 > 注：batch=1 时 graph 比 eager 慢（forward 太轻量，graph 管理开销 > launch 节省）。
 > Graph 收益在大 batch（concurrent serving）时才显著。当前 sglang 的 FULL graph
 > (vllm_flash_attn) 与 BREAKABLE graph (paged_decode_attn) 均已正确+干净，为大 batch 场景
-> 准备就绪，但 batch=1 bench 不体��其价值。
+> 准备就绪，但 batch=1 bench 不体现其价值。
 
 ---
 
@@ -263,7 +277,7 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 
 - **paged_decode_attn_dl.cu**：自定义 dlcc 内核，直接读分页 KV（无 gather），graph-safe
 - **BREAKABLE backend fix**：`breakable_cuda_graph_backend.py` LogitsProcessor 处理
-- **vllm_flash_attn dormant path**：wheel 到手即自动切换
+- **vllm_flash_attn 自编路径（Route B，2026-07-01）**：`scripts/dl/build_dlin_vllm_flash_attn.sh` 直接驱动 DLIN flash-attn 源码编译 `_vllm_fa2_C.so`（纯 C++，dlcc）——不再 dormant、不再等 wheel、不依赖 vLLM venv；正确性 `scripts/dl/test_dlin_vllm_fa2_correctness.py`（vs SDPA 5e-4，与旧 copied .so 逐 bit 一致）
 - **docs/dl/**：gap analysis + bug report + wheel request
 - **scripts/dl/**：repro, bench (sglang + vLLM), 5 个 correctness tests
 
@@ -311,7 +325,7 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 
 | 优先级 | 项 | 做法 | 依赖 |
 |---|---|---|---|
-| **O1（根治）** | **sglang FP8 → dlblasLtMatmul** | **C API 已定位**��`dlblasLtMatmul`（`sdk/include/dlblasLt_ext.h:208`）+ `dlblasLtMatmulGetWorkspace`，支持 **W8A8 + 2D block 量化**（`dlblasLtQuantParamsConfigSetGroupSize` 设 group_size_row/col=128）——正好匹配模型 `weight_block_size=[128,128]`。这即 vLLM `fp8_dlblas`/`apply_w8a8_block_fp8_linear` 底层。**优化 = 给 sglang 写 C++ extension（或 torch op）wrap `dlblasLtMatmul`**，接入 FP8 quant method（linear + FusedMoE expert）的 DLIN 分支。dlblas 无 Python binding，需自建（仿 vLLM `_dl_C`）。 | dlblasLtMatmul C++ extension |
+| **O1（根治）** | **sglang FP8 → dlblasLtMatmul** | **C API 已定位**：`dlblasLtMatmul`（`sdk/include/dlblasLt_ext.h:208`）+ `dlblasLtMatmulGetWorkspace`，支持 **W8A8 + 2D block 量化**（`dlblasLtQuantParamsConfigSetGroupSize` 设 group_size_row/col=128）——正好匹配模型 `weight_block_size=[128,128]`。这即 vLLM `fp8_dlblas`/`apply_w8a8_block_fp8_linear` 底层。**优化 = 给 sglang 写 C++ extension（或 torch op）wrap `dlblasLtMatmul`**，接入 FP8 quant method（linear + FusedMoE expert）的 DLIN 分支。dlblas 无 Python binding，需自建（仿 vLLM `_dl_C`）。 | dlblasLtMatmul C++ extension |
 | O2 | 解决 #6 Triton FP8 bitcast | O1 接入 dlblas 后，FP8 GEMM 不再走 Triton → bitcast 自然消失 | O1 |
 | O3 | 补齐 sgl_kernel DLIN 构建 | 把 `gemma_rmsnorm`/`rmsnorm`/`fused_add_rmsnorm` 等 norm ops 编进 DLIN sgl_kernel .so（替代 #1/#4 的 native fallback，提性能） | DLIN sgl_kernel 编译 |
 | O4 | linear-attn 的 Hopper Triton extras | 评估 FLA kernels 还依赖哪些 Hopper Triton 特性（TMA/wgmma 等），逐个提供 DLIN 等价或 fallback | DLIN Triton 能力 |
@@ -349,3 +363,24 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 - vLLM（跑通）：同 env（dl19 SDK + `venv-vllm021`）→ `python scripts/dl/run_qwen35_35b_vllm.py`（TP=2 eager；自动 `fp8_dlblas`）
 - /mars NFS 读速 ~5 MB/s（慢），**用本地副本** `/LocalRun/xi.chen/Qwen3.5-35B-A3B-FP8` 加载。
 
+
+### 7.5 优化实测（2026-07-02，按顺序开展）
+
+| 优化步骤 | 结果 | 结论 |
+|---|---|---|
+| O1a cuda-graph | 0.052 vs 0.047 tok/s (~10%) | ❌ 排除（kernel-bound，非 dispatch） |
+| dlblasGemmExV2 探测 (6 configs) | 全部 rc=15 NOT_SUPPORTED | ❌ 公共 API 不足 |
+| dlblasLtMatmul 探测 | DLEOL graph-instantiation err | ❌ 需 DLIN 内部描述符知识 |
+| **vLLM _dl_C.so 加载** | `gptq_dlblas_gemmex` 可用 ✅ | ✅ dl19→dl24 ABI 兼容 |
+| **O1: dlblas FP8 线性路由** | **0.047 → 0.087 tok/s (1.8×)** | ✅ 已提交 |
+| O1: dlblas FP8 MoE 路由 | 0.087 (无变化) | ❌ MoE 非瓶颈 |
+| O1: cuda-graph + dlblas | 0.087 (无变化) | ❌ 非 launch 开销 |
+
+**瓶颈转移（关键发现）**：所有配置（±MoE dlblas、±cuda-graph）均 ≈0.087 tok/s。
+**FP8 GEMM（linear + MoE）不是瓶颈**——剩余 ~95% decode 时间在 **FLA linear-attn**
+（30/40 层的 GatedDeltaNet Triton kernel，Hopper 专用 gdc_wait 被 stub）。
+
+**vLLM 12.63 tok/s 的原因**：vLLM 的 DL platform plugin 有 **DLIN 适配的 FLA kernel**
+（`dl_gdn_attn.py`、`dl_flash_attn.py`），sglang 用上游 Hopper Triton FLA kernel（gdc stub）。
+
+**下一步**：移植 vLLM 的 DL FLA kernel 或为 DLIN 重写 GatedDeltaNet。
