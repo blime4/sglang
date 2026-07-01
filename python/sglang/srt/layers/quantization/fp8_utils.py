@@ -486,8 +486,62 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
+# DL begin — dlblas FP8 blockwise linear via vLLM's _dl_C binding (gptq_dlblas_gemmex).
+# The public dlblas APIs (dlblasGemmExV2/dlblasLtMatmul) fail from standalone C++ extensions
+# (descriptor setup requires DLIN-internal knowledge). vLLM's _dl_C.so (built by DLIN engineers)
+# has the correct binding. It's dl19-built but ABI-compatible with dl24 torch (same as vllm_flash_attn).
+_dl_C_loaded = False
+
+
+def _ensure_dl_C():
+    global _dl_C_loaded
+    if not _dl_C_loaded:
+        import os
+        for p in [
+            "../venv-vllm021/lib/python3.12/site-packages/vllm/_dl_C.cpython-312-x86_64-linux-gnu.so",
+        ]:
+            if os.path.exists(p):
+                torch.ops.load_library(p)
+                break
+        _dl_C_loaded = (
+            hasattr(torch.ops, "_dl_C")
+            and hasattr(torch.ops._dl_C, "gptq_dlblas_gemmex")
+        )
+
+
+def dlblas_w8a8_block_fp8_linear(
+    input, weight, block_size, weight_scale, input_scale=None, bias=None
+):
+    _ensure_dl_C()
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    out = torch.ops._dl_C.gptq_dlblas_gemmex(
+        input_2d,
+        weight.t().contiguous(),  # [N,K] → [K,N]
+        weight_scale.contiguous(),
+        weight_scale.contiguous(),  # symmetric FP8: qzeros = scales
+        quant_type=2,
+        bit=8,
+    )
+    if bias is not None:
+        out = out + bias
+    return out.to(dtype=input.dtype).view(*input.shape[:-1], weight.shape[0])
+
+
+# DL end
+
+
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
+    # DL begin: on DLIN, use dlblas FP8 GEMM (via vLLM's _dl_C binding) — the only
+    # fast FP8 path; triton/cutlass are pathologically slow on DLIN.
+    try:
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+        if _is_dlin():
+            return dlblas_w8a8_block_fp8_linear
+    except Exception:
+        pass
+    # DL end
+
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
