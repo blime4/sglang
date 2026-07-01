@@ -384,3 +384,19 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 （`dl_gdn_attn.py`、`dl_flash_attn.py`），sglang 用上游 Hopper Triton FLA kernel（gdc stub）。
 
 **下一步**：移植 vLLM 的 DL FLA kernel 或为 DLIN 重写 GatedDeltaNet。
+
+### 7.6 测量修正：prefill/decode 分离（2026-07-02）
+
+之前 N=4 的 SG_TPS（0.087 tok/s = 11.5s/token）**包含 prompt prefill**（~26s），过度高估
+了 decode 时间。用 N=4 vs N=16 分解：
+
+| | sglang (dlblas linear) | vLLM |
+|---|---|---|
+| **prefill** (~5 token prompt) | ~26s | ~0.5s |
+| **decode/token** | ~5.0s | ~48ms |
+| **decode gap** | — | **~104×**（比之前估算的 268× 小，但仍然大） |
+
+差距来源（按时间占比）：
+- **FLA linear-attn**（30/40 层 GatedDeltaNet，Hopper Triton + gdc stub）→ 主导 decode + prefill。
+- **FP8 GEMM**（linear dlblas 已 1.8×，MoE 已排除）。
+- **cuda-graph** 无效（kernel-bound 非 dispatch-bound）。
