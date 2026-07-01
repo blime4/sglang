@@ -1900,20 +1900,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         try:
             from sglang.srt.utils.common import is_dlin as _is_dlin
 
-            if _is_dlin():
+            if _is_dlin() and os.environ.get("SGLANG_DL_MOE_DLBLAS", "0") == "1":
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
 
                 _ensure_dl_C()
                 topk_weights, topk_ids, _ = dispatch_output.topk_output
-                num_experts = layer.w13_weight.shape[0]
                 inter = layer.w13_weight.shape[1] // 2
                 out = torch.zeros_like(x)
-                for e in range(num_experts):
-                    mask = topk_ids == e
-                    if not mask.any():
-                        continue
-                    tok_idx, kop_idx = mask.nonzero(as_tuple=True)
+                # Only iterate over ACTIVE experts (from topk_ids, ~8 for batch=1),
+                # not all 256. Avoids 256× mask.any() host-syncs.
+                active_experts = topk_ids.flatten().unique().tolist()
+                for e in active_experts:
+                    expert_mask = topk_ids == e
+                    tok_idx, kop_idx = expert_mask.nonzero(as_tuple=True)
                     xe = x[tok_idx]
                     gu = torch.ops._dl_C.gptq_dlblas_gemmex(
                         xe,
