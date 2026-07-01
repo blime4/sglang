@@ -321,12 +321,12 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 > 每 token ~10240 个 expert FP8 GEMM）走未优化的 CUTLASS/Triton 路径 + eager 无 cuda-graph。
 > **差距 ~268×**（vLLM 快 268 倍）。O1（FP8→dlblas）+ cuda-graph 是缩小差距的核心。
 >
-> **优化进行中（2026-07-01，受 GPU 资源阻塞）**：① cuda-graph（O1a）尝试时 OOM，但当时 GPU 1,2 被
-> **hao.dong 的 vLLM job（TP0-7）占用**（session 中途进来），OOM 实为资源争用**非** cuda-graph 本身内存
-> 不足 → cuda-graph 是否可行**待 free GPU 复测**。② 为定位 bottleneck（MoE vs linear-attn），已给
-> `qwen3_5.py` 加 `cuda.Event` 计时（lin_attn vs mlp），**但全 32 GPU 已被占满（25-32GB each）**，
-> 无法跑。**下一步（GPU 空闲后）**：跑 instrumentation → 若 MoE 主导则 O1 dlblas port；若 linear-attn
-> 主导则 FLA kernel 适配。
+> **优化进行中（2026-07-01）**：① **cuda-graph（O1a）已实测 → 0.052 tok/s**（vs eager 0.047，仅 +10%，
+> 噪声级）——**排除**。这证明差距是 **kernel-bound**（FP8 MoE GEMM 本身慢），非性 launch/dispatch 开销；
+> cuda-graph（消除 launch 开销）无效。**∴ O1 dlblas FP8 kernel port 是缩小差距的唯一路径**。
+> ② 集群 GPU 长期高 contention（其他用户 job 反复抢占 GPU，多个 run 被 OOM/unbalanced 打断），
+> bottleneck instrumentation（MoE vs linear-attn）暂未取得——但 vLLM 的 win 完全在 FP8 MoE（dlblas），
+> 故 dlblas port 为高置信度首要项（实现指南见下）。
 
 **O1 实现指南（dlblas FP8 port，待 stable GPU 实现+验证）**：
 
