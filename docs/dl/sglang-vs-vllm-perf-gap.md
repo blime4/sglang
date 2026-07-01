@@ -320,6 +320,13 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 > sglang 跑通但 **decode 极慢：0.047 tok/s**（4 tokens / 85s）——sglang 的 FP8 MoE（256 experts × 40 层，
 > 每 token ~10240 个 expert FP8 GEMM）走未优化的 CUTLASS/Triton 路径 + eager 无 cuda-graph。
 > **差距 ~268×**（vLLM 快 268 倍）。O1（FP8→dlblas）+ cuda-graph 是缩小差距的核心。
+>
+> **优化进行中（2026-07-01，受 GPU 资源阻塞）**：① cuda-graph（O1a）尝试时 OOM，但当时 GPU 1,2 被
+> **hao.dong 的 vLLM job（TP0-7）占用**（session 中途进来），OOM 实为资源争用**非** cuda-graph 本身内存
+> 不足 → cuda-graph 是否可行**待 free GPU 复测**。② 为定位 bottleneck（MoE vs linear-attn），已给
+> `qwen3_5.py` 加 `cuda.Event` 计时（lin_attn vs mlp），**但全 32 GPU 已被占满（25-32GB each）**，
+> 无法跑。**下一步（GPU 空闲后）**：跑 instrumentation → 若 MoE 主导则 O1 dlblas port；若 linear-attn
+> 主导则 FLA kernel 适配。
 
 ### 7.4 复现
 
