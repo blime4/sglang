@@ -36,6 +36,8 @@ def main():
         page_size=16,
         mem_fraction_static=float(os.environ.get("MEM_FRAC", "0.80")),
         disable_cuda_graph=not CG,
+        context_length=int(os.environ.get("CONTEXT_LEN", "4096")),  # cap KV pool (model default 262144 -> OOM)
+        max_running_requests=int(os.environ.get("MAX_RUNNING_REQUESTS", "0")) or None,
     )
     if CG and CG_MAX_BS:
         kw["cuda_graph_max_bs_decode"] = CG_MAX_BS
