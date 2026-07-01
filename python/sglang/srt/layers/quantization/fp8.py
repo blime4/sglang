@@ -1896,6 +1896,50 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
+        # DL begin: DLIN — per-expert dlblas FP8 GEMM via gptq_dlblas_gemmex (_dl_C)
+        try:
+            from sglang.srt.utils.common import is_dlin as _is_dlin
+
+            if _is_dlin():
+                from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
+                import torch.nn.functional as F
+
+                _ensure_dl_C()
+                topk_weights, topk_ids, _ = dispatch_output.topk_output
+                num_experts = layer.w13_weight.shape[0]
+                inter = layer.w13_weight.shape[1] // 2
+                out = torch.zeros_like(x)
+                for e in range(num_experts):
+                    mask = topk_ids == e
+                    if not mask.any():
+                        continue
+                    tok_idx, kop_idx = mask.nonzero(as_tuple=True)
+                    xe = x[tok_idx]
+                    gu = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        xe,
+                        layer.w13_weight[e].t().contiguous(),
+                        layer.w13_weight_scale_inv[e].contiguous(),
+                        layer.w13_weight_scale_inv[e].contiguous(),
+                        quant_type=2,
+                        bit=8,
+                    )
+                    gate, up = gu[..., :inter], gu[..., inter:]
+                    he = F.silu(gate) * up
+                    de = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        he,
+                        layer.w2_weight[e].t().contiguous(),
+                        layer.w2_weight_scale_inv[e].contiguous(),
+                        layer.w2_weight_scale_inv[e].contiguous(),
+                        quant_type=2,
+                        bit=8,
+                    )
+                    w = topk_weights[tok_idx, kop_idx]
+                    out.index_add_(0, tok_idx, de * w.unsqueeze(-1))
+                return StandardCombineInput(hidden_states=out)
+        except Exception as _dl_moe_err:
+            logger.warning(f"DLIN MoE dlblas branch failed: {_dl_moe_err}")
+        # DL end
+
         if use_intel_xpu_backend():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
