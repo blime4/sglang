@@ -1909,8 +1909,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_weights, topk_ids, _ = dispatch_output.topk_output
                 inter = layer.w13_weight.shape[1] // 2
                 out = torch.zeros_like(x)
-                # Only iterate over ACTIVE experts (from topk_ids, ~8 for batch=1),
-                # not all 256. Avoids 256× mask.any() host-syncs.
+
                 active_experts = topk_ids.flatten().unique().tolist()
                 for e in active_experts:
                     expert_mask = topk_ids == e
@@ -1918,9 +1917,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     xe = x[tok_idx]
                     gu = torch.ops._dl_C.gptq_dlblas_gemmex(
                         xe,
-                        layer.w13_weight[e].t().contiguous(),
-                        layer.w13_weight_scale_inv[e].contiguous(),
-                        layer.w13_weight_scale_inv[e].contiguous(),
+                        layer.w13_weight[e].t(),
+                        layer.w13_weight_scale_inv[e],
+                        layer.w13_weight_scale_inv[e],
                         quant_type=2,
                         bit=8,
                     )
@@ -1928,9 +1927,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     he = F.silu(gate) * up
                     de = torch.ops._dl_C.gptq_dlblas_gemmex(
                         he,
-                        layer.w2_weight[e].t().contiguous(),
-                        layer.w2_weight_scale_inv[e].contiguous(),
-                        layer.w2_weight_scale_inv[e].contiguous(),
+                        layer.w2_weight[e].t(),
+                        layer.w2_weight_scale_inv[e],
+                        layer.w2_weight_scale_inv[e],
                         quant_type=2,
                         bit=8,
                     )
