@@ -947,6 +947,16 @@ class Gemma4RMSNorm(MultiPlatformOp):
         return x * torch.pow(mean_squared, -0.5)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        # DL begin — use torch.nn.functional.rms_norm when available (1 fused op vs ~9 dispatches)
+        try:
+            import torch.nn.functional as _F
+            w = self.weight.float()
+            if self.with_scale:
+                w = w + self.scale_shift
+            return _F.rms_norm(x.float(), [x.shape[-1]], w, self.eps).to(x.dtype)
+        except Exception:
+            pass
+        # DL end
         normed_output = self._norm(x.float())
         if self.with_scale:
             normed_output = normed_output * (self.weight.float() + self.scale_shift)
