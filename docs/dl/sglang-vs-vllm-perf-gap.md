@@ -400,3 +400,26 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 - **FLA linear-attn**（30/40 层 GatedDeltaNet，Hopper Triton + gdc stub）→ 主导 decode + prefill。
 - **FP8 GEMM**（linear dlblas 已 1.8×，MoE 已排除）。
 - **cuda-graph** 无效（kernel-bound 非 dispatch-bound）。
+
+### 7.7 dlblas MoE dtype bug 修复 — 32× 总提升（2026-07-02）
+
+**关键发现**：dlblas MoE 路由此前**每次调用都静默失败**（`index_add_(): self
+(BFloat16) and source (Float) must have the same scalar type`），导致每次回退到
+340ms/layer 的慢 triton `fused_experts`。
+
+根因：`topk_weights` 是 float32，`out` 是 bf16 → `de * w.unsqueeze(-1)` 是 Float
+→ `index_add_` 类型不匹配。同时 `os` 未在 apply 作用域导入。
+
+修复后实测（TP=2, eager, batch=1, N=16）：
+
+| 阶段 | tok/s | vs baseline | vs vLLM |
+|---|---|---|---|
+| baseline (triton FP8) | 0.047 | 1× | 268× |
+| + dlblas FP8 linear | 0.087 | 1.8× | 145× |
+| **+ dlblas FP8 MoE (fixed)** | **1.502** | **32×** | **8.4×** |
+
+剩余 8.4× 差距来源（按估计占比）：
+- per-expert Python 循环开销（8 experts × 2 GEMM，vs vLLM 的 C++ fused kernel）
+- FLA linear-attn Triton kernel（30/40 层，仍用 Hopper-stubbed Triton）
+- conv1d_update + track_mamba_state Triton kernel
+- engine round-trip overhead
