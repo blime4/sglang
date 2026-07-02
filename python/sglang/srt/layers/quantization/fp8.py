@@ -1911,11 +1911,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 out = torch.zeros_like(x)
 
                 # DL begin — graph-safe fixed-size loop (no .tolist()/.item()/.unique())
-                # Iterate over topk slots (always num_experts_per_tok = 8), not unique experts.
-                # Tensor indexing (graph-safe) replaces host-side expert ID resolution.
                 num_topk = topk_ids.shape[1]
                 for k in range(num_topk):
-                    e = topk_ids[0, k]  # tensor index — graph-safe
+                    e = topk_ids[0, k]
                     gu = torch.ops._dl_C.gptq_dlblas_gemmex(
                         x,
                         layer.w13_weight[e].t(),
