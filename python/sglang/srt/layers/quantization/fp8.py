@@ -1900,7 +1900,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         try:
             from sglang.srt.utils.common import is_dlin as _is_dlin
 
-            if _is_dlin() and os.environ.get("SGLANG_DL_MOE_DLBLAS", "0") == "1":
+            import os as _os
+            if _is_dlin() and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "0") == "1":
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
 
@@ -1934,10 +1935,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         bit=8,
                     )
                     w = topk_weights[tok_idx, kop_idx]
-                    out.index_add_(0, tok_idx, de * w.unsqueeze(-1))
+                    out.index_add_(0, tok_idx, (de * w.unsqueeze(-1)).to(out.dtype))
                 return StandardCombineInput(hidden_states=out)
         except Exception as _dl_moe_err:
-            logger.warning(f"DLIN MoE dlblas branch failed: {_dl_moe_err}")
+            print(f"DL_MOE_ERR: {_dl_moe_err}", flush=True)
         # DL end
 
         if use_intel_xpu_backend():
