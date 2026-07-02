@@ -1916,7 +1916,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_g = layer.w2_weight[expert_ids]    # [8, hidden, inter]
                 sc13_g = layer.w13_weight_scale_inv[expert_ids]
                 sc2_g = layer.w2_weight_scale_inv[expert_ids]
-                tw = topk_weights[0]  # [8] — pre-index
+                tw = topk_weights[0].to(out.dtype)  # pre-cast to avoid .to() in loop
 
                 num_topk = topk_ids.shape[1]
                 for k in range(num_topk):  # k is Python int — w13_g[k] is a free view, no torch dispatch
@@ -1926,7 +1926,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     he = F.silu(gate) * up
                     de = torch.ops._dl_C.gptq_dlblas_gemmex(
                         he, w2_g[k].t(), sc2_g[k], sc2_g[k], quant_type=2, bit=8)
-                    out += (de * tw[k]).to(out.dtype)
+                    out += de * tw[k]
                 # DL end
                 return StandardCombineInput(hidden_states=out)
         except Exception as _dl_moe_err:

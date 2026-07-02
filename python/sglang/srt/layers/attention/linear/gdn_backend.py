@@ -340,9 +340,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
             )
-            self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
-            )
+            # DL begin — skip track_mamba when env set (saves 1 Triton kernel/layer)
+            if not __import__("os").environ.get("SGLANG_DL_SKIP_TRACK_MAMBA"):
+                self._track_mamba_state_decode(
+                    forward_batch, conv_states, ssm_states, cache_indices
+                )
+            # DL end
             return core_attn_out
 
         query, key, value = torch.split(
@@ -369,9 +372,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
+        # DL begin
+        if not __import__("os").environ.get("SGLANG_DL_SKIP_TRACK_MAMBA"):
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+        # DL end
 
         return core_attn_out
 
