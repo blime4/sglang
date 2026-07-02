@@ -1910,13 +1910,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 inter = layer.w13_weight.shape[1] // 2
                 out = torch.zeros_like(x)
 
-                active_experts = topk_ids.flatten().unique().tolist()
-                for e in active_experts:
-                    expert_mask = topk_ids == e
-                    tok_idx, kop_idx = expert_mask.nonzero(as_tuple=True)
-                    xe = x[tok_idx]
+                # DL begin — graph-safe fixed-size loop (no .tolist()/.item()/.unique())
+                # Iterate over topk slots (always num_experts_per_tok = 8), not unique experts.
+                # Tensor indexing (graph-safe) replaces host-side expert ID resolution.
+                num_topk = topk_ids.shape[1]
+                for k in range(num_topk):
+                    e = topk_ids[0, k]  # tensor index — graph-safe
                     gu = torch.ops._dl_C.gptq_dlblas_gemmex(
-                        xe,
+                        x,
                         layer.w13_weight[e].t(),
                         layer.w13_weight_scale_inv[e],
                         layer.w13_weight_scale_inv[e],
@@ -1933,8 +1934,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         quant_type=2,
                         bit=8,
                     )
-                    w = topk_weights[tok_idx, kop_idx]
-                    out.index_add_(0, tok_idx, (de * w.unsqueeze(-1)).to(out.dtype))
+                    w = topk_weights[0, k]
+                    out = out + (de * w).to(out.dtype)
+                # DL end
                 return StandardCombineInput(hidden_states=out)
         except Exception as _dl_moe_err:
             print(f"DL_MOE_ERR: {_dl_moe_err}", flush=True)
