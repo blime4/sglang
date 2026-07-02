@@ -1910,30 +1910,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 inter = layer.w13_weight.shape[1] // 2
                 out = torch.zeros_like(x)
 
-                # DL begin — graph-safe fixed-size loop (no .tolist()/.item()/.unique())
+                # DL begin — pre-gather expert weights (4 index ops vs 32 in-loop tensor-index ops)
+                expert_ids = topk_ids[0]  # [8] — one advanced index
+                w13_g = layer.w13_weight[expert_ids]  # [8, 2*inter, hidden]
+                w2_g = layer.w2_weight[expert_ids]    # [8, hidden, inter]
+                sc13_g = layer.w13_weight_scale_inv[expert_ids]
+                sc2_g = layer.w2_weight_scale_inv[expert_ids]
+                tw = topk_weights[0]  # [8] — pre-index
+
                 num_topk = topk_ids.shape[1]
-                for k in range(num_topk):
-                    e = topk_ids[0, k]
+                for k in range(num_topk):  # k is Python int — w13_g[k] is a free view, no torch dispatch
                     gu = torch.ops._dl_C.gptq_dlblas_gemmex(
-                        x,
-                        layer.w13_weight[e].t(),
-                        layer.w13_weight_scale_inv[e],
-                        layer.w13_weight_scale_inv[e],
-                        quant_type=2,
-                        bit=8,
-                    )
+                        x, w13_g[k].t(), sc13_g[k], sc13_g[k], quant_type=2, bit=8)
                     gate, up = gu[..., :inter], gu[..., inter:]
                     he = F.silu(gate) * up
                     de = torch.ops._dl_C.gptq_dlblas_gemmex(
-                        he,
-                        layer.w2_weight[e].t(),
-                        layer.w2_weight_scale_inv[e],
-                        layer.w2_weight_scale_inv[e],
-                        quant_type=2,
-                        bit=8,
-                    )
-                    w = topk_weights[0, k]
-                    out = out + (de * w).to(out.dtype)
+                        he, w2_g[k].t(), sc2_g[k], sc2_g[k], quant_type=2, bit=8)
+                    out += (de * tw[k]).to(out.dtype)
                 # DL end
                 return StandardCombineInput(hidden_states=out)
         except Exception as _dl_moe_err:
