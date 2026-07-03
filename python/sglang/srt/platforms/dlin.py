@@ -23,6 +23,44 @@ from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import DeviceCapability
 
 
+def _install_triton_gdc_stubs() -> None:
+    """Inject no-op Hopper-PDL stubs into ``triton.language.extra.cuda``.
+
+    DLIN's Triton has no ``gdc_wait`` / ``gdc_launch_dependents`` (no Hopper PDL).
+    Several kernels (FLA ``layernorm_gated``, ``fp8_quantize``, ``mla``) reference
+    them inside dead ``if USE_GDC:`` branches. At runtime ``USE_GDC`` is False on
+    DLIN (``is_arch_support_pdl()``), so the branch never runs — BUT Triton's AST
+    dependency hasher walks the whole function body statically and does
+    ``getattr(extra.cuda, 'gdc_wait')`` at hash time, which raises AttributeError
+    when the cache is cold. The stubs make that ``getattr`` resolve to a harmless
+    ``@triton.jit`` no-op so hashing succeeds; the dead branch is never executed.
+    Idempotent: skipped if the attributes already exist (e.g. real Hopper Triton).
+    """
+    try:
+        import triton
+        import triton.language.extra.cuda as ext_cuda
+
+        @triton.jit
+        def _dl_gdc_wait():  # noqa: D401
+            pass
+
+        @triton.jit
+        def _dl_gdc_launch_dependents():  # noqa: D401
+            pass
+
+        if not hasattr(ext_cuda, "gdc_wait"):
+            ext_cuda.gdc_wait = _dl_gdc_wait
+        if not hasattr(ext_cuda, "gdc_launch_dependents"):
+            ext_cuda.gdc_launch_dependents = _dl_gdc_launch_dependents
+    except Exception:
+        # Triton not yet importable here — kernels import it later; the stubs are
+        # only needed before first Triton hash, which is at model warmup.
+        pass
+
+
+_install_triton_gdc_stubs()
+
+
 class DlinSRTPlatform(CudaSRTPlatform):
     """In-tree platform for Denglin (登临/DLIN) GPUs."""
 

@@ -285,6 +285,31 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 
 ## 7. Qwen3.5-35B-A3B-FP8 补充（2026-07-01，与 §1–6 的 Qwen3-1.7B bf16 不同模型）
 
+> ### ⚠️→✅ 重大更正（2026-07-03）：本节早期数据曾是「乱码的速度」——现已修复为「又对又快」
+>
+> 本节原先声称 sglang 输出与 vLLM「逐字一致」、以及 `0.047→2.48 tok/s` 的优化进展 —— **那些数字测的都是乱码输出的速度**。`2.48 tok/s` 路径（dlblas FP8 GEMM，`quant_type=2`）一直输出乱码（`' Imagive iniv.K.K'` 等），跨所有 attention/MoE backend、所有 prompt。
+>
+> **根因**：sglang 的 dlblas FP8 调用用了 **`quant_type=2`**（GPTQ-blockwise 模式，期望 GPTQ 打包权重），而 vLLM 的 DL FP8 scheme（`compressed_tensors_w8a8_fp8.py`）用 **`quant_type=1`（per-channel）** 或 `=0`（per-tensor）。microbench（`scripts/dl/sweep_fp8_layout.py`）：`qt=1`+per-channel scale → rel_err 0.003（正确）；`qt=2` → 1.75（乱码）；`qt=0` → DLIN JIT segfault。sglang 的 plain blockwise FP8 权重只有配合 `qt=1` 才被正确读取。
+>
+> **修复（又对又快）**：核心是改用正确的 `quant_type` / 反量化路径。
+> - **Linear**（`fp8_utils.dlblas_w8a8_block_fp8_linear`）：blockwise FP8 权重**反量化→按 per-channel 再量化**，首次调用转换并按 `data_ptr` 缓存（`_dl_pc_cache`），再用 `quant_type=1` + per-channel scale 调 `gptq_dlblas_gemmex`。默认开。
+> - **MoE**（`fp8.py` Fp8MoEMethod.apply DL 分支）：gather 出的 8 个 expert **blockwise 反量化到 bf16**（无损），用 **`torch.bmm`** 一次批量 GEMM（比 per-channel-FP8 循环更快且更精确——少一次 FP8 cast、无再量化损失）。**非 in-place**（prefill 的 triton fused_experts 仍需 blockwise）。decode-only（M==1）；prefill 走标准 triton。默认���（`SGLANG_DL_MOE_DLBLAS` 默认 1）。
+>
+> **结果：默认配置（��� env）现输出正确**（` Paris`、` 2 times 3 is 6`、连贯诗歌），**经全-triton blockwise ground truth 交叉验证一致**（`2+2=` 等给出的"怪"答案是推理模型 greedy 的自然行为，两条路径一致，非 bug）。eager ~1.52 tok/s，**cuda graph ~1.55 tok/s（最快配置）** —— 是正确全-triton 基线（0.064）的 **~24×**，约为旧乱码 dlblas 速度（2.48）的 63%。
+
+> **DLIN 原生 op 持续采用（2026-07-03）：** 发现 sglang 已加载的 `_dl_C.so`（vLLM 的）含全套 DLIN 原生 op，之前没用。本轮：
+> - **`gemma_rms_norm` / `fused_add_gemma_rms_norm`**（`layernorm.py` DL fallback 改用）—— 验证正确（rel_err 0.0019）、**8.4× 快于 torch fallback**（1 fused kernel vs 6 dispatch 含慢 bf16→fp32 cast），eager 省 ~9ms/step（1.496→1.517）。
+> - `_dl_C.invoke_fused_moe_opt`（fused blockwise FP8 MoE）—— microbench **12.5× 快于 bf16 反量化+bmm**，真实模型**正确**（W8A8 对 post-norm 激活精度够），但 **decode(M=1) 比 bf16-bmm 慢**（moe_align_block_size metadata ×40/step 开销）；vLLM 的 `use_moe_cu` 快速路径（空 metadata）在 DLIN **崩溃**（`per_token_group_quant_8bit_v2.cuh:396 cudaErrorInvalidAddressSpace`，DLIN 共享内存 bug）。**这是突破到 vLLM 速度的唯一钥匙，但被 DLIN kernel bug 阻塞。**
+
+> **继续优化（2026-07-03）精确瓶颈定位：**
+> - **CUDA GRAPH 现已可用**��FP8 修复解锁）：重测输出正确（` Paris`），~1.55 tok/s（+4% over eager）。之前的"cuda graph 乱码"是 FP8 quant_type bug，非 graph 问题。只 +4% 说明模型是 **GPU-bound 非 dispatch-bound**。
+> - **修了 `moe_sum_reduce`**（DLIN sgl_kernel 缺失，`fused_moe.py` 改用 triton fallback）→ 标准 MoE combine 现可在 DLIN 跑（之前崩 launch_server prefill/profiler），并解锁 profiler。
+> - **GDN 不是瓶颈**：per-kernel 计时（cuda.Event）显示 packed_decode=0.37ms/layer、track=0.11、conv=0.03 → 整个 GDN decode 仅 ~15ms/token（30 层）。torch 重写 GDN 反而更慢（0.68ms vs 0.37ms），num_warps 调优无收益。
+> - **真瓶颈 = MoE 的 on-the-fly FP8→bf16 反量化（~117ms GPU/token）**。消除它（in-place per-channel 转换 + dlblas qt=1）可达 ~1.9 tok/s，但被 prefill 阻塞（triton fused_experts 需 blockwise）。现在 moe_sum_reduce 已修，**下一步可验证 fused_experts 是否支持 per-channel scale** —— 若支持，in-place 路径就能 prefill+decode 都通，省去 117ms。
+> - DLIN FP8 cast 仅 ~6GB/s（clone 拷贝 38GB/s，cast 6GB/s）是反量化慢的根因；fused triton dequant 调优无收益。
+>
+> 下面 §7.1–7.7 的历史数据保留作参考，但其中的 tok/s 数字（0.047→2.48）**均为乱码速度**，已被上述修复取代。当前**正确**基线为 ~1.19 tok/s。
+
 > 模型：`/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/`（本地副本 `/LocalRun/xi.chen/...`，35G）。
 > 架构 `Qwen3_5MoeForConditionalGeneration`：**35B MoE、A3B（256 experts×8 active + shared expert）**、
 > **hybrid linear/full attention**（每 4 层 1 层 full-attn，余为 GatedDeltaNet linear-attn）、FP8 blockwise
@@ -423,3 +448,40 @@ int64→bool bitcast 习惯），DLIN dlcc/Triton 不兼容；逐个加 DL 标�
 - FLA linear-attn Triton kernel（30/40 层，仍用 Hopper-stubbed Triton）
 - conv1d_update + track_mamba_state Triton kernel
 - engine round-trip overhead
+
+### 7.8 dlblas MoE 循环重写 — 消除 per-expert Python dispatch（2026-07-02）
+
+§7.7 修完 dtype bug 后 MoE 已正确走 dlblas（1.502 tok/s），但 per-expert Python 循环仍是显式开销：
+旧循环用 `topk_ids.flatten().unique().tolist()` 解析活跃 expert（含 host-sync → graph 不可捕获），且循环内每次
+`layer.w13_weight[e]` 是一次 tensor-index dispatch（8 experts × 4 weight = 32 次 dispatch）。本节逐步消除这些开销，
+decode 从 **1.5 → 2.48 tok/s**（**52× from baseline 0.047**），差距缩至 **5.1×**（vLLM 12.63）。
+
+| # | commit | 优化 | tok/s | vs baseline | vs vLLM |
+|---|---|---|---|---|---|
+| §7.7 | `14694f66a1` | dlblas MoE dtype bug fix（本节基线） | 1.502 | 32× | 8.4× |
+| — | `72bfa6ecc8` | 去掉多余 `.contiguous()`（对齐 vLLM，同速、少一次 alloc） | 1.5 | 32× | 8.4× |
+| 1 | `4bba47016b` | **graph-safe 固定 8 次循环**：遍历 topk 槽而非 `unique()` expert；`e=topk_ids[0,k]` tensor-index，无 `.tolist()/.unique()/.item()` host-sync | 1.84 | 39× | 6.9× |
+| 1b | `28ec5e7b05` | **bmm 融合尝试 → revert**（prefill 多 token 路由失败，回退到固定循环） | 1.84 | 39× | 6.9× |
+| 2 | `475f8354b0` | **预 gather expert 权重**：循环外 4 次 `index_select`（`w13_g/w2_g/sc13_g/sc2_g = layer.*[expert_ids]`）取代循环内 32 次 tensor-index | 2.44 | 52× | 5.2× |
+| 3 | `0abd054c29` | **预 cast topk_weights**（循环外 `tw=… .to(out.dtype)`，循环内免去 `.to()`）+ **track_mamba skip guard**（`SGLANG_DL_SKIP_TRACK_MAMBA` 省 1 Triton kernel/层） | 2.47 | 52× | 5.1× |
+| 4 | `3158c310eb` | **`F.rms_norm` 替换 `Gemma4RMSNorm.forward_native`**（1 fused op vs ~9 dispatch） | **2.48** | **52×** | **5.1×** |
+
+**关键技术点**（均在 `python/sglang/srt/layers/quantization/fp8.py` MoE 分支，带 `# DL` 标记）：
+
+- **graph-safe 固定循环（decode-path）**：固定遍历 `num_experts_per_tok=8` 个 topk 槽（而非 host 端 `unique()` 出的活跃 expert 集合）。每个槽对当前 decode token 的 `x` 算 `expert[e]` 输出并按 `w[k]` 累加（`out += de * tw[k]`）。**batch=1 decode 下与逐-expert-gather 等价**（单 token 恰由这 8 个 expert 服务），且纯 tensor-index、无 host-sync。**代价：multi-token（prefill / batch>1）下不同 token 选不同 expert 子集，此固定循环不适用** —— 这正是 bmm 融合尝试失败的原因（见下）。
+- **bmm 融合的负结果**：尝试把 8 experts 打包成一次 bmm（逼近 vLLM 的单 fused MoE kernel），但 prefill 多 token 路由无法用稠密 bmm 表达 → **revert**（`28ec5e7b05`）。教训同 §7.5：vLLM 的 win 来自 C++ fused/grouped MoE kernel（1 launch for all experts），sglang 用 per-expert Python 循环（16 次 `gptq_dlblas_gemmex` launch）—— bmm 在 decode 之外不可行，故保留 graph-safe 固定循环。
+- **预 gather 权重**：循环内 `w13_g[k]` 用 **Python int** 索引 → free view（零 torch dispatch）；而旧版 `layer.w13_weight[e]`（`e` 是 tensor）是 advanced index（每次一次 dispatch）。16 次 GEMM 的权重准备从 32 次 dispatch 压到 4 次 `index_select`。
+- **预 cast 权重**：`topk_weights[0].to(out.dtype)` 在循环外做一次，循环内 `de * tw[k]` 直接累加、无逐次 `.to()`。
+- **track_mamba skip**：linear-attn 的 `_track_mamba_state_decode` 每 layer 调 1 个 Triton kernel 写回 mamba state；decode 时若不需要可经 `SGLANG_DL_SKIP_TRACK_MAMBA` 跳过（省 30/40 层 × 1 kernel）。位于 `gdn_backend.py`。
+- **RMSNorm fused**：`Gemma4RMSNorm.forward_native`（`layernorm.py`）原是手写 RMS（~9 个 dispatch），DLIN torch 的 `torch.nn.functional.rms_norm` 是单 fused kernel。
+
+**cuda-graph 仍 blocked**：`gptq_dlblas_gemmex` 内部 `dlblasLtMatmulGetWorkspace` 每次分配 workspace → 不可 graph-capture。故当前仍 eager。与 §7.5 结论一致——差距 kernel-bound，cuda-graph 非关键路径。
+
+**当前差距（2.48 vs vLLM 12.63 = 5.1×）剩余来源（按估计占比）**：
+- **FLA linear-attn Triton kernel**（30/40 层 GatedDeltaNet，仍用 Hopper-stubbed `gdc_*`）—— **主导项**（§7.5/§7.6 已定位）。`track_mamba` skip 仅省 state 写回，核心 GatedDeltaNet kernel 本身未优化。
+- per-expert Python 循环残留开销（已从 32 次大幅压缩，但仍是 16 次 launch，非 vLLM 的单 fused MoE kernel）。
+- conv1d_update Triton kernel + engine round-trip overhead。
+
+> **MoE 路径已基本榨干**（dlblas FP8 GEMM + 预 gather + 预 cast + fused norm）。**下一步与 §7.3 O4 一致**：
+> 移植 vLLM 的 DL FLA kernel（`dl_gdn_attn.py`、`dl_flash_attn.py`）或为 DLIN 重写 GatedDeltaNet ——
+> 这是剩余 5.1× 差距的主要所在。

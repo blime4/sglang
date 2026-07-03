@@ -133,6 +133,12 @@ What unblocks sglang serving in practice:
 |   | "to bc failed" path at serve time.        |                                        |
 +---+--------------------------------------------+----------------------------------------+
 
+**Update (2026-07-01, Route B):** the copy step above is now superseded — sglang
+builds its own `_vllm_fa2_C.so` from the DLIN flash-attention source via
+`scripts/dl/build_dlin_vllm_flash_attn.sh` (no vLLM venv needed). The built .so is
+bit-identical to the copied one (max diff 0.0, vs SDPA max_err 5e-4). `setup_vllm_flash_attn.sh`
+is now a thin shim that delegates to the from-source build.
+
 Measured result (Qwen3-1.7B, batch=1, KS38): eager **19.52 tok/s** and a CLEAN
 FULL cuda graph **16.64 tok/s** (output "Paris..." correct). See
 `docs/dl/sglang-vs-vllm-perf-gap.md`.

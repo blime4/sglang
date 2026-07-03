@@ -53,7 +53,19 @@ _is_musa = is_musa()
 
 
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce
+    # DL begin: DLIN's sgl_kernel build lacks moe_sum_reduce; use the triton
+    # fallback (imported unconditionally above) so the standard MoE combine path
+    # (prefill/profiling) works. Decode uses the DL bf16-bmm branch which bypasses it.
+    try:
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+
+        if _is_dlin():
+            moe_sum_reduce = moe_sum_reduce_triton
+        else:
+            from sgl_kernel import moe_sum_reduce
+    except Exception:
+        from sgl_kernel import moe_sum_reduce
+    # DL end
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:

@@ -92,13 +92,36 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
-    # DL begin — DLIN sgl_kernel build lacks the rmsnorm-family C++ ops; native torch fallbacks
+    # DL begin — DLIN sgl_kernel build lacks the rmsnorm-family C++ ops.
+    # Prefer vLLM's _dl_C native kernels (gemma_rms_norm / fused_add_gemma_rms_norm)
+    # when available — they are ~8x faster than the torch fallback (1 fused kernel
+    # vs ~6 dispatches incl. a slow bf16->fp32 cast). Fall back to torch only if
+    # _dl_C is not loadable.
     def _dl_has_op(_n):
         try:
             getattr(torch.ops.sgl_kernel, _n)
             return True
         except Exception:
             return False
+
+    def _dl_load_dl_C():
+        try:
+            if hasattr(torch.ops, "_dl_C") and hasattr(torch.ops._dl_C, "gemma_rms_norm"):
+                return True
+            import os
+            for _p in [
+                "../venv-vllm021/lib/python3.12/site-packages/vllm/_dl_C.cpython-312-x86_64-linux-gnu.so",
+            ]:
+                if os.path.exists(_p):
+                    torch.ops.load_library(_p)
+                    break
+            return hasattr(torch.ops, "_dl_C") and hasattr(
+                torch.ops._dl_C, "gemma_rms_norm"
+            )
+        except Exception:
+            return False
+
+    _dl_C_ok = _dl_load_dl_C()
 
     def _dl_rms(input, weight, eps=1e-6, out=None, shift=0.0):
         o = torch.empty_like(input) if out is None else out
@@ -113,14 +136,36 @@ if _is_cuda or _is_xpu or _is_musa:
         r = torch.rsqrt(rf.pow(2).mean(-1, keepdim=True) + eps)
         input.copy_((rf * r).to(input.dtype) * (weight + shift))  # in-place into input
 
-    if not _dl_has_op("gemma_rmsnorm"):
-        gemma_rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 1.0)
-    if not _dl_has_op("rmsnorm"):
-        rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 0.0)
-    if not _dl_has_op("fused_add_rmsnorm"):
-        fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 0.0)
-    if not _dl_has_op("gemma_fused_add_rmsnorm"):
-        gemma_fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 1.0)
+    if _dl_C_ok:
+        # DLIN native fused kernels: gemma_rms_norm(out, input, weight, eps) [gemma=weight+1].
+        # These write IN-PLACE to `out` and return None, so wrap to return the tensor.
+        def _dl_gemma_rmsnorm(i, w, eps=1e-6, out=None, enable_pdl=None):
+            o = out if out is not None else torch.empty_like(i)
+            torch.ops._dl_C.gemma_rms_norm(o, i, w, eps)
+            return o
+
+        def _dl_gemma_fused_add_rmsnorm(i, r, w, eps=1e-6, enable_pdl=None):
+            # modifies i (=norm(r+i)) and r (+=i) in place, like _dl_fused
+            torch.ops._dl_C.fused_add_gemma_rms_norm(i, r, w, eps)
+            return i, r
+
+        gemma_rmsnorm = _dl_gemma_rmsnorm
+        gemma_fused_add_rmsnorm = _dl_gemma_fused_add_rmsnorm
+        # standard (non-gemma) rmsnorm/fused_add_rmsnorm: no _dl_C std variant -> torch fallback
+        if not _dl_has_op("rmsnorm"):
+            rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 0.0)
+        if not _dl_has_op("fused_add_rmsnorm"):
+            fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 0.0)
+    else:
+        # _dl_C not loadable: original torch fallbacks (only when sgl_kernel lacks the op)
+        if not _dl_has_op("gemma_rmsnorm"):
+            gemma_rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 1.0)
+        if not _dl_has_op("rmsnorm"):
+            rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 0.0)
+        if not _dl_has_op("fused_add_rmsnorm"):
+            fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 0.0)
+        if not _dl_has_op("gemma_fused_add_rmsnorm"):
+            gemma_fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 1.0)
     # DL end
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False

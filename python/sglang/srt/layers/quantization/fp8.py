@@ -1901,32 +1901,90 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.utils.common import is_dlin as _is_dlin
 
             import os as _os
-            if _is_dlin() and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "0") == "1":
+            # Decode-only (M==1) DLIN dlblas MoE path. The gathered 8 experts are
+            # dequantized blockwise->bf16 (lossless) and run through torch.bmm.
+            # gptq_dlblas_gemmex quant_type=2 (blockwise) reads sglang's plain FP8
+            # weight in the wrong order (gibberish); quant_type=1 (per-channel) needs
+            # a costly per-step re-quant. bf16 dequant + bmm is faster AND more exact.
+            # Default ON; set SGLANG_DL_MOE_DLBLAS=0 to use the standard triton
+            # fused_experts. Decode-only: prefill (M>1) needs per-token routing.
+            if (
+                _is_dlin()
+                and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "1") != "0"
+                and x.shape[0] == 1
+            ):
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
 
                 _ensure_dl_C()
                 topk_weights, topk_ids, _ = dispatch_output.topk_output
                 inter = layer.w13_weight.shape[1] // 2
+                hidden = x.shape[-1]
+                num_experts = layer.w13_weight.shape[0]
+                topk = topk_ids.shape[1]
                 out = torch.zeros_like(x)
 
-                # DL begin — pre-gather expert weights (4 index ops vs 32 in-loop tensor-index ops)
-                expert_ids = topk_ids[0]  # [8] — one advanced index
-                w13_g = layer.w13_weight[expert_ids]  # [8, 2*inter, hidden]
-                w2_g = layer.w2_weight[expert_ids]    # [8, hidden, inter]
-                sc13_g = layer.w13_weight_scale_inv[expert_ids]
-                sc2_g = layer.w2_weight_scale_inv[expert_ids]
-                tw = topk_weights[0].to(out.dtype)  # pre-cast to avoid .to() in loop
+                # DL begin — DLIN fused blockwise FP8 MoE (SGLANG_DL_MOE_FUSED=1):
+                # _dl_C.invoke_fused_moe_opt is the DLIN-native grouped FP8 GEMM (what
+                # vLLM uses). Microbench: 12.5x faster than bf16 dequant+bmm. With cuda
+                # graph the moe_align_block_size dispatch is eliminated, so this is the
+                # fast path. use_moe_cu (empty metadata) crashes on DLIN; use real metadata.
+                if _os.environ.get("SGLANG_DL_MOE_FUSED", "0") == "1":
+                    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+                        moe_align_block_size as _mabs,
+                    )
+                    _G = torch.ops._dl_C.invoke_fused_moe_opt
+                    tw_f = topk_weights.to(torch.float32).contiguous()
+                    ti_f = topk_ids.to(torch.int32).contiguous()
+                    srt, eid, npp = _mabs(ti_f, 16, num_experts)
+                    c13 = torch.empty(1, topk, 2 * inter, dtype=x.dtype, device=x.device)
+                    _G(x, layer.w13_weight, c13, None, layer.w13_weight_scale_inv.contiguous(), None,
+                       tw_f, ti_f, srt, eid, npp, False, topk, 16, 128, 128,
+                       True, False, False, False, [128, 128], 1)
+                    gate, up = c13[0, :, :inter], c13[0, :, inter:]
+                    he = (F.silu(gate) * up).contiguous().view(1, topk, inter)
+                    c2 = torch.empty(1, topk, hidden, dtype=x.dtype, device=x.device)
+                    _G(he, layer.w2_weight, c2, None, layer.w2_weight_scale_inv.contiguous(), None,
+                       tw_f, ti_f, srt, eid, npp, True, topk, 16, 128, 128,
+                       True, False, False, False, [128, 128], 1)
+                    out += c2.sum(dim=1)  # mul_routed_weight applied weights; sum over topk
+                    return StandardCombineInput(hidden_states=out)
+                # DL end (fused MoE path)
 
-                num_topk = topk_ids.shape[1]
-                for k in range(num_topk):  # k is Python int — w13_g[k] is a free view, no torch dispatch
-                    gu = torch.ops._dl_C.gptq_dlblas_gemmex(
-                        x, w13_g[k].t(), sc13_g[k], sc13_g[k], quant_type=2, bit=8)
-                    gate, up = gu[..., :inter], gu[..., inter:]
-                    he = F.silu(gate) * up
-                    de = torch.ops._dl_C.gptq_dlblas_gemmex(
-                        he, w2_g[k].t(), sc2_g[k], sc2_g[k], quant_type=2, bit=8)
-                    out += de * tw[k]
+                # DL begin — gather the 8 routed experts, dequant blockwise -> bf16,
+                # and use torch.bmm (one batched GEMM for all 8 experts). Why not the
+                # dlblas FP8 GEMM: gptq_dlblas_gemmex quant_type=2 (blockwise) reads
+                # sglang's plain FP8 weight in the wrong order (gibberish); quant_type=1
+                # (per-channel) needs a costly per-step blockwise->per-channel re-quant
+                # (2 FP8 casts, ~9ms/layer = 88% of step time, since DLIN's FP8 cast is
+                # ~17GB/s). Dequanting once to bf16 + bmm is ~2.5x faster AND more
+                # accurate (no re-quantization loss). Not in-place: prefill's triton
+                # fused_experts still expects blockwise FP8.
+                expert_ids = topk_ids[0]  # [8]
+                w13_g = layer.w13_weight[expert_ids]  # [8, 2*inter, hidden] FP8 blockwise
+                w2_g = layer.w2_weight[expert_ids]    # [8, hidden, inter]
+                sc13_g = layer.w13_weight_scale_inv[expert_ids]  # [8, nb, kb]
+                sc2_g = layer.w2_weight_scale_inv[expert_ids]
+                tw = topk_weights[0].to(out.dtype)  # [8]
+
+                def _dequant_bf16(w_blk, sc_blk):
+                    # FP8 blockwise [n,N,K] + scale [n,N/128,K/128] -> bf16 [n,N,K]
+                    n, N, K = w_blk.shape
+                    B = 128
+                    nb, kb = N // B, K // B
+                    w5 = w_blk.to(torch.bfloat16).view(n, nb, B, kb, B)
+                    return (w5 * sc_blk.to(torch.bfloat16).view(n, nb, 1, kb, 1)).view(n, N, K)
+
+                w13_bf = _dequant_bf16(w13_g, sc13_g)  # [8, 2*inter, hidden]
+                w2_bf = _dequant_bf16(w2_g, sc2_g)     # [8, hidden, inter]
+
+                x_exp = x.unsqueeze(0).expand(8, 1, hidden)           # [8,1,hidden]
+                gu = torch.bmm(x_exp, w13_bf.transpose(1, 2))         # [8,1,2*inter]
+                gu = gu.squeeze(1)                                     # [8, 2*inter]
+                gate, up = gu[:, :inter], gu[:, inter:]               # [8, inter]
+                he = (F.silu(gate) * up).unsqueeze(1)                 # [8,1,inter]
+                de = torch.bmm(he, w2_bf.transpose(1, 2)).squeeze(1)  # [8, hidden]
+                out += (de * tw.unsqueeze(1)).sum(0, keepdim=True)    # [1, hidden]
                 # DL end
                 return StandardCombineInput(hidden_states=out)
         except Exception as _dl_moe_err:

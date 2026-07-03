@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+# DL begin
+import os
+# DL end
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -491,6 +494,10 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 # (descriptor setup requires DLIN-internal knowledge). vLLM's _dl_C.so (built by DLIN engineers)
 # has the correct binding. It's dl19-built but ABI-compatible with dl24 torch (same as vllm_flash_attn).
 _dl_C_loaded = False
+# DL: cache for blockwise->per-channel FP8 weight conversion (keyed by weight
+# data_ptr; computed once per weight on first call, reused after). Lets the
+# dlblas path run at full speed after the first forward.
+_dl_pc_cache: dict = {}
 
 
 def _ensure_dl_C():
@@ -514,17 +521,29 @@ def dlblas_w8a8_block_fp8_linear(
 ):
     _ensure_dl_C()
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    N, K = weight.shape
+    # DL: gptq_dlblas_gemmex is correct with quant_type=1 (per-channel FP8), but
+    # the checkpoint is blockwise [128,128] and quant_type=2 (blockwise mode)
+    # produces wrong output (reads the plain FP8 weight in the wrong order).
+    # So dequant the blockwise weight once -> requantize per-channel -> cache, and
+    # call with quant_type=1 + per-channel scale. Verified rel_err ~0.003 vs bf16.
+    key = (weight.data_ptr(), N, K)
+    cached = _dl_pc_cache.get(key)
+    if cached is None:
+        bn, bk = block_size[0], block_size[1]
+        sc_full = weight_scale.float().repeat_interleave(bn, 0).repeat_interleave(bk, 1)  # [N,K]
+        w_bf = weight.float() * sc_full  # blockwise dequant to fp32
+        pc = w_bf.abs().amax(dim=1).clamp(min=1e-6)  # [N] per-channel scale
+        w_pc = (w_bf / pc.view(N, 1)).clamp(-1, 1).to(torch.float8_e4m3fn)  # [N,K]
+        cached = (w_pc.t().contiguous(), pc.to(torch.float32).view(N, 1).contiguous())
+        _dl_pc_cache[key] = cached
+    w_pc_t, pc_scale = cached
     out = torch.ops._dl_C.gptq_dlblas_gemmex(
-        input_2d,
-        weight.t().contiguous(),  # [N,K] → [K,N]
-        weight_scale.contiguous(),
-        weight_scale.contiguous(),  # symmetric FP8: qzeros = scales
-        quant_type=2,
-        bit=8,
+        input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
     )
     if bias is not None:
         out = out + bias
-    return out.to(dtype=input.dtype).view(*input.shape[:-1], weight.shape[0])
+    return out.to(dtype=input.dtype).view(*input.shape[:-1], N)
 
 
 # DL end
@@ -532,11 +551,17 @@ def dlblas_w8a8_block_fp8_linear(
 
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
-    # DL begin: on DLIN, use dlblas FP8 GEMM (via vLLM's _dl_C binding) — the only
-    # fast FP8 path; triton/cutlass are pathologically slow on DLIN.
+    # DL begin: on DLIN use dlblas FP8 GEMM (gptq_dlblas_gemmex). The checkpoint
+    # is blockwise [128,128] but the kernel's blockwise mode (quant_type=2) reads
+    # sglang's plain FP8 weight in the wrong order => gibberish. dlblas_w8a8_block_fp8_linear
+    # instead dequants blockwise -> requantizes PER-CHANNEL once (cached) and calls
+    # with quant_type=1 (verified rel_err ~0.003 vs bf16) — correct AND fast.
+    # Set SGLANG_DL_FP8_NO_DLBLAS=1 to fall back to the standard cutlass/triton
+    # blockwise path (correct but ~40x slower on DLIN).
     try:
         from sglang.srt.utils.common import is_dlin as _is_dlin
-        if _is_dlin():
+        import os as _os
+        if _is_dlin() and _os.environ.get("SGLANG_DL_FP8_NO_DLBLAS", "0") != "1":
             return dlblas_w8a8_block_fp8_linear
     except Exception:
         pass

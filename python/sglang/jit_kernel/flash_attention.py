@@ -11,7 +11,9 @@ from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_k
 # have the compiled _vllm_fa2_C extension that exposes varlen_fwd (the plain
 # pure-python stub does NOT). When present, decode can take the clean graph-safe
 # varlen+block_table path (the one vLLM uses); otherwise sglang falls back to
-# the gather workaround. See docs/dl/request-dl24-vllm-flash-attn-wheel.md.
+# the gather workaround. The .so is now built from source (Route B,
+# scripts/dl/build_dlin_vllm_flash_attn.sh); historically requested via
+# docs/dl/request-dl24-vllm-flash-attn-wheel.md.
 _DLIN_VLLM_FA_PROBED: Optional[bool] = None
 
 
@@ -173,8 +175,8 @@ def flash_attn_with_kvcache(
         # cudnnMHAVarlenForward*, which works and is cuda-graph-capturable).
         # All tensors are fixed-shape; seqused_k carries per-seq lengths as a
         # runtime value; max_seqlen_k is a shape-derived upper bound (no .item()
-        # host-sync) so this path stays graph-safe. See
-        # docs/dl/request-dl24-vllm-flash-attn-wheel.md.
+        # host-sync) so this path stays graph-safe. The .so is built from source
+        # (Route B, scripts/dl/build_dlin_vllm_flash_attn.sh).
         if (
             _dlin_vllm_flash_attn_ok()
             and page_table is not None
