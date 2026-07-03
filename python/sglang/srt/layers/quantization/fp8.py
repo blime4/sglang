@@ -1910,6 +1910,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_FUSED", "0") == "1"
+                and x.shape[0] == 1
             ):
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
