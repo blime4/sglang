@@ -118,8 +118,15 @@ pick_model() {
     qwen35-35b)
       MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
       DLIN_TP_SIZE=2; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
-      DLIN_MEM_FRACTION=0.85 DLIN_CONTEXT_LEN=4096 DLIN_PAGE_SIZE=16
+      DLIN_MEM_FRACTION=0.85; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
       export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_MAX_BF16_M=128
+      # TP=2 needs 2 GPUs; ensure CUDA_VISIBLE_DEVICES has >=2 devices.
+      local _ndev
+      _ndev=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | tr ',' '\n' | wc -l)
+      if [ "$_ndev" -lt 2 ]; then
+        CUDA_VISIBLE_DEVICES="0,1"
+        log "TP=2: set CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (override with CUDA_VISIBLE_DEVICES=X,Y)"
+      fi
       ;;
     *) die "unknown preset '$1'. Available: qwen3-1.7b qwen35-35b" ;;
   esac
