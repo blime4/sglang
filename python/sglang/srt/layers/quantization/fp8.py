@@ -1944,7 +1944,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DL end (fused MoE)
 
             # DL begin — bf16 dequant+bmm MoE (handles BOTH decode M==1 and prefill M>1)
-            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "1"))
+            # DL: MAX_BF16_M controls the max M for bf16-bmm MoE path (includes prefill).
+            # Default 128: bf16-bmm handles prefill+decode (fast, ~15 tok/s).
+            # If correctness issues arise for large M, set to 1 (decode-only, triton prefill).
+            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "128"))
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "1") != "0"
