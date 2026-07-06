@@ -482,3 +482,22 @@ decode 从 **1.5 → 2.48 tok/s**（**52× from baseline 0.047**），差距缩�
 > **MoE 路径已基本榨干**（dlblas FP8 GEMM + 预 gather + 预 cast + fused norm）。**下一步与 §7.3 O4 一致**：
 > 移植 vLLM 的 DL FLA kernel（`dl_gdn_attn.py`、`dl_flash_attn.py`）或为 DLIN 重写 GatedDeltaNet ——
 > 这是剩余 5.1× 差距的主要所在。
+
+> ### 📊 decode-only 速度测量（2026-07-06，cache 清理后）
+>
+> **方法**：500 tok 和 1000 tok 两次测量的差值 = 纯 decode 速度（排除 prefill JIT）。
+>
+> | 测量 | 总时 | tok/s |
+> |---|---|---|
+> | 500 tok | 49.9s | 10.0 |
+> | 1000 tok | 76.6s | 13.1 |
+> | **decode-only** | 500 tok / 26.7s | **18.7** |
+>
+> **sglang decode-only = 18.7 tok/s，是 vLLM 12.63 的 1.48×。**
+>
+> 短测（200 tok）被 prefill JIT（~23s/首次调用）拖低到 5-6 tok/s。长测（1000+ tok）接近 decode-only 极限。
+>
+> **2× vLLM（25 tok/s）的路径**：
+> 1. NGRAM 推测解码（1.5-2× decode → 28-37 tok/s）—— 但需 FlashInfer，DLIN 上 tvm_ffi 编译失败
+> 2. DLIN dl_recurrent GDN kernel（省 11ms/token → ~25 tok/s）—— 但 `__launch_bounds__(0)` JIT bug
+> 3. 两者都是 DLIN 侧问题，sglang 侧已到极限
