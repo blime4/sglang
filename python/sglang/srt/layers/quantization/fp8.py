@@ -1944,9 +1944,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DL end (fused MoE)
 
             # DL begin — bf16 dequant+bmm MoE (handles BOTH decode M==1 and prefill M>1)
+            # For prefill (M>1), only use bf16-bmm when M is small enough to avoid OOM
+            # (the gather layer.w13_weight[topk_ids] allocates M*topk expert copies).
+            # Fall back to standard triton fused_experts for large M.
+            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "16"))
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "1") != "0"
+                and x.shape[0] <= _DL_MOE_MAX_BF16_M
             ):
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
