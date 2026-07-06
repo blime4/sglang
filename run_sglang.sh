@@ -84,6 +84,40 @@ MODEL_PATH="${MODEL_PATH:-/opt/dataset/Qwen3-1.7B}"
 ATTN_BACKEND="${ATTN_BACKEND:-fa3}"          # fa3 -> FlashAttention -> DLIN FA2
 USE_CUDA_GRAPH="${USE_CUDA_GRAPH:-0}"         # 0 = disable_cuda_graph (safer on DLIN)
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
+
+#-------------------------------------------------------------------------------
+# Optimized model presets — `./run_sglang.sh gen -M qwen35-35b` picks one.
+# Each preset sets all the DLIN-optimized flags for that model.
+#-------------------------------------------------------------------------------
+declare -A OPT_MODELS=(
+  ["qwen3-1.7b"]="/opt/dataset/Qwen3-1.7B"
+  ["qwen35-35b"]="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
+)
+# Preset-specific env (applied by pick_model below).
+declare -A OPT_TP=(
+  ["qwen35-35b"]="2"
+)
+declare -A OPT_CG_MAX_BS=(
+  ["qwen35-35b"]="2"
+)
+declare -A OPT_MEM_FRAC=(
+  ["qwen35-35b"]="0.85"
+)
+declare -A OPT_CG=(
+  ["qwen35-35b"]="1"   # qwen35-35b benefits from CG (fused MoE decode)
+)
+declare -A OPT_DL_FUSED=(
+  ["qwen35-35b"]="1"   # SGLANG_DL_MOE_FUSED=1
+)
+declare -A OPT_DL_MAX_BF16_M=(
+  ["qwen35-35b"]="128" # bf16-bmm for prefill+decode
+)
+declare -A OPT_PAGE_SIZE=(
+  ["qwen35-35b"]="16"  # FA2 requires page_size divisible by 16
+)
+declare -A OPT_CTX_LEN=(
+  ["qwen35-35b"]="4096"
+)
 PROMPT="${PROMPT:-}"                          # empty -> builtin demo prompts
 SERVE_PORT="${SERVE_PORT:-30000}"
 SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
@@ -106,6 +140,29 @@ log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
 ok()   { echo -e "\033[1;32m[run_sglang OK]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[run_sglang ERROR]\033[0m $*"; exit 1; }
+
+#-------------------------------------------------------------------------------
+# pick_model — resolve a -M preset name to concrete model + env settings.
+# Called by parse_test_args when -M is used.
+#-------------------------------------------------------------------------------
+pick_model() {
+  local preset="$1"
+  local path="${OPT_MODELS[$preset]:-}"
+  [ -n "$path" ] || die "unknown model preset '$preset'. Available: ${!OPT_MODELS[*]}"
+  MODEL_PATH="$path"
+  # Apply preset-specific overrides (only if set)
+  [ -n "${OPT_TP[$preset]:-}" ]             && DLIN_TP_SIZE="${OPT_TP[$preset]}"
+  [ -n "${OPT_CG[$preset]:-}" ]              && USE_CUDA_GRAPH="${OPT_CG[$preset]}"
+  [ -n "${OPT_CG_MAX_BS[$preset]:-}" ]       && DLIN_CG_MAX_BS="${OPT_CG_MAX_BS[$preset]}"
+  [ -n "${OPT_MEM_FRAC[$preset]:-}" ]         && DLIN_MEM_FRACTION="${OPT_MEM_FRAC[$preset]}"
+  [ -n "${OPT_DL_FUSED[$preset]:-}" ]         && export SGLANG_DL_MOE_FUSED="${OPT_DL_FUSED[$preset]}"
+  [ -n "${OPT_DL_MAX_BF16_M[$preset]:-}" ]   && export SGLANG_DL_MOE_MAX_BF16_M="${OPT_DL_MAX_BF16_M[$preset]}"
+  [ -n "${OPT_PAGE_SIZE[$preset]:-}" ]        && DLIN_PAGE_SIZE="${OPT_PAGE_SIZE[$preset]}"
+  [ -n "${OPT_CTX_LEN[$preset]:-}" ]          && DLIN_CONTEXT_LEN="${OPT_CTX_LEN[$preset]}"
+  log "preset '$preset': model=$MODEL_PATH tp=${DLIN_TP_SIZE:-1} cg=$USE_CUDA_GRAPH"
+  [ -n "${DLIN_MEM_FRACTION:-}" ]  && log "  mem_fraction=$DLIN_MEM_FRACTION context=$DLIN_CONTEXT_LEN page=$DLIN_PAGE_SIZE"
+  [ -n "${SGLANG_DL_MOE_FUSED:-}" ] && log "  DL_MOE_FUSED=$SGLANG_DL_MOE_FUSED DL_MAX_BF16_M=$SGLANG_DL_MOE_MAX_BF16_M"
+}
 
 #-------------------------------------------------------------------------------
 # uv config helpers — mirror the artifactory method (uv.toml / pip.conf) but add
@@ -349,9 +406,14 @@ Usage:
 Quick tests (handy for verifying a model runs on DLIN):
   ./run_sglang.sh gen                   # end-to-end generation (default Qwen3-1.7B)
   ./run_sglang.sh gen -m <model> -p "prompt" -n 32 -b fa3
+  ./run_sglang.sh gen -M qwen35-35b     # use optimized preset for Qwen3.5-35B-FP8
   ./run_sglang.sh serve --port 30000    # HTTP server (OpenAI-compatible)
   ./run_sglang.sh bench -c 16           # concurrent bench (auto-starts a server)
   ./run_sglang.sh bench --offline       # per-batch latency, no server (bench_one_batch)
+
+Optimized model presets (-M flag):
+  -M qwen3-1.7b    Qwen3-1.7B (default, bf16)
+  -M qwen35-35b     Qwen3.5-35B-A3B-FP8 (TP=2, fused MoE, CG, 14-16 tok/s)
 
 gen/serve options:
   -m, --model PATH          model path        (default /opt/dataset/Qwen3-1.7B)
@@ -383,6 +445,7 @@ parse_test_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       -m|--model)          MODEL_PATH="$2"; shift 2;;
+      -M|--model-preset)   pick_model "$2"; shift 2;;
       -p|--prompt)         PROMPT="$2"; shift 2;;
       -n|--max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
       -b|--backend)        ATTN_BACKEND="$2"; shift 2;;
@@ -413,14 +476,32 @@ phase_gen() {
   log "Phase [gen]: end-to-end generation on DLIN (in-process Engine)"
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
   dlin_runtime_env
-  local gen_py="$SGLANG_DIR/scripts/dl/run_qwen3_1_7b.py"
-  [ -f "$gen_py" ] || die "missing $gen_py"
 
-  export MODEL_PATH ATTN_BACKEND USE_CUDA_GRAPH MAX_NEW_TOKENS PROMPT
-  log "model=$MODEL_PATH | backend=$ATTN_BACKEND | cuda_graph=$USE_CUDA_GRAPH | max_new_tokens=$MAX_NEW_TOKENS"
-  [ -n "$PROMPT" ] && log "prompt: $PROMPT" || log "prompt: <builtin demos>"
-  log "(first run JIT-compiles ~42 buckets, ~5 min; cached after -> <90s)"
-  python "$gen_py"
+  # If a DLIN preset was selected (-M), use the optimized gen script that
+  # respects TP/mem_fraction/context_len/cuda_graph_max_bs env vars.
+  local tp="${DLIN_TP_SIZE:-1}"
+  if [ "$tp" -gt 1 ] 2>/dev/null || [ -n "${DLIN_MEM_FRACTION:-}" ]; then
+    local gen_py="$SGLANG_DIR/scripts/dl/qwen35_sg_tps.py"
+    [ -f "$gen_py" ] || die "missing $gen_py (needed for TP>1 / preset models)"
+    export MODEL_PATH ATTN_BACKEND USE_CUDA_GRAPH MAX_NEW_TOKENS PROMPT
+    export TP_SIZE="$tp"
+    export MEM_FRAC="${DLIN_MEM_FRACTION:-0.80}"
+    export CONTEXT_LEN="${DLIN_CONTEXT_LEN:-4096}"
+    export PAGE_SIZE="${DLIN_PAGE_SIZE:-16}"
+    export CG_MAX_BS="${DLIN_CG_MAX_BS:-0}"
+    log "model=$MODEL_PATH | tp=$TP_SIZE | backend=$ATTN_BACKEND | cg=$USE_CUDA_GRAPH | mem=$MEM_FRAC | ctx=$CONTEXT_LEN"
+    [ -n "$PROMPT" ] && log "prompt: $PROMPT" || log "prompt: <builtin demos>"
+    log "(first run JIT-compiles, ~5 min; cached after)"
+    python "$gen_py"
+  else
+    local gen_py="$SGLANG_DIR/scripts/dl/run_qwen3_1_7b.py"
+    [ -f "$gen_py" ] || die "missing $gen_py"
+    export MODEL_PATH ATTN_BACKEND USE_CUDA_GRAPH MAX_NEW_TOKENS PROMPT
+    log "model=$MODEL_PATH | backend=$ATTN_BACKEND | cuda_graph=$USE_CUDA_GRAPH | max_new_tokens=$MAX_NEW_TOKENS"
+    [ -n "$PROMPT" ] && log "prompt: $PROMPT" || log "prompt: <builtin demos>"
+    log "(first run JIT-compiles ~42 buckets, ~5 min; cached after -> <90s)"
+    python "$gen_py"
+  fi
 }
 
 #-------------------------------------------------------------------------------
@@ -434,12 +515,22 @@ phase_serve() {
   log "Phase [serve]: HTTP server on DLIN (launch_server)"
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
   dlin_runtime_env
+  local tp="${DLIN_TP_SIZE:-1}"
+  local page_size="${DLIN_PAGE_SIZE:-16}"
+  local mem_frac="${DLIN_MEM_FRACTION:-}"
+  local ctx_len="${DLIN_CONTEXT_LEN:-}"
+  local cg_max_bs="${DLIN_CG_MAX_BS:-}"
   local cg_flag=""
   [ "$USE_CUDA_GRAPH" = "1" ] || cg_flag="--disable-cuda-graph"
-  log "model=$MODEL_PATH | backend=$ATTN_BACKEND | host=$SERVE_HOST:$SERVE_PORT"
+  local extra_flags=""
+  [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
+  [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
+  [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
+  log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT"
   exec python -m sglang.launch_server \
-    --model-path "$MODEL_PATH" --page-size 16 --dtype bfloat16 \
-    --attention-backend "$ATTN_BACKEND" $cg_flag \
+    --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
+    --tp-size "$tp" \
+    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags \
     --port "$SERVE_PORT" --host "$SERVE_HOST"
 }
 
@@ -459,12 +550,22 @@ wait_for_server() {  # $1=url  $2=timeout_s
   return 1
 }
 start_server_bg() {  # launches launch_server detached; sets SERVER_PID
+  local tp="${DLIN_TP_SIZE:-1}"
+  local page_size="${DLIN_PAGE_SIZE:-16}"
+  local mem_frac="${DLIN_MEM_FRACTION:-}"
+  local ctx_len="${DLIN_CONTEXT_LEN:-}"
+  local cg_max_bs="${DLIN_CG_MAX_BS:-}"
   local cg_flag=""
   [ "$USE_CUDA_GRAPH" = "1" ] || cg_flag="--disable-cuda-graph"
+  local extra_flags=""
+  [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
+  [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
+  [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
   BENCH_LOG="${BENCH_LOG:-/tmp/sglang_bench_server.log}"
   nohup python -m sglang.launch_server \
-    --model-path "$MODEL_PATH" --page-size 16 --dtype bfloat16 \
-    --attention-backend "$ATTN_BACKEND" $cg_flag \
+    --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
+    --tp-size "$tp" \
+    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags \
     --port "$SERVE_PORT" --host "$SERVE_HOST" \
     > "$BENCH_LOG" 2>&1 &
   SERVER_PID=$!
