@@ -84,40 +84,6 @@ MODEL_PATH="${MODEL_PATH:-/opt/dataset/Qwen3-1.7B}"
 ATTN_BACKEND="${ATTN_BACKEND:-fa3}"          # fa3 -> FlashAttention -> DLIN FA2
 USE_CUDA_GRAPH="${USE_CUDA_GRAPH:-0}"         # 0 = disable_cuda_graph (safer on DLIN)
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-16}"
-
-#-------------------------------------------------------------------------------
-# Optimized model presets — `./run_sglang.sh gen -M qwen35-35b` picks one.
-# Each preset sets all the DLIN-optimized flags for that model.
-#-------------------------------------------------------------------------------
-declare -A OPT_MODELS=(
-  ["qwen3-1.7b"]="/opt/dataset/Qwen3-1.7B"
-  ["qwen35-35b"]="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
-)
-# Preset-specific env (applied by pick_model below).
-declare -A OPT_TP=(
-  ["qwen35-35b"]="2"
-)
-declare -A OPT_CG_MAX_BS=(
-  ["qwen35-35b"]="2"
-)
-declare -A OPT_MEM_FRAC=(
-  ["qwen35-35b"]="0.85"
-)
-declare -A OPT_CG=(
-  ["qwen35-35b"]="1"   # qwen35-35b benefits from CG (fused MoE decode)
-)
-declare -A OPT_DL_FUSED=(
-  ["qwen35-35b"]="1"   # SGLANG_DL_MOE_FUSED=1
-)
-declare -A OPT_DL_MAX_BF16_M=(
-  ["qwen35-35b"]="128" # bf16-bmm for prefill+decode
-)
-declare -A OPT_PAGE_SIZE=(
-  ["qwen35-35b"]="16"  # FA2 requires page_size divisible by 16
-)
-declare -A OPT_CTX_LEN=(
-  ["qwen35-35b"]="4096"
-)
 PROMPT="${PROMPT:-}"                          # empty -> builtin demo prompts
 SERVE_PORT="${SERVE_PORT:-30000}"
 SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
@@ -142,26 +108,22 @@ ok()   { echo -e "\033[1;32m[run_sglang OK]\033[0m $*"; }
 die()  { echo -e "\033[1;31m[run_sglang ERROR]\033[0m $*"; exit 1; }
 
 #-------------------------------------------------------------------------------
-# pick_model — resolve a -M preset name to concrete model + env settings.
-# Called by parse_test_args when -M is used.
+# pick_model — resolve a -M preset name to model path + optimized env.
 #-------------------------------------------------------------------------------
 pick_model() {
-  local preset="$1"
-  local path="${OPT_MODELS[$preset]:-}"
-  [ -n "$path" ] || die "unknown model preset '$preset'. Available: ${!OPT_MODELS[*]}"
-  MODEL_PATH="$path"
-  # Apply preset-specific overrides (only if set)
-  [ -n "${OPT_TP[$preset]:-}" ]             && DLIN_TP_SIZE="${OPT_TP[$preset]}"
-  [ -n "${OPT_CG[$preset]:-}" ]              && USE_CUDA_GRAPH="${OPT_CG[$preset]}"
-  [ -n "${OPT_CG_MAX_BS[$preset]:-}" ]       && DLIN_CG_MAX_BS="${OPT_CG_MAX_BS[$preset]}"
-  [ -n "${OPT_MEM_FRAC[$preset]:-}" ]         && DLIN_MEM_FRACTION="${OPT_MEM_FRAC[$preset]}"
-  [ -n "${OPT_DL_FUSED[$preset]:-}" ]         && export SGLANG_DL_MOE_FUSED="${OPT_DL_FUSED[$preset]}"
-  [ -n "${OPT_DL_MAX_BF16_M[$preset]:-}" ]   && export SGLANG_DL_MOE_MAX_BF16_M="${OPT_DL_MAX_BF16_M[$preset]}"
-  [ -n "${OPT_PAGE_SIZE[$preset]:-}" ]        && DLIN_PAGE_SIZE="${OPT_PAGE_SIZE[$preset]}"
-  [ -n "${OPT_CTX_LEN[$preset]:-}" ]          && DLIN_CONTEXT_LEN="${OPT_CTX_LEN[$preset]}"
-  log "preset '$preset': model=$MODEL_PATH tp=${DLIN_TP_SIZE:-1} cg=$USE_CUDA_GRAPH"
-  [ -n "${DLIN_MEM_FRACTION:-}" ]  && log "  mem_fraction=$DLIN_MEM_FRACTION context=$DLIN_CONTEXT_LEN page=$DLIN_PAGE_SIZE"
-  [ -n "${SGLANG_DL_MOE_FUSED:-}" ] && log "  DL_MOE_FUSED=$SGLANG_DL_MOE_FUSED DL_MAX_BF16_M=$SGLANG_DL_MOE_MAX_BF16_M"
+  case "$1" in
+    qwen3-1.7b)
+      MODEL_PATH="/opt/dataset/Qwen3-1.7B"
+      ;;
+    qwen35-35b)
+      MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
+      DLIN_TP_SIZE=2; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
+      DLIN_MEM_FRACTION=0.85 DLIN_CONTEXT_LEN=4096 DLIN_PAGE_SIZE=16
+      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_MAX_BF16_M=128
+      ;;
+    *) die "unknown preset '$1'. Available: qwen3-1.7b qwen35-35b" ;;
+  esac
+  log "preset '$1': model=$MODEL_PATH tp=${DLIN_TP_SIZE:-1} cg=$USE_CUDA_GRAPH"
 }
 
 #-------------------------------------------------------------------------------
