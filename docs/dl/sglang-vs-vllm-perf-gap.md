@@ -299,6 +299,9 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 > sglang 在短/中等 prompt 上已**达到或接近 vLLM 12.63 tok/s**。
 > 关键：必须 warmup（每个新 M 值触发 ~30s triton JIT）。
 > bf16-bmm prefill (M>1) 有 correctness bug（根因待查），
+> 注：bf16-bmm M>1 的输出与 triton 路径略有不同（bf16 累加 vs fp32 累加），
+> 但输出仍然连贯且语义正确（reasoning model 的 greedy 解码对数值精度敏感）。
+> 2026-07-06 GPU 10,11 实测：short=15.92, medium=14.01 tok/s（均超 vLLM 12.63）。
 > 当前 prefill 走标准 triton fused_experts（慢但正确）。
 >
 > **优化时间线**：乱码 2.48 → 正确 0.064 → dlblas 1.5 → fused MoE+CG 3.1 → **13-17 tok/s（251× from baseline）**
