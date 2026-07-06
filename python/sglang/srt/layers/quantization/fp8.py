@@ -1944,7 +1944,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DL end (fused MoE)
 
             # DL begin — bf16 dequant+bmm MoE (handles BOTH decode M==1 and prefill M>1)
-            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "128"))
+            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "1"))
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "1") != "0"
@@ -1968,27 +1968,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w5 = w_blk.to(torch.bfloat16).view(n, nb, B, kb, B)
                     return (w5 * sc_blk.to(torch.bfloat16).view(n, nb, 1, kb, 1)).view(n, N, K)
 
-                # DL begin — per-token loop (correct for all M, avoids batched view bug)
-                # For M==1 this is the fast decode path. For M>1 it loops per token,
-                # avoiding the batched gather correctness issue.
-                tw_f = topk_weights.to(torch.bfloat16)
-                for _t in range(M):
-                    _eids = topk_ids[_t]  # [topk]
-                    _w13 = layer.w13_weight[_eids]  # [topk, 2*inter, hidden]
-                    _w2 = layer.w2_weight[_eids]    # [topk, hidden, inter]
-                    _sc13 = layer.w13_weight_scale_inv[_eids]
-                    _sc2 = layer.w2_weight_scale_inv[_eids]
-                    _tw = tw_f[_t]  # [topk]
-                    w13_bf = _dequant_bf16(_w13, _sc13)
-                    w2_bf = _dequant_bf16(_w2, _sc2)
-                    _x = x[_t:_t+1]  # [1, hidden]
-                    x_exp = _x.unsqueeze(0).expand(topk, 1, hidden)
-                    gu = torch.bmm(x_exp, w13_bf.transpose(1, 2)).squeeze(1)  # [topk, 2*inter]
-                    gate, up = gu[:, :inter], gu[:, inter:]
-                    he = (F.silu(gate) * up).unsqueeze(1)  # [topk, 1, inter]
-                    de = torch.bmm(he, w2_bf.transpose(1, 2)).squeeze(1)  # [topk, hidden]
-                    out[_t] += (de * _tw.unsqueeze(1)).sum(0)  # [hidden]
-                # DL end (per-token bf16-bmm)
+                # DL begin — batched bf16 dequant + bmm for ALL M (decode + prefill).
+                expert_ids = topk_ids  # [M, topk]
+                w13_g = layer.w13_weight[expert_ids]
+                w2_g = layer.w2_weight[expert_ids]
+                sc13_g = layer.w13_weight_scale_inv[expert_ids]
+                sc2_g = layer.w2_weight_scale_inv[expert_ids]
+                tw = topk_weights.to(torch.bfloat16)
+                MT = M * topk
+                w13_bf = _dequant_bf16(w13_g.view(MT, -1, hidden), sc13_g.view(MT, -1, sc13_g.shape[-1]))
+                w2_bf = _dequant_bf16(w2_g.view(MT, -1, w2_g.shape[-1]), sc2_g.view(MT, -1, sc2_g.shape[-1]))
+                x_exp = x.unsqueeze(1).expand(M, topk, hidden).reshape(MT, 1, hidden)
+                gu = torch.bmm(x_exp, w13_bf.transpose(1, 2)).view(M, topk, -1)
+                gate, up = gu[:, :, :inter], gu[:, :, inter:]
+                he = (F.silu(gate) * up).reshape(MT, 1, inter)
+                de = torch.bmm(he, w2_bf.transpose(1, 2)).view(M, topk, hidden)
+                out = (de * tw.unsqueeze(-1)).sum(dim=1)
+                # DL end (batched bf16-bmm)
                 # DL end (bf16-bmm MoE block)
                 return StandardCombineInput(hidden_states=out)
         except Exception as _dl_moe_err:
