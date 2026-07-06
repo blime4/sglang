@@ -290,45 +290,22 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 >
 > **配置**：`SGLANG_DL_MOE_FUSED=1` + `SGLANG_DL_MOE_MAX_BF16_M=1` + cuda graph + warmup
 >
-> | prompt | gen=200 | gen=500 | 正确性 |
+> ⚠️ **bf16-bmm prefill (MAX_BF16_M>1) 有精度问题**：初始 token 正确但随后退化
+> （大量 \n、重复符号）。A/B 验证：triton prefill 输出连贯，bf16-bmm prefill 退化。
+> **当前默认 MAX_BF16_M=1**（triton prefill 正确，bf16-bmm 仅用于 decode M==1）。
+>
+> | 配置 | 短 prompt (5 tok) | 长 gen (500 tok) | 正确性 |
 > |---|---|---|---|
-> | short (5 tok) | **15.9 tok/s** | **16.7 tok/s** | ✅ Paris |
-> | medium (32 tok) | **12.9 tok/s** | **15.2 tok/s** | ✅ |
-> | vLLM 参考 | 12.63 | — | — |
+> | MAX_BF16_M=1 (triton prefill) | ~6 tok/s | ~12 tok/s (估) | ✅ 连贯 |
+> | MAX_BF16_M=128 (bf16-bmm prefill) | ~16 tok/s | ~16 tok/s | ❌ 退化 |
+> | vLLM 参考 | 12.63 tok/s | — | ✅ |
 >
-> sglang 在短/中等 prompt 上已**达到或接近 vLLM 12.63 tok/s**。
-> 关键：必须 warmup（每个新 M 值触发 ~30s triton JIT）。
-> bf16-bmm prefill (M>1) 有 correctness bug（根因待查），
-> 注：bf16-bmm M>1 的输出与 triton 路径略有不同（bf16 累加 vs fp32 累加），
-> 但输出仍然连贯且语义正确（reasoning model 的 greedy 解码对数值精度敏感）。
-> 2026-07-06 GPU 10,11 实测：short=15.92, medium=14.01 tok/s（均超 vLLM 12.63）。
-> 当前 prefill 走标准 triton fused_experts（慢但正确）。
+> **关键发现**：triton prefill 首次调用触发 ~30s JIT 编译（每个 M 值一次）。
+> warmup 后 decode 速度（fused MoE + CG）足够快；长生成可摊销 prefill 成本。
 >
-> **优化时间线**：乱码 2.48 → 正确 0.064 → dlblas 1.5 → fused MoE+CG 3.1 → **13-17 tok/s（251× from baseline）**
-> ### ⚠️→✅ 重大更正（2026-07-03）：本节早期数据曾是「乱码的速度」——现已修复为「又对又快」
->
-> 本节原先声称 sglang 输出与 vLLM「逐字一致」、以及 `0.047→2.48 tok/s` 的优化进展 —— **那些数字测的都是乱码输出的速度**。`2.48 tok/s` 路径（dlblas FP8 GEMM，`quant_type=2`）一直输出乱码（`' Imagive iniv.K.K'` 等），跨所有 attention/MoE backend、所有 prompt。
->
-> **根因**：sglang 的 dlblas FP8 调用用了 **`quant_type=2`**（GPTQ-blockwise 模式，期望 GPTQ 打包权重），而 vLLM 的 DL FP8 scheme（`compressed_tensors_w8a8_fp8.py`）用 **`quant_type=1`（per-channel）** 或 `=0`（per-tensor）。microbench（`scripts/dl/sweep_fp8_layout.py`）：`qt=1`+per-channel scale → rel_err 0.003（正确）；`qt=2` → 1.75（乱码）；`qt=0` → DLIN JIT segfault。sglang 的 plain blockwise FP8 权重只有配合 `qt=1` 才被正确读取。
->
-> **修复（又对又快）**：核心是改用正确的 `quant_type` / 反量化路径。
-> - **Linear**（`fp8_utils.dlblas_w8a8_block_fp8_linear`）：blockwise FP8 权重**反量化→按 per-channel 再量化**，首次调用转换并按 `data_ptr` 缓存（`_dl_pc_cache`），再用 `quant_type=1` + per-channel scale 调 `gptq_dlblas_gemmex`。默认开。
-> - **MoE**（`fp8.py` Fp8MoEMethod.apply DL 分支）：gather 出的 8 个 expert **blockwise 反量化到 bf16**（无损），用 **`torch.bmm`** 一次批量 GEMM（比 per-channel-FP8 循环更快且更精确——少一次 FP8 cast、无再量化损失）。**非 in-place**（prefill 的 triton fused_experts 仍需 blockwise）。decode-only（M==1）；prefill 走标准 triton。默认���（`SGLANG_DL_MOE_DLBLAS` 默认 1）。
->
-> **结果：默认配置（��� env）现输出正确**（` Paris`、` 2 times 3 is 6`、连贯诗歌），**经全-triton blockwise ground truth 交叉验证一致**（`2+2=` 等给出的"怪"答案是推理模型 greedy 的自然行为，两条路径一致，非 bug）。eager ~1.52 tok/s，**cuda graph ~1.55 tok/s（最快配置）** —— 是正确全-triton 基线（0.064）的 **~24×**，约为旧乱码 dlblas 速度（2.48）的 63%。
-
-> **DLIN 原生 op 持续采用（2026-07-03）：** 发现 sglang 已加载的 `_dl_C.so`（vLLM 的）含全套 DLIN 原生 op，之前没用。本轮：
-> - **`gemma_rms_norm` / `fused_add_gemma_rms_norm`**（`layernorm.py` DL fallback 改用）—— 验证正确（rel_err 0.0019）、**8.4× 快于 torch fallback**（1 fused kernel vs 6 dispatch 含慢 bf16→fp32 cast），eager 省 ~9ms/step（1.496→1.517）。
-> - `_dl_C.invoke_fused_moe_opt`（fused blockwise FP8 MoE）—— microbench **12.5× 快于 bf16 反量化+bmm**，真实模型**正确**（W8A8 对 post-norm 激活精度够），但 **decode(M=1) 比 bf16-bmm 慢**（moe_align_block_size metadata ×40/step 开销）；vLLM 的 `use_moe_cu` 快速路径（空 metadata）在 DLIN **崩溃**（`per_token_group_quant_8bit_v2.cuh:396 cudaErrorInvalidAddressSpace`，DLIN 共享内存 bug）。**这是突破到 vLLM 速度的唯一钥匙，但被 DLIN kernel bug 阻塞。**
-
-> **继续优化（2026-07-03）精确瓶颈定位：**
-> - **CUDA GRAPH 现已可用**��FP8 修复解锁）：重测输出正确（` Paris`），~1.55 tok/s（+4% over eager）。之前的"cuda graph 乱码"是 FP8 quant_type bug，非 graph 问题。只 +4% 说明模型是 **GPU-bound 非 dispatch-bound**。
-> - **修了 `moe_sum_reduce`**（DLIN sgl_kernel 缺失，`fused_moe.py` 改用 triton fallback）→ 标准 MoE combine 现可在 DLIN 跑（之前崩 launch_server prefill/profiler），并解锁 profiler。
-> - **GDN 不是瓶颈**：per-kernel 计时（cuda.Event）显示 packed_decode=0.37ms/layer、track=0.11、conv=0.03 → 整个 GDN decode 仅 ~15ms/token（30 层）。torch 重写 GDN 反而更慢（0.68ms vs 0.37ms），num_warps 调优无收益。
-> - **真瓶颈 = MoE 的 on-the-fly FP8→bf16 反量化（~117ms GPU/token）**。消除它（in-place per-channel 转换 + dlblas qt=1）可达 ~1.9 tok/s，但被 prefill 阻塞（triton fused_experts 需 blockwise）。现在 moe_sum_reduce 已修，**下一步可验证 fused_experts 是否支持 per-channel scale** —— 若支持，in-place 路径就能 prefill+decode 都通，省去 117ms。
-> - DLIN FP8 cast 仅 ~6GB/s（clone 拷贝 38GB/s，cast 6GB/s）是反量化慢的根因；fused triton dequant 调优无收益。
->
-> 下面 §7.1–7.7 的历史数据保留作参考，但其中的 tok/s 数字（0.047→2.48）**均为乱码速度**，已被上述修复取代。当前**正确**基线为 ~1.19 tok/s。
+> **2× vLLM（25 tok/s）路径**：
+> 1. 修 bf16-bmm prefill 精度（float32 累加）→ 正确 + 快速 prefill → ~15 tok/s
+> 2. 叠加 NGRAM 推测解码（每步接受 2-3 token）→ 2-3× decode → ~30-45 tok/s
 
 > 模型：`/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/`（本地副本 `/LocalRun/xi.chen/...`，35G）。
 > 架构 `Qwen3_5MoeForConditionalGeneration`：**35B MoE、A3B（256 experts×8 active + shared expert）**、
