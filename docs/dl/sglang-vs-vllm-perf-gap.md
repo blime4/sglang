@@ -285,6 +285,23 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 
 ## 7. Qwen3.5-35B-A3B-FP8 补充（2026-07-01，与 §1–6 的 Qwen3-1.7B bf16 不同模型）
 
+
+> ### 📊 最新性能数据（2026-07-06）
+>
+> **配置**：`SGLANG_DL_MOE_FUSED=1` + `SGLANG_DL_MOE_MAX_BF16_M=1` + cuda graph + warmup
+>
+> | prompt | gen=200 | gen=500 | 正确性 |
+> |---|---|---|---|
+> | short (5 tok) | **15.9 tok/s** | **16.7 tok/s** | ✅ Paris |
+> | medium (32 tok) | **12.9 tok/s** | **15.2 tok/s** | ✅ |
+> | vLLM 参考 | 12.63 | — | — |
+>
+> sglang 在短/中等 prompt 上已**达到或接近 vLLM 12.63 tok/s**。
+> 关键：必须 warmup（每个新 M 值触发 ~30s triton JIT）。
+> bf16-bmm prefill (M>1) 有 correctness bug（根因待查），
+> 当前 prefill 走标准 triton fused_experts（慢但正确）。
+>
+> **优化时间线**：乱码 2.48 → 正确 0.064 → dlblas 1.5 → fused MoE+CG 3.1 → **13-17 tok/s（251× from baseline）**
 > ### ⚠️→✅ 重大更正（2026-07-03）：本节早期数据曾是「乱码的速度」——现已修复为「又对又快」
 >
 > 本节原先声称 sglang 输出与 vLLM「逐字一致」、以及 `0.047→2.48 tok/s` 的优化进展 —— **那些数字测的都是乱码输出的速度**。`2.48 tok/s` 路径（dlblas FP8 GEMM，`quant_type=2`）一直输出乱码（`' Imagive iniv.K.K'` 等），跨所有 attention/MoE backend、所有 prompt。
