@@ -81,7 +81,9 @@ if _is_cuda or _is_xpu or _is_musa:
                 return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
             _flashinfer_layernorm_available = True
-        except (ImportError, AttributeError):
+        # DL begin
+        except (ImportError, AttributeError, RuntimeError):
+        # DL end
             _flashinfer_layernorm_available = False
     else:
         _flashinfer_layernorm_available = False

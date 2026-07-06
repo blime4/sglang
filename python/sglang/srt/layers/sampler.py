@@ -36,7 +36,7 @@ if is_cuda():
             min_p_sampling_from_probs,
             top_k_top_p_sampling_from_probs,
         )
-    except ImportError:
+    except (ImportError, RuntimeError):
         min_p_sampling_from_probs = None
         top_k_top_p_sampling_from_probs = None
     try:
