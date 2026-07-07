@@ -19,6 +19,9 @@
 #   bench        concurrent serving benchmark (wraps sglang.bench_serving;
 #                auto-starts a server) or --offline per-batch latency
 #                (sglang.bench_one_batch, no server).
+#   benchrun     vLLM-benchrun-format serving bench (wraps scripts/dl/
+#                benchrun_sglang.py). Same config schema + output as the
+#                team's `vllm bench run` -> sglang vs vLLM diff directly.
 #   all          setup -> build-kernel -> install -> test  (default)
 #
 # Usage:
@@ -30,6 +33,8 @@
 #   ./run_sglang.sh serve --port 30000
 #   ./run_sglang.sh bench -c 32 --num-prompts 200   # concurrent bench (autostarts server)
 #   ./run_sglang.sh bench --offline                  # per-batch latency, no server
+#   ./run_sglang.sh benchrun -M qwen35-35b --num-prompts 8   # vLLM-format bench (autostarts server)
+#   ./run_sglang.sh benchrun --template                      # write a config_serving.json to edit
 #
 # gen / serve options (override the env vars below):
 #   -m, --model PATH         model path           (default $MODEL_PATH)
@@ -109,6 +114,13 @@ BENCH_OUTPUT_LEN="${BENCH_OUTPUT_LEN:-128}"      # random output len (online)
 BATCH_SIZE="${BATCH_SIZE:-1 4 8 16}"             # --batch-size sweep (offline)
 BENCH_BASE_URL="${BENCH_BASE_URL:-}"             # nonempty -> bench external server
 BENCH_OFFLINE="${BENCH_OFFLINE:-0}"              # 1 -> bench_one_batch (no server)
+
+# benchrun options (wraps scripts/dl/benchrun_sglang.py — vLLM `bench run` format).
+# --config PATH runs that config verbatim; --template just writes config_serving.json;
+# otherwise a config is built from the flags + (-M) preset, then run.
+BENCHRUN_CONFIG="${BENCHRUN_CONFIG:-}"           # --config PATH (passthrough to the harness)
+BENCHRUN_TEMPLATE="${BENCHRUN_TEMPLATE:-0}"      # 1 -> write the config template, don't run
+BENCHRUN_TP="${DLIN_TP_SIZE:-1}"                 # tensor-parallel size (set by -M qwen35-35b)
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -410,6 +422,9 @@ Quick tests (handy for verifying a model runs on DLIN):
   ./run_sglang.sh serve --port 30000    # HTTP server (OpenAI-compatible)
   ./run_sglang.sh bench -c 16           # concurrent bench (auto-starts a server)
   ./run_sglang.sh bench --offline       # per-batch latency, no server (bench_one_batch)
+  ./run_sglang.sh benchrun -M qwen35-35b --num-prompts 8   # vLLM-format bench (auto-starts a server)
+  ./run_sglang.sh benchrun --template                      # write a config_serving.json to hand-edit
+  ./run_sglang.sh benchrun /path/config_serving.json       # run an existing vLLM-format config
 
 Optimized model presets (-M flag):
   -M qwen3-1.7b    Qwen3-1.7B (default, bf16)
@@ -441,6 +456,23 @@ bench options (wraps sglang's official bench_serving / bench_one_batch):
   overlap a prefill batch (DLIN FA2 q.reshape in jit_kernel/flash_attention.py).
   Raise -c to probe the ceiling; fix = route batched extend to flash_attn_varlen_func.
 
+benchrun options (vLLM `bench run` format, wraps scripts/dl/benchrun_sglang.py):
+  -M <preset> / -m <path>    model (preset or path; default Qwen3-1.7B)
+  --num-prompts N            requests            (default 64)
+  --input-len/--output-len   random in/out lens  (default 1024 / 128)
+  -c, --concurrency N        max concurrent      (default 1; DLIN FA2 ceiling)
+  --port N                   server port         (default 30000)
+  --config PATH              run that config verbatim (passthrough)
+  --template                 just write config_serving.json, don't run
+  Builds a vLLM-schema config (server_params/client_params/fixed_params), auto-starts
+  the sglang server per batch, runs sglang.bench_serving, and emits the SAME artifacts
+  as `vllm bench run`: benchrun_result.json (dict keyed by full_key_name), per-case
+  client/server log dirs, and a GitHub-markdown summary. Diff directly with vLLM output.
+  DLIN defaults baked in: fa3, page_size=16, random-ids, HF offline, max_concurrency=1.
+  For Qwen3.5-35B-A3B-FP8 the blockwise-FP8 path needs DLIN dlblas (gptq_dlblas_gemmex);
+  if the env lacks it the run falls back to the slow bf16-bmm MoE path. Fused MoE
+  (SGLANG_DL_MOE_FUSED=1) is opt-in — the -M qwen35-35b preset exports it.
+
 Env overrides: SDK_DIR, VENV_DIR, TORCH_SPEC, SKIP_KERNEL,
                MODEL_PATH, ATTN_BACKEND, USE_CUDA_GRAPH, MAX_NEW_TOKENS, PROMPT, ...
 EOF
@@ -466,6 +498,9 @@ parse_test_args() {
       --batch-size)        BATCH_SIZE="$2"; shift 2;;
       --base-url)          BENCH_BASE_URL="$2"; shift 2;;
       --offline)           BENCH_OFFLINE=1; shift;;
+      # benchrun
+      --config)            BENCHRUN_CONFIG="$2"; shift 2;;
+      --template)          BENCHRUN_TEMPLATE=1; shift;;
       -h|--help)           usage; exit 0;;
       *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
@@ -659,12 +694,80 @@ phase_bench() {
 }
 
 #-------------------------------------------------------------------------------
+# Phase: benchrun -- vLLM-benchrun-format serving benchmark. Wraps scripts/dl/
+#   benchrun_sglang.py (a port of vLLM's DLIN benchrun_serving). Emits the SAME
+#   config schema + artifacts as `vllm bench run` so sglang vs vLLM results diff
+#   directly. The harness auto-starts/stops the sglang server per batch.
+#
+#   * --config PATH : run that vLLM-schema config verbatim (passthrough).
+#   * --template    : write a config_serving.json template (hand-edit path).
+#   * otherwise     : build a config from the flags + (-M) preset, then run.
+#
+#   DLIN defaults are baked into the harness (fa3, page_size=16, random-ids, HF
+#   offline, max_concurrency=1). -M qwen35-35b exports SGLANG_DL_MOE_FUSED=1
+#   (needs the dlblas fused-MoE op; without it the run falls back to slow bf16-bmm).
+#-------------------------------------------------------------------------------
+phase_benchrun() {
+  log "Phase [benchrun]: vLLM-benchrun-format serving benchmark (sglang)"
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+  dlin_runtime_env
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
+  local script="$SGLANG_DIR/scripts/dl/benchrun_sglang.py"
+  [ -f "$script" ] || die "harness not found: $script"
+
+  # --config PATH -> passthrough to the harness verbatim.
+  if [ -n "$BENCHRUN_CONFIG" ]; then
+    log "[benchrun] config: $BENCHRUN_CONFIG"
+    python "$script" "$BENCHRUN_CONFIG"
+    return $?
+  fi
+
+  # --template -> let the harness write config_serving.json in CWD and exit.
+  if [ "$BENCHRUN_TEMPLATE" = "1" ]; then
+    log "[benchrun] writing config_serving.json template in $(pwd)"
+    python "$script"
+    return $?
+  fi
+
+  # Otherwise build a vLLM-schema config from flags + preset, then run it.
+  local tp="${DLIN_TP_SIZE:-1}"
+  local page="${DLIN_PAGE_SIZE:-16}"
+  local mem="${DLIN_MEM_FRACTION:-0.85}"
+  local timeout="${BENCHRUN_TIMEOUT:-900}"
+  # cuda graph: off by default on DLIN unless -g / -M qwen35-35b turned it on.
+  local cg_field="true"   # disable_cuda_graph
+  [ "$USE_CUDA_GRAPH" = "1" ] && cg_field="false"
+
+  local work cfg
+  work="$(mktemp -d -t sglang_benchrun_XXXXXX)"
+  cfg="$work/config_serving.json"
+  cat > "$cfg" <<EOF
+{
+  "server_params": {"tensor_parallel_size":$tp,"attention_backend":"$ATTN_BACKEND","page_size":$page,"dtype":"bfloat16","mem_fraction_static":$mem,"disable_cuda_graph":$cg_field,"trust_remote_code":""},
+  "client_params": {"dataset_name":"random-ids","random_input_len":[$BENCH_INPUT_LEN],"random_output_len":[$BENCH_OUTPUT_LEN],"num_prompts":[$BENCH_NUM_PROMPTS],"temperature":0,"max_concurrency":[$BENCH_CONCURRENCY],"profile":[false]},
+  "fixed_params": {"mode":"serving","model":"$MODEL_PATH","port":$SERVE_PORT,"time_out":$timeout,"output_file":"benchrun_result.json","output_dir":"$work","ci_log_format":false,"output_json_format":false}
+}
+EOF
+  local cg_state="off"; [ "$USE_CUDA_GRAPH" = "1" ] && cg_state="on"
+  log "[benchrun] model=$MODEL_PATH tp=$tp backend=$ATTN_BACKEND mem=$mem cg=$cg_state | prompts=$BENCH_NUM_PROMPTS in/out=$BENCH_INPUT_LEN/$BENCH_OUTPUT_LEN conc=$BENCH_CONCURRENCY"
+  log "[benchrun] work dir (config + artifacts): $work"
+  python "$script" "$cfg"
+  local rc=$?
+  # Tidy the transient script-dir copies the harness writes next to itself.
+  rm -f "$SGLANG_DIR/scripts/dl/benchrun_result.json" "$SGLANG_DIR/scripts/dl/profiler_serving_data.json" 2>/dev/null || true
+  local model_tail; model_tail="$(basename "${MODEL_PATH%/}")"
+  log "[benchrun] result: $work/benchrun_${model_tail}/benchrun_result.json"
+  return $rc
+}
+
+#-------------------------------------------------------------------------------
 # Dispatch. gen/serve parse their trailing flags first; everything else ignores
 # extra args (backward compatible with the original positional phases).
 #-------------------------------------------------------------------------------
 PHASE="${1:-all}"; shift || true
 case "$PHASE" in
-  gen|serve|bench) parse_test_args "$@" ;;
+  gen|serve|bench|benchrun) parse_test_args "$@" ;;
 esac
 apply_ngram_overrides   # no-op unless -S/--spec-ngram (or USE_NGRAM=1)
 
@@ -676,6 +779,7 @@ case "$PHASE" in
   gen)          source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_gen ;;
   serve)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_serve ;;
   bench)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_bench ;;
+  benchrun)     source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_benchrun ;;
   all)
     phase_setup
     phase_build_kernel || warn "build-kernel phase best-effort; continuing"
@@ -683,6 +787,6 @@ case "$PHASE" in
     phase_test
     ;;
   -h|--help|help) usage; exit 0 ;;
-  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|all)" ;;
+  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|all)" ;;
 esac
 ok "Done ($PHASE)."
