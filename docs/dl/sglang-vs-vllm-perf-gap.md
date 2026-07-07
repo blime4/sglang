@@ -574,7 +574,11 @@ Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefil
 - 验证状态：engine 在 DLIN 上已能起（"ENGINE_OK"），先前 generation 测量超时是**本会话已修的 harness bug**（`pkill -f sglang` 自杀 + `set -u` 崩溃），不是 NGRAM 本身的问题。**应立即用修好的 `e2e_correctness_speed.py` 重测 NGRAM**。
 - 预期：accept rate 中等（0.4-0.6）时 decode 有效吞吐 1.5-2× → 28-37 tok/s，达成 2× vLLM。
 
-**P4（质量）补充**：greedy 重复是推理模型 + temperature=0 的常见现象，未必是 bug。先用 `repetition_penalty=1.1` 或 `temperature=0.7` 验证是否消失；若消失则确认是 sampling；若不消失再查 decode fused 路径精度。
+**P4（质量）✅ 已验证（2026-07-07，sdk 4.2.1）**：greedy 重复是 **sampling 问题，非 bug**。实测 "Do you know Trump?"（sglang.Engine，fused M>1）：
+- temp=0 无 penalty → ❌ "The Trumps are the Trumps are..." 循环。
+- **temp=0 + `repetition_penalty=1.2` → ✅ "A. Yes, you know Trump! B. No, you don't... The answer is: Yes"（连贯）**。
+- temp=0.6 无 penalty → ❌ '"" ""...' 引号循环（temperature 单独不够）。
+→ **结论：`repetition_penalty=1.2` 修复 greedy degeneracy**。建议 sglang serving 默认带 `repetition_penalty≈1.1-1.2`（sglang `--sampling-defaults` / `preferred_sampling_params`）。
 
 **建议执行顺序**：先 P1（重测 NGRAM，最高杠杆，可能直接达标）→ 若 NGRAM verify 撞 M>1 MoE 崩，则转 P4（质量，快速）+ 等 DLIN 修 P2/P3。
 
