@@ -542,3 +542,38 @@ Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefil
 - decode 已 1.45× vLLM；长请求（decode 主导）已超 vLLM。
 
 **2× vLLM（25 tok/s）的更新路径**：decode 18.3 → 需 +37%。NGRAM 推测解码（accept 2-3 tok/step）可达 25-37 tok/s，仍是首选；但其 DLIN unblock（tvm_ffi / launch_bounds）未解。prefill 侧短期靠 MAX_BF16_M=128 已从 0.09× 拉到 0.80×。
+
+### 7.10 现状总结 + 下一步优化方案（2026-07-07）
+
+**现状 TL;DR**（Qwen3.5-35B-A3B-FP8, TP=2, fa3, CG, MAX_BF16_M=128）：
+
+| 维度 | sglang | vLLM | 关系 | 状态 |
+|---|---|---|---|---|
+| 纯 decode（M=1, CG 内） | 18.32 tok/s | 12.63 | **1.45×** | ✅ 已超 vLLM |
+| 短请求 e2e（8 prompt + 32 out） | 10.08 tok/s | 12.63 | **0.80×** | 🟡 prefill 仍拖累 |
+| prefill | ~5.6 tok/s | ≫ | ≪ | 🔴 仍是主差距 |
+| 正确性 | "France 首都" 连贯 | — | — | 🟡 greedy 重复（"Trump"→"I am."） |
+
+**关键认知更新**（推翻先前误判）：
+1. 短请求慢 **不是 JIT warmup**（bench 恒定 ≠ 一次性）—— 是 prefill kernel 本身慢。一次性 JIT 仅 ~3s。
+2. decode **已 1.45× vLLM**，先前 "18.7 tok/s" 是真的（纯 decode），只是被 prefill 掩盖成 "10× 慢" 的假象。
+3. MAX_BF16_M=128 修复后短请求从 0.09× → 0.80× vLLM，且质量不回归。
+
+**下一步优化方案（按 impact/effort 排序）**：
+
+| 优先级 | 方案 | decode 影响 | 阻塞 | effort |
+|---|---|---|---|---|
+| **P1** | **NGRAM 推测解码** | 18→28-37 tok/s（达 2× vLLM） | 低（见下） | 中 |
+| P2 | DLIN `dl_recurrent` GDN kernel（替 triton packed_decode） | 18→~25 tok/s | `__launch_bounds__(0)` JIT bug（DLIN 侧） | 低（代码已写） |
+| P3 | DLIN fused MoE 支持 prefill M>1 | prefill 5.6→vLLM 量级 | `invoke_fused_moe_opt` M>1 崩（DLIN 侧） | 低（等 DLIN） |
+| P4 | greedy 重复 → repetition_penalty / 非 greedy 采样 | 质量，非速度 | 无 | 低 |
+
+**P1（NGRAM）详解 —— 这是冲 2× vLLM 的首选，且比先前以为的更可行**：
+- NGRAM 用 n-gram 查表生成草稿 token，**不需要 draft model，也不依赖 FlashInfer**。先前 §7.9 把 "tvm_ffi 未解" 算作 NGRAM 的阻塞是**错的**——tvm_ffi 是 EAGLE/FlashInfer draft model 的事，与 NGRAM 无关。NGRAM 的 C++ ext（`ngram_corpus`）只需 `<cstddef>`（已修，commit 20aa4e4b90）。
+- 真正风险：(a) verify 阶段一次处理多个草稿 token → attention/MoE 的 M 变大 → 可能触发新 triton JIT 或撞 M>1 MoE 崩溃；(b) `speculative_ngram_max_bfs_breadth=1` + page_size=16 的约束需保持。
+- 验证状态：engine 在 DLIN 上已能起（"ENGINE_OK"），先前 generation 测量超时是**本会话已修的 harness bug**（`pkill -f sglang` 自杀 + `set -u` 崩溃），不是 NGRAM 本身的问题。**应立即用修好的 `e2e_correctness_speed.py` 重测 NGRAM**。
+- 预期：accept rate 中等（0.4-0.6）时 decode 有效吞吐 1.5-2× → 28-37 tok/s，达成 2× vLLM。
+
+**P4（质量）补充**：greedy 重复是推理模型 + temperature=0 的常见现象，未必是 bug。先用 `repetition_penalty=1.1` 或 `temperature=0.7` 验证是否消失；若消失则确认是 sampling；若不消失再查 decode fused 路径精度。
+
+**建议执行顺序**：先 P1（重测 NGRAM，最高杠杆，可能直接达标）→ 若 NGRAM verify 撞 M>1 MoE 崩，则转 P4（质量，快速）+ 等 DLIN 修 P2/P3。
