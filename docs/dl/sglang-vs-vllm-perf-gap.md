@@ -501,3 +501,44 @@ decode 从 **1.5 → 2.48 tok/s**（**52× from baseline 0.047**），差距缩�
 > 1. NGRAM 推测解码（1.5-2× decode → 28-37 tok/s）—— 但需 FlashInfer，DLIN 上 tvm_ffi 编译失败
 > 2. DLIN dl_recurrent GDN kernel（省 11ms/token → ~25 tok/s）—— 但 `__launch_bounds__(0)` JIT bug
 > 3. 两者都是 DLIN 侧问题，sglang 侧已到极限
+
+### 7.9 短请求慢的根因 = 慢 PREFILL kernel（非 JIT warmup）+ 修复 MAX_BF16_M=128（2026-07-06）
+
+**用户观察**：短请求 sglang 明显比 vLLM 慢；怀疑是 JIT warmup。**实测推翻该假设**。
+
+**方法**：`scripts/dl/e2e_correctness_speed.py`（TP=2, fa3, page_size=16, CG on, CG_MAX_BS=1），同一 prompt 连跑 warmup + 3 次 bench。
+
+**关键事实**（scheduler 日志直接读数）：
+```
+Decode batch ... cuda graph: True, gen throughput (token/s): 18.32   ← 纯 decode
+Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefill
+```
+
+| 指标 | 值 | 结论 |
+|---|---|---|
+| 纯 decode（M=1, CG 内） | **18.32 tok/s = 1.45× vLLM** | decode 已赢，无需优化 |
+| prefill（MAX_BF16_M=1, triton fused_experts） | **~0.3 tok/s** | 主导短请求慢 |
+| bench0/1/2 同 prompt 3 次 | 27.95 / 27.83 / 27.84 s（**恒定**） | **不是 JIT**（JIT 会只在首次） |
+| 一次性 JIT 成本（warmup − bench） | ~3 s | 次要 |
+
+**结论**：短请求慢 = prefill kernel 本身慢（triton `fused_experts` 在 DLIN 上 ~0.3 tok/s，**每次 prefill 都付，不是 JIT**）。JIT warmup 假说不成立（恒定 ≠ 一次性）。
+
+**sglang 官方 vs DLIN vLLM 的 warmup 差异**（回答「怎么把这个优化补齐」）：
+- **sglang 官方**：`--warmups=voice_chat` 启动时扫 511 个 prefill 长度（4→2048 tok）预 JIT 并缓存；triton cache 持久化于 `~/.triton/cache`（实测 5 个 `.so` kernel，跨 run 稳定）。**但 JIT 在此仅 ~3s，扫 511 个长度收益有限**。
+- **DLIN vLLM**：用 **预编译** `_dl_C.so` op（`dl_recurrent_gated_delta_rule`、`invoke_fused_moe_opt`）—— AOT 编译，**零 JIT**，首请求即快。sglang 用 triton（JIT + kernel 本身慢）。
+- 真正要补的不是 warmup，而是**换更快的 prefill kernel**（bf16-bmm 或 DLIN fused）。
+
+**修复**：`SGLANG_DL_MOE_MAX_BF16_M` 默认 `1 → 128`（`fp8.py` + `run_sglang.sh` qwen35 预设）。prefill M≤128 走 bf16-bmm（decode M=1 仍走 fused 路径，不受影响）：
+
+| 配置 | warmup(8tok) | bench(32tok) | prefill 速度 | e2e vs vLLM |
+|---|---|---|---|---|
+| MAX_BF16_M=1（triton，旧默认） | 29.3 s | 27.8 s = **1.15 tok/s** | ~0.3 tok/s | **0.09×** |
+| **MAX_BF16_M=128（bf16-bmm，新默认）** | **5.6 s** | **3.17 s = 10.08 tok/s** | ~5.6 tok/s | **0.80×** |
+
+**正确性**：「France 首都」prompt 下 bf16-bmm 输出连贯（交替 "X 是 Y 首都"/"Y 的首都是 X"），比 triton 的逐字重复更好。先前「bf16-bmm prefill 损质量」的记录（导致曾 revert 回 1）是 prompt-specific / 过度悲观。`MAX_BF16_M=128` 把 bf16 累加精度漂移 bound 在 M=128；更长 prefill 仍回退 triton（安全）。**注意**：greedy（temperature=0）下该推理模型无论哪条 prefill 路径都会重复（如 "Do you know Trump?" → "I am." 循环），那是 decode/sampling 问题，非 prefill。
+
+**剩余差距来源**（e2e 短请求 0.80× vLLM）：
+- prefill 仍只 5.6 tok/s（vLLM 预编译 op 量级更高）—— 真正的 prefill parity 需 DLIN fused MoE 支持 M>1（`invoke_fused_moe_opt` 当前 M>1 prefill 崩，见 §7.5）或更快的 GDN prefill kernel。
+- decode 已 1.45× vLLM；长请求（decode 主导）已超 vLLM。
+
+**2× vLLM（25 tok/s）的更新路径**：decode 18.3 → 需 +37%。NGRAM 推测解码（accept 2-3 tok/step）可达 25-37 tok/s，仍是首选；但其 DLIN unblock（tvm_ffi / launch_bounds）未解。prefill 侧短期靠 MAX_BF16_M=128 已从 0.09× 拉到 0.80×。

@@ -119,7 +119,9 @@ pick_model() {
       MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
       DLIN_TP_SIZE=2; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
       DLIN_MEM_FRACTION=0.85; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
-      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_MAX_BF16_M=1
+      # MAX_BF16_M=128: bf16-bmm MoE for prefill M<=128 (0.3->5.6 tok/s vs triton
+      # fused_experts). Decode M=1 always uses fused path. =1 only if quality drift.
+      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_MAX_BF16_M=128
       # TP=2 needs 2 GPUs; ensure CUDA_VISIBLE_DEVICES has >=2 devices.
       local _ndev
       _ndev=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | tr ',' '\n' | wc -l)
@@ -382,7 +384,7 @@ Quick tests (handy for verifying a model runs on DLIN):
 
 Optimized model presets (-M flag):
   -M qwen3-1.7b    Qwen3-1.7B (default, bf16)
-  -M qwen35-35b     Qwen3.5-35B-A3B-FP8 (TP=2, fused MoE, CG, 14-16 tok/s)
+  -M qwen35-35b     Qwen3.5-35B-A3B-FP8 (TP=2, fused MoE, CG, MAX_BF16_M=128; decode ~18 tok/s, short-req e2e ~10 tok/s)
 
 gen/serve options:
   -m, --model PATH          model path        (default /opt/dataset/Qwen3-1.7B)
