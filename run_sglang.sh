@@ -119,9 +119,10 @@ pick_model() {
       MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
       DLIN_TP_SIZE=2; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
       DLIN_MEM_FRACTION=0.85; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
-      # MAX_BF16_M=128: bf16-bmm MoE for prefill M<=128 (0.3->5.6 tok/s vs triton
-      # fused_experts). Decode M=1 always uses fused path. =1 only if quality drift.
-      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_MAX_BF16_M=128
+      # FUSED=1 + FUSED_MAX_M=128: DLIN fused MoE (invoke_fused_moe_opt) for decode
+      # AND prefill/verify M<=128 — fast + correct (vLLM uses the same op for M>1).
+      # NGRAM verify (M≈num_draft+1) also uses it. =1 only to debug a specific prompt.
+      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=128 SGLANG_DL_MOE_MAX_BF16_M=128
       # TP=2 needs 2 GPUs; ensure CUDA_VISIBLE_DEVICES has >=2 devices.
       local _ndev
       _ndev=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | tr ',' '\n' | wc -l)

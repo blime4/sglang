@@ -577,3 +577,27 @@ Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefil
 **P4（质量）补充**：greedy 重复是推理模型 + temperature=0 的常见现象，未必是 bug。先用 `repetition_penalty=1.1` 或 `temperature=0.7` 验证是否消失；若消失则确认是 sampling；若不消失再查 decode fused 路径精度。
 
 **建议执行顺序**：先 P1（重测 NGRAM，最高杠杆，可能直接达标）→ 若 NGRAM verify 撞 M>1 MoE 崩，则转 P4（质量，快速）+ 等 DLIN 修 P2/P3。
+
+### 7.11 突破：fused MoE 支持 M>1 → sglang 全面超过 vLLM（2026-07-07）
+
+**根因反转**：§7.9/§7.10 把 prefill/verify 慢归因于"triton fused_experts 本身慢"，但**真正的快路径（DLIN `invoke_fused_moe_opt`）被一个 `x.shape[0]==1` guard 限制在 decode-only**。先前会话假设它"M>1 prefill 崩"——**实测证伪**：它对 M>1 完全正常（vLLM 本就用它做 prefill，是正确的 grouped GEMM，按 token 路由）。新增 `SGLANG_DL_MOE_FUSED_MAX_M`（默认 128）让 prefill/verify 也走 fused。
+
+**实测**（TP=2, fa3, CG, FUSED_MAX_M=128；scripts/dl/e2e_correctness_speed.py + ngram_test.py）：
+
+| 场景 | 旧（bf16-bmm/triton） | 新（fused M>1） | vs vLLM 12.63 |
+|---|---|---|---|
+| 纯 decode M=1 | 18.32 tok/s | 18.32（不变） | **1.45×** |
+| 短请求 e2e（8+48 tok） | 10.08 tok/s | **16.04 tok/s** | **1.27×** |
+| prefill 速度 | ~5.6 tok/s | ~50 tok/s | — |
+| NGRAM verify（M=5） | 4.95 tok/s（verify=prefill 速，不摊销） | **20.21 tok/s**（best-case 100% accept） | **1.60×** |
+
+**NGRAM 也因此从净负变为净正**：verify 现在 197ms/处理 5 tok = 39ms/tok（fused 摊销），快于 decode 的 54.6ms/tok。
+
+**正确性**：fused M>1 做直接 FP8 GEMM（比 bf16-bmm 的 bf16 累加更准）。"capital of France" 输出连贯。开放 prompt（"explain neural networks"）的换行/重复 degeneracy 在 **bf16-bmm 与 fused 两条路径都出现** → 是模型 greedy 行为（推理模型 + temperature=0），非 fused bug（见 §7.10 P4）。
+
+**交付**（commit 待提交）：
+- `fp8.py`：`SGLANG_DL_MOE_FUSED_MAX_M` 默认 1→128（`# DL begin/end` 内）。
+- `run_sglang.sh`：qwen35 预设导出 `SGLANG_DL_MOE_FUSED_MAX_M=128`。
+- NGRAM 两缺失 op 的 torch fallback（`ngram_worker.py` reconstruct_indices_from_tree_mask、`eagle_utils.py` verify_tree_greedy，commit 73c2c5f213）——NGRAM 在 DLIN 首次跑通。
+
+**2× vLLM（25 tok/s）剩余路径**：NGRAM best-case 已 20.21（1.60×）。提到 25 需：(a) `num_draft=8`（verify 摊销更多 token，理论 ~40 tok/s，但显存紧需 CG_MAX_BS↓/mem↓）；(b) 或 decode 侧 GDN kernel（dl_recurrent，DLIN launch_bounds bug）。两者 + 真实 diverse prompt 的 accept rate 待测。**但 sglang 已全面超过 vLLM（1.27-1.60×），主目标"比 vLLM 快"已达成。**

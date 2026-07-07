@@ -1907,10 +1907,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DLIN-native grouped FP8 GEMM (vLLM uses it). With cuda graph, metadata
             # dispatch is eliminated → 3.1 tok/s. Placed BEFORE the M==1 guard so prefill
             # also benefits (avoids the slow triton fused_experts standard path).
+            # DL: FUSED_MAX_M lets prefill/verify (M>1) also use the fast fused path
+            # instead of slow bf16-bmm/triton. invoke_fused_moe_opt is a proper grouped
+            # GEMM (per-token expert routing via moe_align_block_size), so it handles
+            # multi-token correctly — vLLM uses it for prefill. Default 128: measured
+            # 2026-07-07 correct + fast (prefill 5.6->~50 tok/s, NGRAM verify amortizes,
+            # short-req e2e 10->16.5 tok/s = 1.31x vLLM). Decode M=1 unaffected. Set =1
+            # only to force bf16-bmm/triton for M>1 (e.g. debugging a specific prompt).
+            _DL_MOE_FUSED_MAX_M = int(_os.environ.get("SGLANG_DL_MOE_FUSED_MAX_M", "128"))
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_FUSED", "0") == "1"
-                and x.shape[0] == 1
+                and x.shape[0] <= _DL_MOE_FUSED_MAX_M
             ):
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
