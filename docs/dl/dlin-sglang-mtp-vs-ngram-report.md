@@ -191,3 +191,21 @@ NGRAM 每步 ≈ 0                    + verify(M_draft_tokens)       ← 同一 
 - 两者都在 draft 执行路径，**不是 hooks 问题**，是 DLIN runtime（buffer sizing + triton JIT），与其它 blocker 同类（`docs/dl/dlin-blockers-handoff.md`）。
 
 **结论修正**：报告 §5「MTP 大概率输」的悲观需修正 —— draft 只 1 层（非 40），draft 税 ≈ 1/40 verify ≈ 小，**MTP 在 diverse 文本上有竞争力**（NGRAM 的 n-gram 查表在 diverse 文本失效处 MTP 用学习草稿）。但**需先解开上述 draft 执行的 DLIN runtime 阻塞**才能实测对比。下一步：debug `cuda_graph_buffer_registry` 的 draft batch sizing（[1] vs [10]）—— 可能是 MTP eager runner 对该 batch 的 buffer 未正确预分配。
+
+### 10.1 Buffer 根因定位（`out_cache_loc` [10] vs draft buffer [1]）
+
+插桩 `cuda_graph_buffer_registry.fill_from` 后定位到 `num_steps=4` 崩溃的精确字段：
+```
+slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
+```
+- draft model runner 的 token buffer 按 `raw_n = num_tokens = 1`（decode 每步 1 token）预分配 → `dst=(1,)`。
+- 但 `forward_batch.out_cache_loc = [10]`（draft 树大小 = num_draft_tokens+bonus+... ）。
+- 调用链：`frozen_kv_mtp_worker_v2.py:432 forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)`，`batch` 是 verify-tree 大小的 schedule batch → `init_new` 给 draft forward_batch 分配了 10 个 KV slot，但 draft runner 的静态 token buffer 只按每步 1 token 预分配。
+
+**结论**：这是 MTP draft batch 与 draft-runner buffer 的尺寸错配（draft forward_batch 带 verify-tree 的 out_cache_loc=10，draft runner 的 token buffer 按每步 1 预分配）。可能 DLIN 特有（draft 的 num_tokens 计算路径），也可能是上游 MTP 在该 batch shape 下的通用问题。修法二选一（需进一步验证哪个正确）：
+1. draft forward_batch 的 `out_cache_loc` 按 draft 实际 num_tokens（seed=1）切片，而非 verify-tree。
+2. draft runner 的 token buffer 预分配到 draft 树大小（≥ num_draft_tokens+1）。
+
+**仍未解**：`num_steps=1` 的 DLIN-triton `ptxas failed`（`write_req_to_token_pool_triton`）—— 与 buffer 无关，是 DLIN triton JIT 对该 kernel shape 编译失败。
+
+⇒ **MTP draft 执行需两个 DLIN/deep-MTP 修复**（buffer sizing + ptxas）才能跑通对比。port（hooks）已就绪，不受影响。
