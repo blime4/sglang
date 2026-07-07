@@ -206,6 +206,22 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             TpModelWorker.init_backends(self, disable_cuda_graph=True)
             self.draft_attn_backend = self._init_draft_attn_backend()
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+            # DL begin — Frozen-KV MTP on hybrid (full/linear) models (e.g. Qwen3.5):
+            # bind_frozen_kv_context remaps each draft attention layer_id to a TARGET
+            # physical layer (so the draft reads target KV). The draft hybrid backend's
+            # full-attn dispatch (`_is_full_attn`: layer_id in full_attn_layers) defaults
+            # to the DRAFT's own layer ids ({0}), so the remapped target id (e.g. 39)
+            # would misroute to the linear/GDN path. Replace with the target physical
+            # ids so dispatch treats them as full-attn. See
+            # docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.2.
+            if (
+                self.kv_context is not None
+                and hasattr(self.draft_attn_backend, "full_attn_layers")
+            ):
+                self.draft_attn_backend.full_attn_layers = list(
+                    self.kv_context.physical_layer_ids.values()
+                )
+            # DL end
             self.init_cuda_graphs()
 
     @property
@@ -510,6 +526,23 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         forward_batch.input_ids = seed_input_ids
         forward_batch.spec_info.hidden_states = seed_prev_hidden
+        # DL begin — Frozen-KV MTP on DLIN: ForwardBatch.init_new borrows the
+        # verify-tree-sized out_cache_loc (len = num_draft_tokens+bonus+...) from
+        # the ScheduleBatch, but the draft model runner's static token buffer is
+        # sized to the draft's num_tokens (== len(seed_input_ids)). The draft
+        # reads frozen target KV (save_kv_cache=False via is_kv_shared_layer), so
+        # out_cache_loc is not used for writes — slice it to the draft token count
+        # so the cuda_graph_buffer_registry copy shape matches. See
+        # docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.1.
+        if (
+            getattr(forward_batch, "out_cache_loc", None) is not None
+            and forward_batch.out_cache_loc.shape[0]
+            != seed_input_ids.shape[0]
+        ):
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc[
+                : seed_input_ids.shape[0]
+            ]
+        # DL end
         self._set_positions(forward_batch)
 
         with (

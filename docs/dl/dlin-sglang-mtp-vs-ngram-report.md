@@ -209,3 +209,17 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 **仍未解**：`num_steps=1` 的 DLIN-triton `ptxas failed`（`write_req_to_token_pool_triton`）—— 与 buffer 无关，是 DLIN triton JIT 对该 kernel shape 编译失败。
 
 ⇒ **MTP draft 执行需两个 DLIN/deep-MTP 修复**（buffer sizing + ptxas）才能跑通对比。port（hooks）已就绪，不受影响。
+
+### 10.2 两个 draft 执行 blocker 已修，暴露 hybrid 模型深层设计冲突
+
+§10.1 之后又修了两个 draft 执行 blocker（`# DL begin/end`，commit 待提交），每个都让 draft forward 更进一步：
+1. **buffer [1] vs [10]**（§10.1）：在 `draft_forward` slice `forward_batch.out_cache_loc` 到 draft token 数。✅ 修复（draft 读 frozen KV、不写，slice 安全）。
+2. **GDN 误路由**：draft 的 full-attn layer 经 `bind` 后 `layer.attn.layer_id = target_phys(39)`，但 draft hybrid backend 的 `_is_full_attn` 用 `layer_id in full_attn_layers`（draft 自身 `{0}`）→ 39∉{0} → 误路由到 linear/GDN → `assert layer_id in mamba_map` 崩。修法：`init_backends` 里把 `draft_attn_backend.full_attn_layers` 覆盖为 target 物理 id（`{39}`）。✅ 修复（dispatch 正确路由到 full-attn）。
+
+**新 blocker（同一根因，更深层）**：KV pool 的 `_transfer_full_attention_id`（`memory_pool.py:1985`）**也**用 `layer_id in full_attention_layers` 校验，draft pool 的 set 仍是 `{0}` → `layer_id=39 not in {0}` → `ValueError`。draft forward 走到 full-attn backend 的 `get_kv_buffer(39)` 时崩。
+
+**根因（设计冲突）**：Qwen3.5 是 **hybrid full/linear 架构**，layer_id 在**多个子系统**（hybrid backend dispatch、KV pool `_transfer_full_attention_id`、可能还有 mamba cache map）都被用来判 full-vs-linear，且都从 **draft 自身 config**（1 层 → `{0}`）派生。而 Frozen-KV MTP 的设计（源自 gemma4 那种 typed-layer、无运行时 dispatch 的模型）把 `layer.attn.layer_id` 重映射到 target_phys(39) 来读 target KV —— 这一重映射同时污染了所有「用 layer_id 判类型」的子系统。gemma4 没 this 问题（typed layer，无运行时 layer_id dispatch）。
+
+**正确修法（需设计层改动，非局部 patch）**：把「KV 读用的 physical layer_id」与「dispatch/transfer 用的 logical layer_id」**解耦** —— 例如 frozen view 在 KV 读边界做 logical→physical 映射，而非全局改 `layer.attn.layer_id`；或让 draft model 的 layer 结构声明成 target 的物理层。这是 upstream 级改动。
+
+**结论**：MTP 在 Qwen3.5 hybrid 上**不是「3 处改动零未知」（报告 §4 高估）**，而是需要 frozen-KV 对 hybrid 模型的 layer-id 解耦设计。已修的 2 个 blocker（buffer + dispatch）是真进度（draft forward 从「第一次崩」推进到 full-attn KV 读），但 KV-pool transfer 这条同根因链还需设计层修。报告 §4 的「~2 天零未知」应修正为「需 frozen-KV hybrid 设计 + 多点 layer-id 解耦」。
