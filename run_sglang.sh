@@ -138,11 +138,16 @@ pick_model() {
     qwen35-35b)
       MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
       DLIN_TP_SIZE=2; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
-      DLIN_MEM_FRACTION=0.85; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
-      # FUSED=1 + FUSED_MAX_M=128: DLIN fused MoE (invoke_fused_moe_opt) for decode
-      # AND prefill/verify M<=128 — fast + correct (vLLM uses the same op for M>1).
-      # NGRAM verify (M≈num_draft+1) also uses it. =1 only to debug a specific prompt.
-      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=128 SGLANG_DL_MOE_MAX_BF16_M=128
+      # mem_fraction=0.60 (not 0.85): the stable bf16-bmm prefill path (M>16) dequants
+      # expert weights and needs several GB headroom, else OOM (docs §7.14). 0.85 OOMs.
+      DLIN_MEM_FRACTION=0.60; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
+      # DLIN MoE routing (see fp8.py + docs §7.13/§7.14):
+      #   FUSED_MAX_M=16  — fused (invoke_fused_moe_opt) for decode M=1 + NGRAM verify
+      #                     M≈9 + short prefill. CRASHES (dleol tu_program.cc:625) for
+      #                     M>=~100, so kept small for serving stability.
+      #   MAX_BF16_M=2048 — bf16-bmm (torch-native, stable) for larger prefill (17-2048).
+      #                     Slow but the only non-crashing path on dl24.
+      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=16 SGLANG_DL_MOE_MAX_BF16_M=2048
       # TP=2 needs 2 GPUs; ensure CUDA_VISIBLE_DEVICES has >=2 devices.
       local _ndev
       _ndev=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | tr ',' '\n' | wc -l)
@@ -167,7 +172,7 @@ apply_ngram_overrides() {
   USE_CUDA_GRAPH=1                                  # NGRAM needs CG for fast decode
   export SGLANG_DL_MOE_FUSED=1
   export SGLANG_DL_MOE_FUSED_MAX_M="${SGLANG_DL_MOE_FUSED_MAX_M:-16}"   # covers verify M=9
-  export SGLANG_DL_MOE_MAX_BF16_M="${SGLANG_DL_MOE_MAX_BF16_M:-128}"
+  export SGLANG_DL_MOE_MAX_BF16_M="${SGLANG_DL_MOE_MAX_BF16_M:-2048}"
   DLIN_MEM_FRACTION=0.60                            # was 0.85; draft tree needs headroom
   DLIN_CG_MAX_BS="${DLIN_CG_MAX_BS:-8}"
   log "NGRAM spec-decode ON: num_draft=$NGRAM_NUM_DRAFT bfs=$NGRAM_MIN_BFS-$NGRAM_MAX_BFS | " \
@@ -575,6 +580,7 @@ phase_serve() {
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
     --tp-size "$tp" \
     --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags $ngram_flags \
+    --skip-server-warmup \
     --port "$SERVE_PORT" --host "$SERVE_HOST"
 }
 
@@ -612,6 +618,7 @@ start_server_bg() {  # launches launch_server detached; sets SERVER_PID
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
     --tp-size "$tp" \
     --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags $ngram_flags \
+    --skip-server-warmup \
     --port "$SERVE_PORT" --host "$SERVE_HOST" \
     > "$BENCH_LOG" 2>&1 &
   SERVER_PID=$!

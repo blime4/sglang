@@ -1907,14 +1907,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DLIN-native grouped FP8 GEMM (vLLM uses it). With cuda graph, metadata
             # dispatch is eliminated → 3.1 tok/s. Placed BEFORE the M==1 guard so prefill
             # also benefits (avoids the slow triton fused_experts standard path).
-            # DL: FUSED_MAX_M lets prefill/verify (M>1) also use the fast fused path
-            # instead of slow bf16-bmm/triton. invoke_fused_moe_opt is a proper grouped
-            # GEMM (per-token expert routing via moe_align_block_size), so it handles
-            # multi-token correctly — vLLM uses it for prefill. Default 128: measured
-            # 2026-07-07 correct + fast (prefill 5.6->~50 tok/s, NGRAM verify amortizes,
-            # short-req e2e 10->16.5 tok/s = 1.31x vLLM). Decode M=1 unaffected. Set =1
-            # only to force bf16-bmm/triton for M>1 (e.g. debugging a specific prompt).
-            _DL_MOE_FUSED_MAX_M = int(_os.environ.get("SGLANG_DL_MOE_FUSED_MAX_M", "128"))
+            # DL: FUSED_MAX_M lets prefill/verify (M>1) also use the fast fused path.
+            # invoke_fused_moe_opt is a proper grouped GEMM (per-token expert routing
+            # via moe_align_block_size) — vLLM uses it for prefill. BUT on dl24 it
+            # CRASHES (dleol tu_program.cc:625 assert -> SIGSEGV, fused_moe_opt.cu:775)
+            # for prefill M >= ~100 (triton fused_experts hits the same assert). Only
+            # bf16-bmm (torch native, no dleol JIT) is stable for large M. So the SAFE
+            # default is FUSED_MAX_M=16 (covers decode M=1, NGRAM verify M=num_draft+1=9,
+            # short prefill; NGRAM 2x result preserved) + MAX_BF16_M=2048 (stable for
+            # larger prefill). Raising FUSED_MAX_M speeds medium prefill but crashes
+            # serving on long prompts. Verified 2026-07-07: 16/2048 = 0 crashes online.
+            _DL_MOE_FUSED_MAX_M = int(_os.environ.get("SGLANG_DL_MOE_FUSED_MAX_M", "16"))
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_FUSED", "0") == "1"
@@ -1952,14 +1955,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # DL end (fused MoE)
 
             # DL begin — bf16 dequant+bmm MoE (handles BOTH decode M==1 and prefill M>1)
-            # DL: MAX_BF16_M controls the max M for bf16-bmm MoE path (includes prefill).
-            # Default 128: bf16-bmm handles prefill(M<=128)+decode(M=1). Measured 2026-07-06:
-            # prefill 0.3->5.6 tok/s vs triton fused_experts; e2e short-req 1.15->10 tok/s.
-            # Decode M==1 always uses the fused path above (SGLANG_DL_MOE_FUSED=1), so this
-            # guard only selects bf16-bmm vs slow triton for PREFILL. Long prefill M>128
-            # still falls back to triton (bf16 accumulation drift bound at M=128).
-            # Set SGLANG_DL_MOE_MAX_BF16_M=1 ONLY if a specific prompt shows quality drift.
-            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "128"))
+            # DL: MAX_BF16_M = max M for the bf16-bmm path. With FUSED_MAX_M=16 (above),
+            # prefill M in (16, MAX_BF16_M] lands here. bf16-bmm is torch-native (no dleol
+            # JIT) so it is the only STABLE path for larger prefill on dl24 (fused + triton
+            # both hit the dleol tu_program.cc:625 assert for M>=~100). Default 2048 covers
+            # typical chunked-prefill sizes; slow but stable. Decode M==1 uses the fused path.
+            # Set =1 ONLY if a specific prompt shows bf16 accumulation drift.
+            _DL_MOE_MAX_BF16_M = int(_os.environ.get("SGLANG_DL_MOE_MAX_BF16_M", "2048"))
             if (
                 _is_dlin()
                 and _os.environ.get("SGLANG_DL_MOE_DLBLAS", "1") != "0"
