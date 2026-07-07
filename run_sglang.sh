@@ -88,6 +88,14 @@ PROMPT="${PROMPT:-}"                          # empty -> builtin demo prompts
 SERVE_PORT="${SERVE_PORT:-30000}"
 SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
 
+# NGRAM speculative decoding — 2.8-3.2x vLLM on qwen35-35b (docs §7.12).
+# Enabled with -S / --spec-ngram. Needs the fused-MoE path + extra mem headroom
+# for the num_draft=8 draft tree; apply_ngram_overrides() sets those when on.
+USE_NGRAM="${USE_NGRAM:-0}"
+NGRAM_NUM_DRAFT="${NGRAM_NUM_DRAFT:-8}"
+NGRAM_MIN_BFS="${NGRAM_MIN_BFS:-1}"
+NGRAM_MAX_BFS="${NGRAM_MAX_BFS:-1}"
+
 # bench options (wraps sglang's official bench_serving / bench_one_batch).
 # NOTE: concurrency defaults to 1 -- the DLIN server crashes under batched
 # prefill (extend) once >~2 requests overlap, because the DLIN FA2 wrapper's
@@ -134,6 +142,26 @@ pick_model() {
     *) die "unknown preset '$1'. Available: qwen3-1.7b qwen35-35b" ;;
   esac
   log "preset '$1': model=$MODEL_PATH tp=${DLIN_TP_SIZE:-1} cg=$USE_CUDA_GRAPH"
+}
+
+#-------------------------------------------------------------------------------
+# apply_ngram_overrides — when -S/--spec-ngram is set, force the config that
+# makes NGRAM num_draft=8 hit 2.8-3.2x vLLM (docs §7.12): fused MoE covering the
+# verify batch (M≈num_draft+1), CG on, and lower mem_fraction for the draft tree.
+# Run AFTER pick_model so it overrides the preset's mem/cg.
+#-------------------------------------------------------------------------------
+apply_ngram_overrides() {
+  [ "$USE_NGRAM" = "1" ] || return 0
+  USE_CUDA_GRAPH=1                                  # NGRAM needs CG for fast decode
+  export SGLANG_DL_MOE_FUSED=1
+  export SGLANG_DL_MOE_FUSED_MAX_M="${SGLANG_DL_MOE_FUSED_MAX_M:-16}"   # covers verify M=9
+  export SGLANG_DL_MOE_MAX_BF16_M="${SGLANG_DL_MOE_MAX_BF16_M:-128}"
+  DLIN_MEM_FRACTION=0.60                            # was 0.85; draft tree needs headroom
+  DLIN_CG_MAX_BS="${DLIN_CG_MAX_BS:-8}"
+  log "NGRAM spec-decode ON: num_draft=$NGRAM_NUM_DRAFT bfs=$NGRAM_MIN_BFS-$NGRAM_MAX_BFS | " \
+      "fused_max_m=$SGLANG_DL_MOE_FUSED_MAX_M mem=$DLIN_MEM_FRACTION cg_max_bs=$DLIN_CG_MAX_BS"
+  log "  (on 2x32GB, CG capture of bs=7-8 may log OOM — sglang auto-recovers; decode/verify" \
+      "still hit 35-40 tok/s. Use TP=4 or CG_MAX_BS=4 to silence.)"
 }
 
 #-------------------------------------------------------------------------------
@@ -385,7 +413,11 @@ Quick tests (handy for verifying a model runs on DLIN):
 
 Optimized model presets (-M flag):
   -M qwen3-1.7b    Qwen3-1.7B (default, bf16)
-  -M qwen35-35b     Qwen3.5-35B-A3B-FP8 (TP=2, fused MoE, CG, MAX_BF16_M=128; decode ~18 tok/s, short-req e2e ~10 tok/s)
+  -M qwen35-35b    Qwen3.5-35B-A3B-FP8 (TP=2, fused MoE, CG; decode ~18 tok/s = 1.45x vLLM)
+                   add -S for NGRAM spec-decode -> 35-40 tok/s = 2.8-3.2x vLLM (docs 7.12)
+
+  Example: ./run_sglang.sh gen -M qwen35-35b -S -n 128      # 2x+ vLLM generation
+           ./run_sglang.sh serve -M qwen35-35b -S --port 30000
 
 gen/serve options:
   -m, --model PATH          model path        (default /opt/dataset/Qwen3-1.7B)
@@ -393,6 +425,7 @@ gen/serve options:
   -n, --max-new-tokens N    decode length     (default 16)
   -b, --backend NAME        attention backend (default fa3; do not use 'triton' on DLIN)
   -g, --cuda-graph          enable cuda graph (default off; safer on DLIN)
+  -S, --spec-ngram          NGRAM spec-decode (qwen35-35b: num_draft=8; needs -M qwen35-35b)
   --port N / --host H       serve only        (default 30000 / 127.0.0.1)
 
 bench options (wraps sglang's official bench_serving / bench_one_batch):
@@ -422,6 +455,7 @@ parse_test_args() {
       -n|--max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
       -b|--backend)        ATTN_BACKEND="$2"; shift 2;;
       -g|--cuda-graph)     USE_CUDA_GRAPH=1; shift;;
+      -S|--spec-ngram)     USE_NGRAM=1; shift;;
       --port)              SERVE_PORT="$2"; shift 2;;
       --host)              SERVE_HOST="$2"; shift 2;;
       # bench
@@ -461,7 +495,8 @@ phase_gen() {
     export CONTEXT_LEN="${DLIN_CONTEXT_LEN:-4096}"
     export PAGE_SIZE="${DLIN_PAGE_SIZE:-16}"
     export CG_MAX_BS="${DLIN_CG_MAX_BS:-0}"
-    log "model=$MODEL_PATH | tp=$TP_SIZE | backend=$ATTN_BACKEND | cg=$USE_CUDA_GRAPH | mem=$MEM_FRAC | ctx=$CONTEXT_LEN"
+    export USE_NGRAM NGRAM_NUM_DRAFT NGRAM_MIN_BFS NGRAM_MAX_BFS
+    log "model=$MODEL_PATH | tp=$TP_SIZE | backend=$ATTN_BACKEND | cg=$USE_CUDA_GRAPH | mem=$MEM_FRAC | ctx=$CONTEXT_LEN | ngram=$USE_NGRAM"
     [ -n "$PROMPT" ] && log "prompt: $PROMPT" || log "prompt: <builtin demos>"
     log "(first run JIT-compiles, ~5 min; cached after)"
     python "$gen_py"
@@ -498,11 +533,13 @@ phase_serve() {
   [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
   [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
   [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
-  log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT"
+  local ngram_flags=""
+  [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
+  log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT | ngram=$USE_NGRAM"
   exec python -m sglang.launch_server \
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
     --tp-size "$tp" \
-    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags \
+    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags $ngram_flags \
     --port "$SERVE_PORT" --host "$SERVE_HOST"
 }
 
@@ -533,11 +570,13 @@ start_server_bg() {  # launches launch_server detached; sets SERVER_PID
   [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
   [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
   [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
+  local ngram_flags=""
+  [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
   BENCH_LOG="${BENCH_LOG:-/tmp/sglang_bench_server.log}"
   nohup python -m sglang.launch_server \
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
     --tp-size "$tp" \
-    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags \
+    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags $ngram_flags \
     --port "$SERVE_PORT" --host "$SERVE_HOST" \
     > "$BENCH_LOG" 2>&1 &
   SERVER_PID=$!
@@ -627,6 +666,7 @@ PHASE="${1:-all}"; shift || true
 case "$PHASE" in
   gen|serve|bench) parse_test_args "$@" ;;
 esac
+apply_ngram_overrides   # no-op unless -S/--spec-ngram (or USE_NGRAM=1)
 
 case "$PHASE" in
   setup)        phase_setup ;;
