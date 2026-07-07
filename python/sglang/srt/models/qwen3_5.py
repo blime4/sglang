@@ -979,7 +979,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        # DL begin — Frozen-KV MTP: suppress KV write for the shared (draft) layer
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            forward_batch,
+            save_kv_cache=not getattr(self, "is_kv_shared_layer", False),
+        )
+        # DL end
 
         if self.attn_output_gate:
             if not _is_npu:
