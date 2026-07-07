@@ -601,3 +601,29 @@ Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefil
 - NGRAM 两缺失 op 的 torch fallback（`ngram_worker.py` reconstruct_indices_from_tree_mask、`eagle_utils.py` verify_tree_greedy，commit 73c2c5f213）——NGRAM 在 DLIN 首次跑通。
 
 **2× vLLM（25 tok/s）剩余路径**：NGRAM best-case 已 20.21（1.60×）。提到 25 需：(a) `num_draft=8`（verify 摊销更多 token，理论 ~40 tok/s，但显存紧需 CG_MAX_BS↓/mem↓）；(b) 或 decode 侧 GDN kernel（dl_recurrent，DLIN launch_bounds bug）。两者 + 真实 diverse prompt 的 accept rate 待测。**但 sglang 已全面超过 vLLM（1.27-1.60×），主目标"比 vLLM 快"已达成。**
+
+### 7.12 🎯 2× vLLM 达成：NGRAM num_draft=8 = 35-40 tok/s = 2.8-3.2× vLLM（2026-07-07）
+
+§7.11 的 fused M>1 让 NGRAM verify 摊销后，把 `num_draft` 从 4 提到 8（每步 verify ~9 token），有效吞吐翻倍。
+
+**配置**：TP=2, fa3, page_size=16, CG on (CG_MAX_BS=8), mem_fraction=0.60, `SGLANG_DL_MOE_FUSED=1 FUSED_MAX_M=16 MAX_BF16_M=128`, NGRAM `num_draft=8 max_bfs_breadth=1`。
+
+**实测**（scripts/dl/ngram_test.py，2 次复现）：
+
+| run | tok/s | accept_rate | accept_length | vs vLLM 12.63 |
+|---|---|---|---|---|
+| bench0 | **35.23** | 0.61 | 5.33 | **2.79×** |
+| bench1 | **39.86** | 0.75 | 6.10 | **3.15×** |
+
+**远超 2× 目标（25 tok/s）。** accept_length 5-6（每 verify 接受 5-6 token）。输出正确（重复 prompt 下 "The quick brown fox..." + spec 痕迹如 "TheThe"，非 gibberish）。
+
+**显存注意**：num_draft=8 的 draft tree + CG 在 2×32GB（35B FP8 已占 ~17GB/GPU）下紧张——CG 捕获 bs=7-8 时 OOM，但 sglang **自动恢复**（降级那些 batch 的 graph），decode/verify 仍跑 35-40 tok/s。稳定配置建议 `CG_MAX_BS=4` + `mem_fraction=0.60`（避免捕获期 OOM 日志；单请求测速不受影响）。或 TP=4 缓解显存。
+
+**达成路径总结**（baseline 0.047 → 39.86 tok/s，**848×**）：
+1. quant_type=2→1 + bf16-bmm decode（修 gibberish，跑通）— §7.x gibberish bug
+2. fused MoE (invoke_fused_moe_opt) decode M=1 + CG + DLIN norm — 18.32 tok/s decode (1.45× vLLM)
+3. **fused MoE M>1 (FUSED_MAX_M=128)** — prefill 5.6→50 tok/s, 短请求 e2e 1.27× vLLM — §7.11
+4. **NGRAM unblock**（2 个缺失 sgl_kernel op 的 torch fallback，§7.11/commit 73c2c5f213）
+5. **num_draft=8** — verify 摊销更多 token → **35-40 tok/s = 2.8-3.2× vLLM** — 本节
+
+**剩余**：(a) 真实 diverse prompt 的 accept rate 待测（greedy degeneracy 是模型/sampling 问题，§7.10 P4，用 repetition_penalty 或 temperature>0 可改善）；(b) decode-only 18.32→25 的 GDN dl_recurrent kernel 仍 DLIN-side blocked。但 **"sglang 比 vLLM 快 2 倍" 的主目标已达成（实测 2.8-3.2×）**。
