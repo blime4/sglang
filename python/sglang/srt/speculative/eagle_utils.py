@@ -22,6 +22,80 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
+# DL begin — DLIN sgl_kernel build omits verify_tree_greedy (greedy tree-verify
+# sampler for spec decoding). Direct CPU-offloaded port of VerifyTreeGreedy
+# (sgl-kernel/csrc/speculative/eagle_utils.cu). Tensors are tiny (bs*num_draft),
+# so one batched host transfer + numpy walk beats per-element .item() GPU syncs.
+_DL_TREE_GREEDY_PROBED = None
+
+
+def _dl_tree_greedy_needs_fallback() -> bool:
+    global _DL_TREE_GREEDY_PROBED
+    if _DL_TREE_GREEDY_PROBED is None:
+        try:
+            _ = torch.ops.sgl_kernel.verify_tree_greedy
+            _DL_TREE_GREEDY_PROBED = False
+        except AttributeError:
+            _DL_TREE_GREEDY_PROBED = True
+    return _DL_TREE_GREEDY_PROBED
+
+
+def _verify_tree_greedy_torch(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+):
+    import numpy as _np
+
+    bs, D = candidates.shape
+    S = accept_index.shape[1]
+    dev = predicts.device
+    cand = candidates.reshape(-1).cpu().numpy()
+    ri = retrive_index.reshape(-1).cpu().numpy()
+    rnt = retrive_next_token.reshape(-1).cpu().numpy()
+    rns = retrive_next_sibling.reshape(-1).cpu().numpy()
+    tp = target_predict.reshape(-1).cpu().numpy()
+    pred = predicts.reshape(-1).cpu().numpy().copy()
+    ai = accept_index.cpu().numpy().copy()
+    atn = accept_token_num.cpu().numpy().copy()
+    for bx in range(bs):
+        base = bx * D
+        last = int(ri[base])
+        ai[bx, 0] = last
+        num_acc = 0
+        cur = 0
+        for _j in range(1, S):
+            cur = int(rnt[base + cur])
+            while cur != -1:
+                draft_index = int(ri[base + cur])
+                draft_token = int(cand[base + cur])
+                target_token = int(tp[last])
+                if draft_token == target_token:
+                    pred[last] = target_token
+                    num_acc += 1
+                    ai[bx, num_acc] = draft_index
+                    last = draft_index
+                    break
+                else:
+                    cur = int(rns[base + cur])
+            if cur == -1:
+                break
+        atn[bx] = num_acc
+        pred[last] = int(tp[last])
+    predicts.copy_(torch.as_tensor(pred, dtype=predicts.dtype, device=dev))
+    accept_index.copy_(torch.as_tensor(ai, dtype=accept_index.dtype, device=dev))
+    accept_token_num.copy_(
+        torch.as_tensor(atn, dtype=accept_token_num.dtype, device=dev)
+    )
+
+
+# DL end
+
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
@@ -229,6 +303,20 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
+    # DL begin — DLIN falls back to the torch port when the sgl_kernel op is absent.
+    if _dl_tree_greedy_needs_fallback():
+        _verify_tree_greedy_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+        return predicts, accept_index, accept_token_num
+    # DL end
     if _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
 
