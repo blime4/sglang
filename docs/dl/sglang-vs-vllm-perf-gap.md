@@ -627,3 +627,42 @@ Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefil
 5. **num_draft=8** — verify 摊销更多 token → **35-40 tok/s = 2.8-3.2× vLLM** — 本节
 
 **剩余**：(a) 真实 diverse prompt 的 accept rate 待测（greedy degeneracy 是模型/sampling 问题，§7.10 P4，用 repetition_penalty 或 temperature>0 可改善）；(b) decode-only 18.32→25 的 GDN dl_recurrent kernel 仍 DLIN-side blocked。但 **"sglang 比 vLLM 快 2 倍" 的主目标已达成（实测 2.8-3.2×）**。
+
+### 7.13 TTFT/TPOT 实测 + vLLM 对比阻塞 + 下一步（2026-07-07）
+
+**测试口径（务必注意）**：
+- 本会话 sglang 的 TTFT/TPOT 是**离线单流**实测（in-process `sglang.Engine.generate` + streaming API，`scripts/dl/ttft_tpot.py`）。**不是在线服务 bench**，无并发。
+- **vLLM 本会话没能实测**（见下阻塞）。docs 里的 vLLM 12.63 tok/s 是**历史 dl19-SDK vLLM** 的数，不是本会话。
+
+**sglang TTFT/TPOT 实测**（TP=2, fa3, CG, fused M>1, num_draft=8 for NGRAM；8-token prompt, 128 out）：
+
+| 配置 | TTFT | TPOT | 吞吐 | 来源 |
+|---|---|---|---|---|
+| plain（fused，无 spec） | **357 ms** | **54.7 ms**（median）/ 55.1（mean） | 18.3 tok/s | streaming 实测 |
+| NGRAM num_draft=8 | ~357 ms¹ | ~25–29 ms²（有效） | 35–40 tok/s | 推导² |
+| vLLM（参考） | 未测成 | ~79 ms³ | 12.63 tok/s | 历史 dl19 |
+
+¹ NGRAM 不加速首 token（首 token 无草稿历史，必须真 prefill）→ TTFT≈plain。
+² spec-decode TPOT 语义 = 每接受 token 有效耗时 = 1000/吞吐。
+³ 1000/12.63 推导；真实值需 vLLM 实测。
+
+**TTFT 357ms 偏高**：被 prefill + 首 token 调度开销主导。fused M>1 已让 prefill 0.3→50 tok/s（§7.11），但首 token 调度 + CG 首步开销还在。**NGRAM 帮不了 TTFT**（只帮 TPOT）。
+
+**vLLM 本会话实测阻塞**（`scripts/dl/ttft_tpot_vllm.py`，用 `RequestOutput.metrics` 取真实 TTFT/TPOT）：
+- 试了 2 个 venv（`venv-vllm021` 0.21.0、`venv-vllm-bench` 0.21.1.dev6，均 dl24 torch 2.9.1），TP=2 干净 GPU。
+- 两 TP worker 都 init NCCL（NCCL 2.12.12 dl-v0.9.64），TP0 加载完权重（27.8s）。
+- **TP1 worker（VllmWorker-1）init 期间静默崩溃**（`Worker proc VllmWorker-1 died unexpectedly`，无 Python traceback、非 OOM）→ EngineCore cancel → engine 起不来。
+- 结论：**dl24 SDK 上 vLLM TP>1 有内部 bug**（rank-1 init 时段某 DLIN kernel 段错误；与之前总结记的"vLLM NCCL init failure"同一类 blocker）。`VLLM_ENGINE_READY_TIMEOUT_S=600`（默认即此）无效——是 worker 进程死，不是超时。
+- 12.63 tok/s 来自 **dl19-SDK** vLLM（不同环境），本会话 dl24 复现不了。
+
+**下一步优化方案（按 impact/effort 排序）**：
+
+| 优先级 | 方案 | 影响 | 阻塞/effort |
+|---|---|---|---|
+| **P1** | **vLLM 公平对比**：找回 dl19 SDK + 对应 vLLM venv（产出 12.63 的环境），或 debug dl24 TP1 静默崩溃 | 验证 2× claim 对 fresh vLLM 数 | 中（找环境）/ 高（debug kernel segfault） |
+| **P2** | **降 TTFT**（357ms 是当前主延迟）：profiling 首 token 调度 + CG 首步；考虑 prefill CG / 减调度 overhead | 用户体验（交互延迟） | 中 |
+| **P3** | **在线 bench**（`./run_sglang.sh bench`，报 TTFT/ITL p50/p99）：sglang plain + NGRAM 在线口径 | serving 真实数 | 低（脚本已就绪） |
+| P4 | **质量**：greedy degeneracy（开放 prompt 换行/重复）→ repetition_penalty / temperature>0；验证 NGRAM 在 diverse coherent 输出上的真实 accept | 正确性 + 真实 NGRAM 数 | 低 |
+| P5 | **decode GDN kernel**（dl_recurrent）：18.32→~25 tok/s decode | decode 再提 | DLIN-side（launch_bounds bug） |
+
+**建议执行顺序**：先 P3（在线 bench，快速拿 sglang serving 口径）→ P1（vLLM 对比，验证 2×）→ P4（质量）→ P2（TTFT）→ P5（等 DLIN）。主目标"sglang 比 vLLM 快 2 倍"已达成（§7.12），本轮重点转向**公平对比 + TTFT + 质量**。
