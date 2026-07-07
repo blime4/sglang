@@ -223,3 +223,27 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 **正确修法（需设计层改动，非局部 patch）**：把「KV 读用的 physical layer_id」与「dispatch/transfer 用的 logical layer_id」**解耦** —— 例如 frozen view 在 KV 读边界做 logical→physical 映射，而非全局改 `layer.attn.layer_id`；或让 draft model 的 layer 结构声明成 target 的物理层。这是 upstream 级改动。
 
 **结论**：MTP 在 Qwen3.5 hybrid 上**不是「3 处改动零未知」（报告 §4 高估）**，而是需要 frozen-KV 对 hybrid 模型的 layer-id 解耦设计。已修的 2 个 blocker（buffer + dispatch）是真进度（draft forward 从「第一次崩」推进到 full-attn KV 读），但 KV-pool transfer 这条同根因链还需设计层修。报告 §4 的「~2 天零未知」应修正为「需 frozen-KV hybrid 设计 + 多点 layer-id 解耦」。
+
+### 10.3 🎯 MTP 端到端跑通（2026-07-08，commit `79a4e1caae`）
+
+修完第 5 个 blocker（`build_tree_kernel_efficient` torch fallback）后，**MTP (FROZEN_KV_MTP) 在 Qwen3.5-35B-A3B-FP8 / DLIN sdk 4.2.1 上端到端跑通**：engine 加载、draft forward、verify、coherent 输出。
+
+**5 个 blocker 全修**（全部 `# DL begin/end`）：
+1. hooks port（`1eb8c5553a`）— `qwen3_5_mtp.py` build/bind + `qwen3_5.py` save_kv_cache。
+2. `out_cache_loc` buffer [1]vs[10]（`0ed5bd0c9c`）— draft_forward slice。
+3. GDN dispatch 误路由（`0ed5bd0c9c`）— `draft_attn_backend.full_attn_layers` 覆盖为 target 物理 id。
+4. KV-pool sub-backend swap（`fb90b6f716`）— `_swap_draft_kv_pool` swap hybrid 子后端。
+5. `build_tree_kernel_efficient`（`79a4e1caae`）— torch port（build_tree_efficient FULL_MASK，CPU-offloaded）。
+
+**实测**（num_steps=4, num_draft=5, topk=1, "quick brown fox"）：
+- 跑通，输出连贯 "The quick brown fox..."。
+- **但 accept_rate ~0.07（accept_length 1.31）** → 7.81 tok/s（低于 plain 18.3 / NGRAM 35-40）。
+- 同 prompt NGRAM accept~1.0；MTP 仅 0.07 → **draft 首 token 预测几乎全错**。
+
+**剩余（correctness tuning，非「跑通」）**：draft 预测质量低 → accept 极低。可能原因：
+1. layer 映射（draft→target 最后一个 full-attn 层 39）读到的 KV 不对/不新鲜。
+2. build_tree torch port 有 subtle bug → verify tree 畸形 → 拒绝好 draft。
+3. save_kv_cache 写抑制未完全生效 → draft 污染 target KV。
+判别法：插桩 draft seed 预测 vs target argmax —— 若 seed 全错→(1)/(3)（draft KV 读）；若 seed 对但 accept 低→(2)（build_tree）。
+
+**结论**：MTP **已支持（跑通）**；从「跑通」到「可用（accept 高、反超 NGRAM）」需 correctness tuning（定位 draft 低 accept 根因）。报告 §4「3 处改动零未知」最终修正为「需 5 处 DL runtime 适配 + correctness tuning」—— hybrid (Qwen3.5) 比 typed-layer (gemma4) 复杂得多。
