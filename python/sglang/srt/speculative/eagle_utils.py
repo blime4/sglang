@@ -178,6 +178,106 @@ class TreeMaskMode(IntEnum):
     QLEN_ONLY_BITPACKING = 2
 
 
+# DL begin — build_tree_kernel_efficient torch fallback (DLIN sgl_kernel omits the
+# C op). CPU-offloaded port of the build_tree_efficient kernel (FULL_MASK path; the
+# MTP default). See sgl-kernel/csrc/speculative/eagle_utils.cu:34.
+_dl_build_tree_probe = None
+
+
+def _dl_build_tree_needs_fallback() -> bool:
+    global _dl_build_tree_probe
+    if _dl_build_tree_probe is None:
+        try:
+            _ = torch.ops.sgl_kernel.build_tree_kernel_efficient
+            _dl_build_tree_probe = False
+        except AttributeError:
+            _dl_build_tree_probe = True
+    return _dl_build_tree_probe
+
+
+def _build_tree_efficient_torch(
+    parent_list, selected_index, verified_seq_len, tree_mask, positions,
+    retrieve_index, retrieve_next_token, retrieve_next_sibling,
+    topk, depth, draft_token_num, tree_mask_mode,
+):
+    import numpy as _np
+
+    bs = parent_list.shape[0]
+    D = int(draft_token_num)
+    dev = tree_mask.device
+    pl = parent_list.reshape(-1).cpu().numpy()
+    si = selected_index.reshape(-1).cpu().numpy()
+    vsl = verified_seq_len.cpu().numpy()
+    tm = tree_mask.cpu().numpy().copy()
+    pos = positions.reshape(-1).cpu().numpy().copy()
+    ri = retrieve_index.reshape(-1).cpu().numpy().copy()
+    rnt = retrieve_next_token.reshape(-1).cpu().numpy().copy()
+    rns = retrieve_next_sibling.reshape(-1).cpu().numpy().copy()
+    pl_stride = int(topk * (depth - 1) + 1)
+    FULL = int(TreeMaskMode.FULL_MASK)
+    for bid in range(bs):
+        seq_tree_idx = D * D * bid
+        for k in range(bid):
+            seq_tree_idx += int(vsl[k]) * D
+        seq_len = int(vsl[bid])
+        for tid in range(D):
+            if tree_mask_mode == FULL:
+                token_tree_idx = seq_tree_idx + (seq_len + D) * tid + seq_len + 1
+            else:
+                token_tree_idx = D * D * bid + D * tid + 1
+            tm[token_tree_idx - 1] = True
+            for k in range(D - 1):
+                tm[token_tree_idx + k] = False
+            if tid == 0:
+                pos[bid * D] = seq_len
+                for i in range(D - 1, 0, -1):
+                    ri[bid * D + i] = bid * D + i
+                    parent_tb_idx = int(si[bid * (D - 1) + i - 1]) // topk
+                    parent_position = 0
+                    if parent_tb_idx > 0:
+                        parent_token_idx = int(pl[bid * pl_stride + parent_tb_idx])
+                        for pp in range(D):
+                            if int(si[bid * (D - 1) + pp]) == parent_token_idx:
+                                parent_position = pp + 1
+                                break
+                    if parent_position == D:
+                        continue
+                    if rnt[bid * D + parent_position] == -1:
+                        rnt[bid * D + parent_position] = i
+                    else:
+                        origin = rnt[bid * D + parent_position]
+                        rnt[bid * D + parent_position] = i
+                        rns[bid * D + i] = origin
+                ri[bid * D] = bid * D
+            else:
+                cur_position = tid - 1
+                position = 0
+                while True:
+                    position += 1
+                    tm[token_tree_idx + cur_position] = True
+                    parent_tb_idx = int(si[bid * (D - 1) + cur_position]) // topk
+                    if parent_tb_idx == 0:
+                        break
+                    token_idx = int(pl[bid * pl_stride + parent_tb_idx])
+                    nxt = -1
+                    for cp in range(D):
+                        if int(si[bid * (D - 1) + cp]) == token_idx:
+                            nxt = cp
+                            break
+                    if nxt < 0:
+                        break
+                    cur_position = nxt
+                pos[bid * D + tid] = position + seq_len
+    tree_mask.copy_(torch.as_tensor(tm, dtype=tree_mask.dtype, device=dev))
+    positions.copy_(torch.as_tensor(pos, dtype=positions.dtype, device=dev))
+    retrieve_index.copy_(torch.as_tensor(ri, dtype=retrieve_index.dtype, device=dev))
+    retrieve_next_token.copy_(torch.as_tensor(rnt, dtype=retrieve_next_token.dtype, device=dev))
+    retrieve_next_sibling.copy_(torch.as_tensor(rns, dtype=retrieve_next_sibling.dtype, device=dev))
+
+
+# DL end
+
+
 def build_tree_kernel_efficient(
     bonus_tokens: torch.Tensor,
     parent_list: List[torch.Tensor],
@@ -267,6 +367,17 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    # DL begin — DLIN sgl_kernel omits build_tree_kernel_efficient; use the torch port
+    elif _dl_build_tree_needs_fallback():
+        _build_tree_efficient_torch(
+            parent_list.to(dtype=torch.int64),
+            top_scores_index.to(dtype=torch.int64),
+            seq_lens.to(dtype=torch.int64),
+            tree_mask, positions,
+            retrieve_index, retrieve_next_token, retrieve_next_sibling,
+            int(topk), int(spec_steps), int(num_verify_tokens), int(tree_mask_mode),
+        )
+    # DL end
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
