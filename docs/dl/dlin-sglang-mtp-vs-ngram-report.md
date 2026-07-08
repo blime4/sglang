@@ -333,3 +333,19 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 - ✅ DL runtime 支持（6 blocker 全修，MTP 端到端跑通）。
 - ❌ **accept 80%+ 不可达**（当前架构下）：Qwen3.5 的 MTP draft 独立训练 q_proj → frozen-KV Q·K 不可对齐 → accept ~0.04。需 standard-NextN（draft own KV）才能对齐，但 sglang 无此算法。
 - NGRAM 仍是 DLIN 最佳 spec-decode（2.9-3.1× vLLM，accept 高）。
+
+### 10.8 确认：frozen-KV attention 有害（zeroed → accept 2×）；80%+ 需 standard-NextN
+
+**实验**：将 draft attention 输出置零（feedforward-only，仅 target_hidden → fc → mlp → logits）。
+- **accept 0.04 → 0.083**（2× 提升！）
+- tok/s 6.4 → 8.14
+
+**解读**：frozen-KV 的 attention **比没有 attention 更差** —— misaligned Q·K 检索到错误 context，**有害**（比 feedforward-only 差 2×）。feedforward-only 给 8.3%（有信号但弱 —— target_hidden 编码了部分 context，但无序列历史）。
+
+**确认根因链**：
+1. draft q_proj 独立训练（§10.7：与 target k_proj 不同，norm 216665 vs 265457）。
+2. frozen-KV 读 target KV → Q·K 不同空间 → 检索错误 context → **比无 attention 更差**。
+3. feedforward-only（跳过 attention）→ 8.3%（target_hidden → fc → mlp 有信号，但无序列上下文）。
+4. **80%+ 需 draft own KV**（standard NextN）→ Q·K 同空间（draft q_proj + draft k_proj）→ 正确 context → 高 accept。但需 draft prefill 写自己的 KV（sglang 无此算法 for built-in heads）。
+
+**accept 80%+ 不可达（当前架构）**：frozen-KV 4%（misaligned）/ feedforward 8.3%（无 context）/ standard-NextN 需 upstream feature。NGRAM 仍是 DLIN 最佳（2.9-3.1× vLLM）。
