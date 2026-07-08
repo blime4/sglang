@@ -349,3 +349,22 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 4. **80%+ 需 draft own KV**（standard NextN）→ Q·K 同空间（draft q_proj + draft k_proj）→ 正确 context → 高 accept。但需 draft prefill 写自己的 KV（sglang 无此算法 for built-in heads）。
 
 **accept 80%+ 不可达（当前架构）**：frozen-KV 4%（misaligned）/ feedforward 8.3%（无 context）/ standard-NextN 需 upstream feature。NGRAM 仍是 DLIN 最佳（2.9-3.1× vLLM）。
+
+### 10.9 三次实验均确认 standard NextN（frozen-KV 不可用）
+
+| 实验 | accept | 解读 |
+|---|---|---|
+| frozen-KV（read target KV） | 0.04 | Q·K misaligned（draft q_proj ≠ target k_proj 空间）|
+| feedforward-only（zero attention） | 0.083 | 有信号但无序列上下文 |
+| copy target qkv_proj → draft | **0.0** | draft q_proj 训练于 draft 输入空间，替换破坏 input-Q 对齐 |
+
+**三次实验均指向同一结论**：Qwen3.5 MTP draft 是 **standard NextN**（q_proj 独立训练，对齐自己的 k_proj），**不是 frozen-KV**（需交叉训练对齐 target k_proj）。frozen-KV 不可用。
+
+### standard-NextN 实现方案（达 80%+ 的唯一路径）
+
+1. **draft 独立 KV pool**：在 worker init 创建 draft 专属 KV pool（1 层，与 target 同 slot 数），不复用 target 的 pool。
+2. **draft prefill**：target forward 后，用捕获的 hidden states（aux_hidden_states，含全 prefix）跑 draft → 写 draft 自己的 KV（layer 0 in draft pool）。
+3. **不 bind frozen-KV**：draft 用自己的 layer_id（0），自己的 KV pool。
+4. **draft decode**：draft forward 读自己的 KV（prefix + draft chain）→ Q·K 同空间（draft q_proj + draft k_proj）→ 对齐 → 高 accept。
+
+**工作量**：中等偏大（~2-3 天）。主要改动在 `frozen_kv_mtp_worker_v2.py`（draft KV pool + draft prefill method）+ `qwen3_5_mtp.py`（draft forward 用 own KV）。
