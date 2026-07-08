@@ -311,3 +311,25 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 - 解 Q·K 需：对照训练 spec（draft 期望的 hidden/KV 层）或试 hidden-capture 改 output / KV-read 改层（empirical，需验证不破坏语义）。
 
 **对原问题「MTP 比 NGRAM 好吗」**：当前不能（6.4 << NGRAM 35-40）。MTP 在 DLIN 上**已支持（跑通）**，但 hybrid Qwen3.5 的 frozen-KV Q·K 对齐是待解的 design-level 问题。NGRAM 仍是 DLIN 最佳 spec-decode（2.9-3.1× vLLM）。
+
+### 10.7 根因确认：draft q_proj 与 target 独立训练 → frozen-KV Q·K 不可对齐
+
+对比 checkpoint 中 draft 和 target 的 q_proj 权重（决定性数据）：
+- draft `mtp.layers.0.self_attn.q_proj.weight`: norm=216665, scale_norm=0.014
+- target `model.language_model.layers.39.self_attn.q_proj.weight`: norm=265457, scale_norm=0.010
+- **`equal=False`, `max_diff=832`**（完全不同的权重）
+
+**结论**：draft 的 q_proj 是**独立训练**的（非 tied to target）。draft 的 Q（from draft q_proj）与 target 的 K（from target k_proj at layer 39）在**不同投影空间** → Q·K **不可能对齐** → attention 检索错误 context → spread logits → accept ~0.04。
+
+**这表明 Qwen3.5 的 MTP 可能是 standard NextN（draft 有自己的 KV），而非 frozen-KV**：
+- standard NextN：draft 写/读**自己的** KV → Q·K 在同一空间（draft q_proj + draft k_proj）→ 对齐。
+- frozen-KV：draft 读**target 的** KV → 需要 draft q_proj 与 target k_proj 交叉对齐（gemma4 是如此训练的）。Qwen3.5 的 draft 独立训练 → **不交叉对齐** → frozen-KV 不可用。
+
+**要达到 accept 80%+**：需让 draft 用**自己的 KV**（standard NextN），而非 frozen-KV。但 sglang 只有 FROZEN_KV_MTP 算法（无 standard-NextN for built-in heads）。两条路：
+1. **在 sglang 加 standard-NextN 支持**（draft 在 prefill 时写自己的 KV，decode 时读自己的 KV）—— upstream feature，工作量大。
+2. **确认 Qwen3.5 MTP 是否确实 standard NextN**（对照训练 spec / DeepSeek MTP 论文）—— 若是，需 path 1。
+
+**MTP 支持终局（更新）**：
+- ✅ DL runtime 支持（6 blocker 全修，MTP 端到端跑通）。
+- ❌ **accept 80%+ 不可达**（当前架构下）：Qwen3.5 的 MTP draft 独立训练 q_proj → frozen-KV Q·K 不可对齐 → accept ~0.04。需 standard-NextN（draft own KV）才能对齐，但 sglang 无此算法。
+- NGRAM 仍是 DLIN 最佳 spec-decode（2.9-3.1× vLLM，accept 高）。
