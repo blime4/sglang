@@ -324,7 +324,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
 
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
-        set_frozen_kv_positions(forward_batch, self.topk)
+        # DL begin — standard NextN: don't override positions (frozen-KV sets all
+        # to seq_lens-1, but standard NextN needs advancing positions per draft step
+        # so the draft writes K/V at correct positions in layer 40).
+        if self.kv_context is not None:
+            set_frozen_kv_positions(forward_batch, self.topk)
+        # DL end
 
     def _expand_for_topk_draft(self, forward_batch: ForwardBatch) -> None:
         expand_for_topk_draft(forward_batch, self.topk)
@@ -609,6 +614,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             forward_batch.input_ids = input_ids
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
+            # DL begin — standard NextN: advance position per draft step so K/V
+            # is written at the correct position in layer 40.
+            if self.kv_context is None and forward_batch.positions is not None:
+                forward_batch.positions = forward_batch.positions + 1
+            # DL end
 
             with (
                 self._target_kv_pool_view(forward_batch),
@@ -657,7 +667,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         del mm_input_embeds
         if batch.forward_mode.is_idle():
             return self._idle_seed()
- — standard NextN: run draft on prompt tokens to fill draft KV
+
+        # standard NextN: run draft on prompt tokens to fill draft KV
         if (
             self.kv_context is None
             and hasattr(self, "draft_model_runner")
