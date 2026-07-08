@@ -288,3 +288,26 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 - ⏸ **可用性**：draft 低 accept（Q·K 对齐，frozen-KV 设计层 subtle）—— 非 DL runtime 问题，是 Qwen3.5 hybrid + frozen-KV 的 hidden/KV 层匹配，需对照训练 spec 或试 hidden-capture input→output。
 
 报告 §4「3 处改动零未知」最终终局修正：**Qwen3.5 hybrid 上 frozen-KV MTP = 6 个 DL runtime 适配（done）+ 1 个 hidden/KV 层匹配 subtle（design-level，待训练 spec 对照）**。gemma4（typed-layer）无此 subtle；hybrid (Qwen3.5) 的 layer_id/hidden 语义更复杂。
+
+### 10.6 决定性诊断：logits 大但 spread → Q·K misaligned（attention 非零但语义错）
+
+插桩 draft attention + logits 的 norm/maxprob，得到决定性数据：
+- `attn_output norm=57-90`（非零、非爆 → attention **数值** sane）。
+- `model-in hidden=13.9 → model-out=119.4`（1-layer **有处理**，非 no-op）。
+- `lm_head norm=293-306`（loaded, sane）。
+- **`logits_norm=1257`（大）但 `maxprob=0.039`（spread，非 peaked）**。
+
+**解读**：logits 量级大（1257）但 spread（maxprob 0.039）→ draft hidden 产出 **noisy logits**（无明确 winner）。正常模型 logits peaked（一个远大）。spread = draft 的 1-layer 产出**语义错**的 hidden（数值 sane 但内容错）→ lm_head(hidden) → noisy logits → 低 accept。
+
+**根因链**：attention output 非零但**语义错**（Q·K misaligned → 检索到错误 context）→ wrong hidden → spread logits → accept ~0.04。
+
+**已排除（runtime 全验证）**：input(hidden) sane ✓ / weights loaded(22+2 shared) ✓ / req_to_token 共享 target ✓ / KV pool swap 达 flashattention ✓ / layer 39 真实 KV ✓ / 1-layer 非空转 ✓ / lm_head sane ✓。
+
+**剩余（design-level）**：Q·K 空间不对齐。H(layer-38 output) + KV-read(layer-39, k_proj(H)) **配对一致**，但 draft qkv_proj 产出 Q 与 target k_proj 产出 K **不在同一空间** —— 可能 draft 训练时期望的 H 是 final hidden(layer-39 output+norm) 而非 layer-38 output。需对照 Qwen3.5 MTP 训练 spec 确认 draft 期望的 hidden 层，或直接比较 Q vs K 的子空间。
+
+**MTP 支持终局**：
+- ✅ **DL runtime 支持完成**：6 个 blocker 全修，MTP 端到端跑通，coherent 输出。
+- ⏸ **可用性**：Q·K misaligned（design-level，非 DL runtime）→ accept ~0.04 → 6.4 tok/s（不可用）。
+- 解 Q·K 需：对照训练 spec（draft 期望的 hidden/KV 层）或试 hidden-capture 改 output / KV-read 改层（empirical，需验证不破坏语义）。
+
+**对原问题「MTP 比 NGRAM 好吗」**：当前不能（6.4 << NGRAM 35-40）。MTP 在 DLIN 上**已支持（跑通）**，但 hybrid Qwen3.5 的 frozen-KV Q·K 对齐是待解的 design-level 问题。NGRAM 仍是 DLIN 最佳 spec-decode（2.9-3.1× vLLM）。
