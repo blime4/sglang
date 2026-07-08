@@ -247,3 +247,22 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 判别法：插桩 draft seed 预测 vs target argmax —— 若 seed 全错→(1)/(3)（draft KV 读）；若 seed 对但 accept 低→(2)（build_tree）。
 
 **结论**：MTP **已支持（跑通）**；从「跑通」到「可用（accept 高、反超 NGRAM）」需 correctness tuning（定位 draft 低 accept 根因）。报告 §4「3 处改动零未知」最终修正为「需 5 处 DL runtime 适配 + correctness tuning」—— hybrid (Qwen3.5) 比 typed-layer (gemma4) 复杂得多。
+
+### 10.4 低 accept 根因诊断：draft KV 读损坏（input/weights 已排除）
+
+插桩逐步排除后定位到 **draft KV 读**：
+- **draft input（target hidden）正常**：`spec_info.hidden_states` shape=(1,2048), norm=14.2, 非 NaN（hidden-capture 激活后已填充）。✅
+- **draft weights 已加载**：22/24 params loaded, fc.norm=25.9, qkv_proj.norm=161571（非 random init）。✅
+- **draft output 仍是 garbage**：seed_maxprob ~0.01（near-uniform），accept ~0.04。❌
+
+⇒ input + weights 都正常，但 draft 的 1-layer attention（Q 来自 draft qkv_proj，K/V 读 target layer-39 KV via frozen pool swap）产出 garbage → **Q·K 不对齐 / KV 读到的不是有效 context**。
+
+**剩余嫌疑（draft KV 读）**：
+1. layer 映射：draft→target 最后一个 full-attn 层(39) 可能不是 draft 训练时期望的 KV 层。
+2. pool swap：尽管修了 sub-backend swap，flashattention 子后端的 `get_kv_buffer(39)` 可能仍读到 draft 自己的（空/错）pool 而非 target ���。
+3. positions/rope：draft Q 在 pos(seq_len-1)，target K 在 pos(0..seq_len-1) —— rope 相对位置可能不对齐。
+4. K/V layout：target layer-39 的 paged KV 与 draft attention 期望的 layout 不匹配。
+
+**下一步判别**：插桩 draft attention 的 K/V —— 打印 `get_kv_buffer(39)` 的 norm/shape；若 ~0 或错 shape → (2)/(4)（pool/layout）；若 sane 但 Q·K 对不齐 → (1)/(3)（layer/rope）。
+
+**状态总结**：MTP **已支持（端到端跑通，6 个 blocker 全修）**；从「跑通」到「可用（高 accept）」剩 draft KV 读的 correctness（已排除 input/weights，定位到 KV 读）。这是 frozen-KV 在 hybrid 模型上的深层 correctness，需逐项验证 KV 读路径。
