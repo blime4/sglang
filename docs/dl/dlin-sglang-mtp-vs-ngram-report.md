@@ -368,3 +368,15 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 4. **draft decode**：draft forward 读自己的 KV（prefix + draft chain）→ Q·K 同空间（draft q_proj + draft k_proj）→ 对齐 → 高 accept。
 
 **工作量**：中等偏大（~2-3 天）。主要改动在 `frozen_kv_mtp_worker_v2.py`（draft KV pool + draft prefill method）+ `qwen3_5_mtp.py`（draft forward 用 own KV）。
+
+### 10.10 Standard NextN draft prefill: KV verified non-zero, accept still 0.106
+
+Draft prefill (10 prompt tokens) writes K/V to layer 40 (verified: K norm=78-102, V norm=83-203). During decode, full_attn_backend reads layer 40 (verified: K norm=101-102). Q·K aligned (draft own q_proj + draft own k_proj, both FP8 from checkpoint).
+
+**BUT accept = 0.106** (same as without prefill). Hypotheses tested:
+- bf16 (unquantized) draft: accept **dropped to 0.0** (FP8→bf16 dequant introduces errors; the checkpoint's mtp weights are FP8-trained, bf16 dequant breaks them). Reverted.
+- Position advancing: no change (0.106 → 0.106).
+
+**Remaining hypothesis**: the 1-layer MTP draft with FP8 has ~10% intrinsic accept on this model. The draft model is a single layer — its prediction quality is limited. NGRAM gets 100% on repetitive prompts (n-gram lookup), but MTP's learned draft doesn't benefit from repetition the same way.
+
+**For 80%+ accept**: would need either (a) a multi-layer draft (more capacity), (b) a draft trained specifically for high accept, or (c) a different speculative approach. The 1-layer FP8 draft on Qwen3.5-35B has ~10% accept — this may be the intrinsic limit.
