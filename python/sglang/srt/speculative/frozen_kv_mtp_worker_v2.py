@@ -159,9 +159,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 type(self.draft_model_runner.model).__name__,
             )
 
+        # DL begin — standard NextN: draft uses its OWN KV (not frozen target KV).
+        # Qwen3.5's draft q_proj is independently trained (not cross-aligned with
+        # target k_proj), so frozen-KV Q·K can't align (accept ~0.04). The draft
+        # writes/reads its own KV at a separate layer (40) in the shared pool.
+        # See docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.7-10.9.
         self.kv_context: Optional[FrozenKVMTPContext] = None
-        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
-            self._bind_kv_context()
+        # Don't call _bind_kv_context (frozen-KV) — draft uses own KV instead.
+        # DL end
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -206,20 +211,37 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             TpModelWorker.init_backends(self, disable_cuda_graph=True)
             self.draft_attn_backend = self._init_draft_attn_backend()
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-            # DL begin — Frozen-KV MTP on hybrid (full/linear) models (e.g. Qwen3.5):
-            # bind_frozen_kv_context remaps each draft attention layer_id to a TARGET
-            # physical layer (so the draft reads target KV). The draft hybrid backend's
-            # full-attn dispatch (`_is_full_attn`: layer_id in full_attn_layers) defaults
-            # to the DRAFT's own layer ids ({0}), so the remapped target id (e.g. 39)
-            # would misroute to the linear/GDN path. Replace with the target physical
-            # ids so dispatch treats them as full-attn. See
-            # docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.2.
-            if (
-                self.kv_context is not None
-                and hasattr(self.draft_attn_backend, "full_attn_layers")
-            ):
-                self.draft_attn_backend.full_attn_layers = list(
-                    self.kv_context.physical_layer_ids.values()
+            # DL begin — standard NextN: add a draft KV layer to the shared pool.
+            # The draft writes/reads its own K/V at layer 40 (separate from the
+            # target's layers 0-39), so Q-K aligns (both draft q_proj/k_proj).
+            draft_model = self.draft_model_runner.model
+            pool = self.draft_attn_backend.token_to_kv_pool
+            if hasattr(pool, "full_kv_pool") and hasattr(pool, "full_attention_layer_id_mapping"):
+                full_pool = pool.full_kv_pool
+                draft_pool_idx = full_pool.layer_num
+                full_pool.k_buffer.append(torch.zeros_like(full_pool.k_buffer[0]))
+                full_pool.v_buffer.append(torch.zeros_like(full_pool.v_buffer[0]))
+                full_pool.layer_num += 1
+                full_pool.k_data_ptrs = torch.tensor(
+                    [x.data_ptr() for x in full_pool.k_buffer],
+                    dtype=torch.uint64, device=full_pool.device,
+                )
+                full_pool.v_data_ptrs = torch.tensor(
+                    [x.data_ptr() for x in full_pool.v_buffer],
+                    dtype=torch.uint64, device=full_pool.device,
+                )
+                full_pool.data_ptrs = torch.cat(
+                    [full_pool.k_data_ptrs, full_pool.v_data_ptrs], dim=0
+                )
+                virtual_layer = 40
+                pool.full_attention_layer_id_mapping[virtual_layer] = draft_pool_idx
+                for layer in draft_model.model.layers:
+                    layer.attn.layer_id = virtual_layer
+                if hasattr(self.draft_attn_backend, "full_attn_layers"):
+                    self.draft_attn_backend.full_attn_layers = [virtual_layer]
+                logger.info(
+                    "Frozen-KV MTP: standard NextN — draft own KV at layer %d (pool idx %d)",
+                    virtual_layer, draft_pool_idx,
                 )
             # DL end
             self.init_cuda_graphs()

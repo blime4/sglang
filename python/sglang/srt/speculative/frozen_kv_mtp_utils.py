@@ -75,11 +75,11 @@ def frozen_kv_target_view(
     swap is seen by both readers (``get_token_to_kv_pool()`` and the
     backend's own ``self.token_to_kv_pool``).
     """
+    # DL begin — standard NextN: no frozen-KV pool swap needed
     if kv_context is None:
-        raise RuntimeError(
-            "Frozen-KV MTP target view called before the model was bound; "
-            "bind the frozen KV context first."
-        )
+        yield
+        return
+    # DL end
     saved_spec_info = forward_batch.spec_info
     forward_batch.spec_info = None
     # DL begin — swap sub-backends too (see _swap_draft_kv_pool)
@@ -110,11 +110,11 @@ def target_kv_pool_view(
     ``get_attn_backend()``) and the backend's own ``self.token_to_kv_pool``
     reads (because ``self is draft_attn_backend``).
     """
+    # DL begin — standard NextN: no frozen-KV pool swap needed
     if kv_context is None:
-        raise RuntimeError(
-            "Frozen-KV MTP target KV pool view called before the model was bound; "
-            "bind the frozen KV context first."
-        )
+        yield
+        return
+    # DL end
     # DL begin — swap sub-backends too (see _swap_draft_kv_pool)
     saved_pools = _swap_draft_kv_pool(
         draft_attn_backend, kv_context.target_token_to_kv_pool
