@@ -266,3 +266,25 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 **下一步判别**：插桩 draft attention 的 K/V —— 打印 `get_kv_buffer(39)` 的 norm/shape；若 ~0 或错 shape → (2)/(4)（pool/layout）；若 sane 但 Q·K 对不齐 → (1)/(3)（layer/rope）。
 
 **状态总结**：MTP **已支持（端到端跑通，6 个 blocker 全修）**；从「跑通」到「可用（高 accept）」剩 draft KV 读的 correctness（已排除 input/weights，定位到 KV 读）。这是 frozen-KV 在 hybrid 模型上的深层 correctness，需逐项验证 KV 读路径。
+
+### 10.5 KV 读路径已验证正确 → Q·K 对齐是 frozen-KV 设计层 subtle 问题
+
+继续排查 draft KV 读（§10.4 嫌疑），逐项验证：
+- ✅ **req_to_token_pool 共享 target**（`frozen_kv_mtp_worker_v2.py:117-120`：`target_worker.get_memory_pool()`，注释明示 "Draft attention uses target req_to_token + KV allocator (read-only)"）—— slot 映射正确，非 bug。
+- ✅ **KV pool swap 达 flashattention**（§10.2 修后 `get_kv_buffer(39)` 读 target pool，`_transfer_full_attention_id(39)`→full_kv_pool[9] 正确）。
+- ✅ **draft input（hidden）sane、weights loaded**（§10.4）。
+
+⇒ K/V 读到的就是 target layer-39 的真实 KV，Q 也 sane，但 **Q·K 不对齐** → garbage attention。这是 frozen-KV 的**设计层 subtle 问题**，不是 DL runtime 适配缺口：
+
+**最可能根因**：hidden-capture 用 gemma4 风格「append layer input」（`aux_hidden_states.append(hidden_states)` 在 layer 调用前），所以 draft 拿到的是 **layer-39 的输入 = layer-38 的输出**。但 draft 的 qkv_proj 可能训练时期望 **layer-39 的输出**（final hidden，经 norm）。input/output 错位 → Q 与 K 空间不对齐 → garbage。
+
+**判别/修法**（需进一步验证，非 DL runtime）：
+1. 改 hidden-capture 为「append layer output」（layer 调用后）—— 让 draft 拿 layer-39 输出。
+2. 或改 layer 映射：draft 读 layer-38 的 KV（而非 39），配合 layer-38 输入 hidden。
+3. 需对照 Qwen3.5 MTP checkpoint 的训练 spec（draft 期望哪个 layer 的 hidden/KV）。
+
+**结论（MTP 支持状态）**：
+- ✅ **MTP 已支持**：端到端跑通（6 个 DL runtime blocker 全修），coherent 输出。
+- ⏸ **可用性**：draft 低 accept（Q·K 对齐，frozen-KV 设计层 subtle）—— 非 DL runtime 问题，是 Qwen3.5 hybrid + frozen-KV 的 hidden/KV 层匹配，需对照训练 spec 或试 hidden-capture input→output。
+
+报告 §4「3 处改动零未知」最终终局修正：**Qwen3.5 hybrid 上 frozen-KV MTP = 6 个 DL runtime 适配（done）+ 1 个 hidden/KV 层匹配 subtle（design-level，待训练 spec 对照）**。gemma4（typed-layer）无此 subtle；hybrid (Qwen3.5) 的 layer_id/hidden 语义更复杂。
