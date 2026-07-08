@@ -653,24 +653,87 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         """Seed for the first decode iter after prefill. Frozen draft writes no
         KV (reads target KV), so unlike EAGLE there is no draft-extend forward:
         just select the last prompt hidden + bonus token and stash the seed."""
-        del mm_input_embeds  # frozen seed needs no input embeds
+        # DL begin
+        del mm_input_embeds
         if batch.forward_mode.is_idle():
             return self._idle_seed()
+ — standard NextN: run draft on prompt tokens to fill draft KV
+        if (
+            self.kv_context is None
+            and hasattr(self, "draft_model_runner")
+            and target_hidden_states.shape[0] > 0
+        ):
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                ForwardMode,
+                CaptureHiddenMode,
+            )
+            from sglang.srt.speculative.frozen_kv_mtp_info import (
+                FrozenKVMTPDraftInput,
+            )
+
+            draft_runner = self.draft_model_runner
+            total_tokens = target_hidden_states.shape[0]
+            device = target_hidden_states.device
+
+            input_ids = batch.input_ids[:total_tokens]
+
+            positions = []
+            for i, elen in enumerate(batch.extend_lens):
+                start = batch.seq_lens[i] - elen
+                positions.extend(range(start, start + elen))
+            positions = torch.tensor(positions, dtype=torch.int64, device=device)
+
+            draft_fb = ForwardBatch.init_new(batch, draft_runner)
+            draft_fb.input_ids = input_ids
+            draft_fb.positions = positions
+            draft_fb.forward_mode = ForwardMode.EXTEND
+            draft_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+
+            draft_spec = FrozenKVMTPDraftInput(
+                bonus_tokens=next_token_ids[: batch.batch_size()],
+                hidden_states=target_hidden_states,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+            draft_fb.spec_info = draft_spec
+
+            with (
+                self.draft_tp_context(draft_runner.tp_group),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+            ):
+                draft_runner.forward(draft_fb)
+
+            logger.info(
+                "Frozen-KV MTP: standard NextN draft prefill — processed %d "
+                "prompt tokens, wrote draft KV at layer 40",
+                total_tokens,
+            )
+        # DL end
+
         last_hidden = self._select_last_extend_hidden(batch, target_hidden_states)
         return self._build_seed_draft_input(next_token_ids, last_hidden)
 
+    # DL begin
     def _draft_extend_for_decode(self, batch: ScheduleBatch, batch_result) -> None:
-        """Frozen 'draft extend': no forward. Pull the last accepted token's
-        target hidden from the verify output and stash it as the next-iter seed.
-
-        Replaces verify's `EagleDraftInput` with a `FrozenKVMTPDraftInput` so the
-        next draft passes the FROZEN_KV_MTP attn-backend assertions.
-        """
+        """DL: standard NextN — draft_forward seed step already writes the accepted
+        token K/V to layer 40, so here we just stash the seed (same as original)."""
         if batch.forward_mode.is_idle():
             batch_result.next_draft_input = self._idle_seed()
             return
 
         bs = len(batch.seq_lens)
+        select_index = (
+            torch.arange(bs, device=self.device) * self.speculative_num_draft_tokens
+            + batch_result.accept_lens
+            - 1
+        )
+        last_hidden = batch_result.logits_output.hidden_states[select_index]
+
+        bonus_tokens = batch_result.next_draft_input.bonus_tokens
+        batch_result.next_draft_input = self._build_seed_draft_input(
+            bonus_tokens, last_hidden
+        )
+        # DL end
         # Same per-req select_index EAGLE uses on its draft-extend output: the
         # last accepted node (accept_lens - 1) in each per-req block of width
         # num_draft_tokens. Verify already compacted the accepted path to the
