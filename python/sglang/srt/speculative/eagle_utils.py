@@ -648,11 +648,60 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        # DL begin — DLIN sgl_kernel's top_k_renorm_prob Python wrapper imports fine
+        # but calls torch.ops.sgl_kernel.top_k_renorm_probs (C++ op, missing on DLIN).
+        # Probe the C++ op; if absent, use inline torch fallbacks (NOT sampler.py's
+        # which also re-exports the sgl_kernel wrapper).
+        _dl_use_renorm_fallback = None
+        try:
+            _ = torch.ops.sgl_kernel.top_k_renorm_probs
+            _dl_use_renorm_fallback = False
+        except AttributeError:
+            _dl_use_renorm_fallback = True
+
+        if _dl_use_renorm_fallback:
+            def top_k_renorm_prob(probs, top_ks):
+                if not isinstance(top_ks, torch.Tensor):
+                    top_ks = torch.tensor([top_ks] * probs.shape[0], device=probs.device, dtype=torch.int64)
+                out = probs.clone()
+                for i in range(probs.shape[0]):
+                    k = int(top_ks[i].item())
+                    if k <= 0 or k >= probs.shape[1]:
+                        continue
+                    topk_vals, topk_idx = probs[i].topk(k)
+                    mask = torch.zeros_like(probs[i])
+                    mask[topk_idx] = 1.0
+                    out[i] = probs[i] * mask
+                    out[i] = out[i] / out[i].sum()
+                return out
+
+            def top_p_renorm_prob(probs, top_ps):
+                if not isinstance(top_ps, torch.Tensor):
+                    top_ps = torch.tensor([top_ps] * probs.shape[0], device=probs.device, dtype=probs.dtype)
+                out = probs.clone()
+                for i in range(probs.shape[0]):
+                    p = float(top_ps[i].item())
+                    if p >= 1.0:
+                        continue
+                    sorted_vals, sorted_idx = probs[i].sort(descending=True)
+                    cumsum = sorted_vals.cumsum(dim=-1)
+                    mask_vals = (cumsum - sorted_vals) < p
+                    mask = torch.zeros_like(probs[i])
+                    mask[sorted_idx[mask_vals]] = 1.0
+                    out[i] = probs[i] * mask
+                    s = out[i].sum()
+                    if s > 0:
+                        out[i] = out[i] / s
+                return out
+
+            tree_speculative_sampling_target_only = None
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
+        # DL end
 
         from sglang.srt.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
@@ -713,6 +762,11 @@ def eagle_sample(
             if use_rejection_sampling
             else tree_speculative_sampling_target_only
         )
+        # DL begin — if tree_speculative_sampling_target_only is None (DLIN),
+        # fall back to rejection sampling (chain_speculative_sampling_triton).
+        if sampling_fn is None:
+            sampling_fn = chain_speculative_sampling_triton
+        # DL end
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

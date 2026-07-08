@@ -45,8 +45,44 @@ if is_cuda():
             top_p_renorm_prob,
         )
     except (ImportError, AttributeError):
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
+        # DL begin — DLIN sgl_kernel omits top_k_renorm_prob / top_p_renorm_prob.
+        # Provide torch fallbacks (vectorized, same semantics as sgl_kernel).
+        def top_k_renorm_prob(probs, top_ks):
+            # probs: [bs, vocab], top_ks: [bs] (or scalar)
+            if not isinstance(top_ks, torch.Tensor):
+                top_ks = torch.tensor([top_ks] * probs.shape[0], device=probs.device, dtype=torch.int64)
+            out = probs.clone()
+            for i in range(probs.shape[0]):
+                k = int(top_ks[i].item())
+                if k <= 0 or k >= probs.shape[1]:
+                    continue
+                topk_vals, topk_idx = probs[i].topk(k)
+                mask = torch.zeros_like(probs[i])
+                mask[topk_idx] = 1.0
+                out[i] = probs[i] * mask
+                out[i] = out[i] / out[i].sum()
+            return out
+
+        def top_p_renorm_prob(probs, top_ps):
+            # probs: [bs, vocab], top_ps: [bs] (cumulative prob threshold)
+            if not isinstance(top_ps, torch.Tensor):
+                top_ps = torch.tensor([top_ps] * probs.shape[0], device=probs.device, dtype=probs.dtype)
+            out = probs.clone()
+            for i in range(probs.shape[0]):
+                p = float(top_ps[i].item())
+                if p >= 1.0:
+                    continue
+                sorted_vals, sorted_idx = probs[i].sort(descending=True)
+                cumsum = sorted_vals.cumsum(dim=-1)
+                mask_vals = (cumsum - sorted_vals) < p
+                mask = torch.zeros_like(probs[i])
+                mask[sorted_idx[mask_vals]] = 1.0
+                out[i] = probs[i] * mask
+                s = out[i].sum()
+                if s > 0:
+                    out[i] = out[i] / s
+            return out
+        # DL end
     # DL end
 
 if is_musa():
