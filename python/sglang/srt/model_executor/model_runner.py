@@ -1020,6 +1020,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "set_dflash_layers_to_capture, which is required for DFLASH."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        # DL begin — FROZEN_KV_MTP: activate target hidden-state capture so the
+        # draft consumes the target's last hidden (spec_info.hidden_states). Without
+        # this, layers_to_capture stays empty, the target captures nothing, and the
+        # draft produces near-uniform logits (accept ~0). Mirror DFLASH's activation.
+        if (
+            getattr(self.spec_algorithm, "is_frozen_kv_mtp", lambda: False)()
+            and not self.is_draft_worker
+            and hasattr(self.model, "set_dflash_layers_to_capture")
+        ):
+            last_layer = self.model_config.hf_text_config.num_hidden_layers - 2
+            self.model.set_dflash_layers_to_capture([last_layer])
+        # DL end
 
     def remote_instance_init_transfer_engine(self):
         try:
