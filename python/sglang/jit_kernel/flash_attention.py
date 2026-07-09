@@ -287,6 +287,46 @@ def flash_attn_with_kvcache(
                 return out
             return _o
 
+        # DL begin — VERIFY (target_verify, _seqq > 1): loop the EXACT DL decode
+        # kernel (paged_decode_attn, validated vs SDPA max_err=0) per tree token
+        # with causal cache_seqlens, instead of the FA2 paged fallback below.
+        # The FA2 paged kernel is imprecise on DLIN for the multi-query verify
+        # tree -> the full-attn output diverges from decode, accumulates over
+        # layers, and the target regenerates the prompt. paged_decode_attn (the
+        # decode path) matches decode exactly. query i attends to KV 0..(seq_len+i),
+        # so cache_seqlens_i = (cache_seqlens - _seqq) + i + 1.
+        if (
+            _seqq > 1
+            and page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and k is None
+            and v is None
+            and causal
+        ):
+            _scale = (
+                softmax_scale if softmax_scale is not None else (q.shape[-1] ** -0.5)
+            )
+            if out is None:
+                out = torch.empty_like(q)
+            _q_r = q.reshape(_batch, _seqq, q.shape[1], q.shape[2])
+            _o_r = out.reshape(_batch, _seqq, q.shape[1], q.shape[2])
+            _base = cache_seqlens.long() - _seqq  # prompt length per req [batch]
+            for _i in range(_seqq):
+                _cs = (_base + _i + 1).to(torch.int32)  # causal KV len for token _i
+                _o_i = torch.empty_like(_q_r[:, _i])
+                torch.ops.sgl_kernel.paged_decode_attn(
+                    _q_r[:, _i].contiguous(),
+                    k_cache,
+                    v_cache,
+                    page_table,
+                    _cs,
+                    _o_i,
+                    _scale,
+                )
+                _o_r[:, _i] = _o_i
+            return out
+        # DL end
+
         # Fallback: original FA2 paged call (for non-decode / unsupported cases).
         from flash_attn import flash_attn_with_kvcache as _fa2_kvcache
 

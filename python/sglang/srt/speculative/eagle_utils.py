@@ -633,9 +633,76 @@ def eagle_sample(
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
-    if sampling_info.is_all_greedy or _is_npu or _is_hip:
+    # DL begin — On DLIN, the sampling verify path (tree_speculative_sampling_target_only)
+    # is None (sgl_kernel C++ op missing) and falls back to chain_speculative_sampling_triton
+    # with draft_probs=zeros → always-accept → output = draft's garbage tokens. When this
+    # fallback would produce garbage (DLIN + no rejection sampling), force greedy verify
+    # (argmax match) for correct output. Accept stays at the draft-capacity limit (~10-21%)
+    # but the output is coherent (target's argmax tokens), not garbage.
+    _dl_force_greedy = False
+    if not sampling_info.is_all_greedy:
+        try:
+            torch.ops.sgl_kernel.top_k_renorm_probs  # raises if missing (DLIN)
+        except AttributeError:
+            if not get_global_server_args().speculative_use_rejection_sampling:
+                _dl_force_greedy = True
+    # DL end
+    # DL begin — DLIN fallback forces greedy verify to avoid always-accept garbage output.
+    if sampling_info.is_all_greedy or _is_npu or _is_hip or _dl_force_greedy:
+    # DL end
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        # DL begin — one-shot debug: dump draft candidates vs target verify argmax.
+        # Answers "does the DRAFT propose coherent tokens, and does the TARGET
+        # verify agree?" — the decisive evidence for greedy low-accept root cause.
+        # Guarded by SGLANG_DL_MTP_DEBUG_VERIFY; fires for the first N verify calls.
+        import os as _os
+        _dl_dbg = _os.environ.get("SGLANG_DL_MTP_DEBUG_VERIFY", "")
+        if _dl_dbg:
+            _n = int(_dl_dbg)
+            if not hasattr(eagle_sample, "_dl_verify_ct"):
+                eagle_sample._dl_verify_ct = 0
+            if eagle_sample._dl_verify_ct < _n:
+                eagle_sample._dl_verify_ct += 1
+                _cand = candidates[0].tolist()
+                _tpred = target_predict[0].tolist()
+                _match = [int(a == b) for a, b in zip(_cand, _tpred)]
+                _pos = (
+                    verify_input.positions.tolist()
+                    if getattr(verify_input, "positions", None) is not None
+                    else None
+                )
+                # Tree mask check: for topk=1 chain, bonus (tree token 0) should
+                # attend to prefix (all True) + itself only (tree row = [1,0,0,...]).
+                # Layout (FULL_MASK): each row = [seq_len prefix + D tree] entries.
+                _cm = getattr(verify_input, "custom_mask", None)
+                _cm_info = None
+                if _cm is not None:
+                    _D = verify_input.draft_token_num
+                    _row_len = None
+                    try:
+                        _cm_cpu = _cm.detach().cpu()
+                        _ntot = _cm_cpu.numel()
+                        _nrows = bs * _D
+                        _row_len = _ntot // _nrows if _nrows else 0
+                        # bonus row = row 0; tree part = last D entries
+                        _bonus_tree = _cm_cpu[_row_len - _D:_row_len].tolist() if _row_len else None
+                        _d0_tree = _cm_cpu[_row_len + _row_len - _D : 2*_row_len].tolist() if _row_len else None
+                    except Exception:
+                        _bonus_tree = _d0_tree = None
+                    _cm_info = f"mask_nelem={_cm.numel()} row_len={_row_len} bonus_tree_row={_bonus_tree} d0_tree_row={_d0_tree}"
+                import sys as _sys
+                print(
+                    f"[DL-MTP-VERIFY#{eagle_sample._dl_verify_ct}] "
+                    f"draft_candidates={_cand} "
+                    f"target_predict={_tpred} "
+                    f"match={_match} "
+                    f"verify_positions={_pos} "
+                    f"{_cm_info} "
+                    f"acc_scaling_penalties={'None' if sampling_info.acc_scaling_penalties is None else 'set'}",
+                    file=_sys.stderr, flush=True,
+                )
+        # DL end
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

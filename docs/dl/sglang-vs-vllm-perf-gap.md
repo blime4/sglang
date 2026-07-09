@@ -13,6 +13,32 @@
 > （Route A 废弃，降级为 Route B 的 shim）。构建产物与旧 copied .so 逐 bit 一致（max diff 0.0，
 > vs SDPA 5e-4），故下表性能数据不变。详见 §3 P0。
 
+### 当前 DLIN 集成现状（截至 2026-07-09）
+
+> 本文前半段的性能分析主要基于 **Qwen3-1.7B bf16 dense 模型**，用于解释当时的 decode/perf-gap 根因；
+> 它**不等价于**“sglang 已整体对齐 vLLM 全套 DLIN 集成”。为避免把历史性能调查结论误读成当前
+> 集成状态，先给出一版按代码与相关文档交叉核对后的现状摘要。
+
+- **已接入（核心路径）**
+  - **Decode attention**：已接入 DLIN FlashAttention 适配层；decode 可走 `vllm_flash_attn`
+    的 `cudnnMHAVarlenForward*` 路径，`_vllm_fa2_C.so` 现由 sglang 自编。
+  - **RMSNorm / fused_add_rmsnorm**：已接入真实 dlcc kernel，不再只是 stub / torch fallback。
+  - **基础 RoPE**：`rotary_embedding` 已有 DLIN kernel。
+- **部分接入 / 已打通但未对齐 vLLM 全量能力**
+  - **MoE topk 基础算子**：`topk_softmax` / `topk_sigmoid` / `moe_align_block_size` /
+    `fast_topk` 已有；但完整 `moe_fused_gate` / fused grouped GEMM 仍未齐。
+  - **Sampler**：当前以 pytorch fallback 为主，部分 renorm 可用；尚未接入 vLLM 同等级 DLIN
+    sampler kernel。
+  - **paged decode kernel / graph-safe 修复**：`paged_decode_attn` 与 FULL/BREAKABLE graph
+    correctness 已打通，但这不等于 vLLM 那套 DLIN cuda-graph 策略已系统迁入。
+- **相对 vLLM 仍缺的主体**
+  - **量化 GEMM 全家桶**：FP8 / W8A8 / GPTQ / AWQ / MXFP4 / GGUF / compressed-tensors /
+    `dlblasLtMatmul`。
+  - **完整 Fused MoE**：含 `moe_fused_gate`、fused grouped GEMM / expert kernel。
+  - **GDN / Gated Delta Rule / MLA**：DL GDN backend、MLA backend 及相关 dldnn 算子仍缺。
+  - **其他 DLIN 组件**：DL sampler、Conv1d、LoRA、Linear head-padding、以及 vLLM 式
+    系统化 cuda-graph 优化。
+
 ---
 
 ## 1. 性能对比（实测）
@@ -64,15 +90,15 @@
 | **Attention decode** | dleol `cudnnMHAVarlenForward*` | dleol `cudnnMHAVarlenForward*`（vllm_flash_attn；.so 由 Route B 自编）✅ | ~0（旧 gather 路径曾损 ~6 tok/s，已消除） |
 | **RoPE** | dlcc `rotary_embedding` | dlcc `rotary_embedding` ✅ | ~0 |
 | **Linear / matmul** | dlblasLt（DLIN-optimized GEMM） | torch `nn.Linear`（DLIN torch 内置） | ~1 tok/s |
-| **Sampler** | DL flashinfer-ext | pytorch fallback | ~0.5 tok/s |
-| **MoE gate** | dlcc `moe_fused_gate` | schema-only stub | N/A（dense model） |
+| **Sampler** | DL flashinfer-ext | pytorch fallback（部分 renorm / guard 可用） | ~0.5 tok/s |
+| **MoE gate / topk** | dlcc `moe_fused_gate` + grouped topk / fused MoE 路径 | topk 基础算子已有；`moe_fused_gate` / 完整 fused 路径仍缺 | N/A（dense model） |
 | **Quant GEMM** | dlblasExt（FP8/W8A8/GPTQ…） | 无 | N/A（bf16 model） |
 
 ### 2.3 CUDA Graph 差异（已用第一性原理 + 裁决实验证证）
 
 | | vLLM | sglang |
 |---|---|---|
-| **Graph backend** | FULL（整图） | FULL（两条 decode 路径都已干净）✅ |
+| **Graph backend** | FULL（整图） | FULL correctness 已验证于两条 decode 路径；但**尚未系统接入** vLLM 式 DLIN cudagraph 默认策略 |
 | **FULL graph 正确性** | ✅ 正常 | ✅ 干净：`paged_decode_attn` FULL ≈17.9 tok/s；`vllm_flash_attn` FULL ≈16.3 tok/s（输出逐字一致 ` Paris...`） |
 | **历史 gibberish 根因** | — | **LogitsProcessorOutput 未按真实 batch 切片**（静态池 `[max_batch, vocab]` 只 `[:bs]` 有效 → sampler 读脏行 → 垃圾 token）。**已修（P1, `5ab2426401`）。与 attention 路径无关。** |
 
@@ -283,7 +309,7 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 
 ---
 
-## 7. Qwen3.5-35B-A3B-FP8 补充（2026-07-01，与 §1–6 的 Qwen3-1.7B bf16 不同模型）
+## 7.    补充（2026-07-01，与 §1–6 的 Qwen3-1.7B bf16 不同模型）
 
 
 > ### 📊 最新性能数据（2026-07-06）
