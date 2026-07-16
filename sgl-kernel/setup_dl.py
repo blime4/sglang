@@ -54,6 +54,12 @@ sources = [
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
     "csrc/memory/weak_ref_tensor.cpp",
+    # DL begin: custom allreduce (standard CUDA runtime only — no NVIDIA P2P/IPC;
+    # uses fake IPC pointers = pre-allocated SHM). Without this, sglang falls back
+    # to slow NCCL (48.5% of decode GPU time per kprof). Ops registered in
+    # common_extension_dl.cc.
+    "csrc/allreduce/custom_all_reduce.cu",
+    # DL end
 ]
 
 cxx_flags = ["-O3", "-std=c++17"]

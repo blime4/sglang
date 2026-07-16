@@ -460,6 +460,15 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
+        # DL begin — async allreduce overlap: comm stream + event sync.
+        # NCCL allreduce runs on a separate stream, overlapped with compute
+        # on the main stream. postprocess_layer launches allreduce async,
+        # prepare_attn waits for it before using the result.
+        # IMPORTANT: stream must be created HERE (before CG capture) — creating
+        # a stream during CG capture causes cudaErrorStreamCaptureInvalidated.
+        self._dl_comm_stream = torch.cuda.Stream()
+        self._dl_comm_event = None
+        # DL end
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -548,6 +557,16 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        # DL begin — wait for previous layer's async allreduce before using
+        # the result. This is the "wait" half of the comm/compute overlap.
+        # _dl_comm_event is a dist.Work handle (not torch.cuda.Event).
+        if self._dl_comm_event is not None:
+            self._dl_comm_event.wait()
+            self._dl_comm_event = None
+        if getattr(self, "_dl_comm_event2", None) is not None:
+            self._dl_comm_event2.wait()
+            self._dl_comm_event2 = None
+        # DL end
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -732,6 +751,30 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        # DL begin — async allreduce via dist.all_reduce(async_op=True).
+        # Uses PyTorch ProcessGroupNCCL (not pynccl), which has built-in CG
+        # integration — unlike torch.cuda.Stream (causes cudaErrorStreamCaptureInvalidated
+        # on DLIN). Returns Work handle; prepare_attn calls handle.wait() to sync.
+        import os as _dl_os
+        _dl_async_ar = (
+            _dl_os.environ.get("SGLANG_DL_ASYNC_AR") == "1"
+            and self._context.tp_size > 1
+            and not self.is_last_layer
+            and not getattr(hidden_states, "_sglang_needs_allreduce_fusion", False)
+        )
+        if _dl_async_ar:
+            import torch.distributed as _dist
+            _tp_group = get_tp_group().device_group
+            # Launch async allreduce (in-place) — NCCL returns immediately,
+            # kernel runs on NCCL internal stream (CG-compatible)
+            _handle = _dist.all_reduce(hidden_states, group=_tp_group, async_op=True)
+            _handle2 = None
+            if residual is not None and residual.data_ptr() != hidden_states.data_ptr():
+                _handle2 = _dist.all_reduce(residual, group=_tp_group, async_op=True)
+            self._dl_comm_event = _handle  # Work handle
+            self._dl_comm_event2 = _handle2
+            return hidden_states, residual
+        # DL end
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -789,7 +832,7 @@ class LayerCommunicator:
         if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
             return False
 
-        return (
+        result = (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
@@ -802,6 +845,18 @@ class LayerCommunicator:
             and (not self.is_last_layer)
             and (self._context.tp_size > 1)
         )
+
+        # DL begin — DLIN: force-enable MLP allreduce fusion even without
+        # flashinfer/aiter. The fusion mechanism (deferring MLP allreduce to
+        # next layer's prepare_attn) is sglang-internal; it halves the
+        # allreduce count (2/layer → 1/layer). kprof showed NCCL allreduce =
+        # 48.5% of decode GPU time; halving calls targets ~24%.
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+        if not result and _is_dlin() and (not self.is_last_layer) and (self._context.tp_size > 1):
+            result = True
+        # DL end
+
+        return result
 
 
 @dataclass

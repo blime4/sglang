@@ -65,6 +65,29 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
+        # DL begin — DLIN compiled GDN decode+extend (vLLM _dl_C ops)
+        # Opt-in via SGLANG_DL_GDN_DLIN=1 on DLIN. decode=dl_recurrent_gated_delta_rule,
+        # extend=dl_chunk_gated_delta_rule (replaces sglang triton chunk which uses a
+        # custom initial_state_indices path that diverges from vLLM → wrong first token).
+        # verify stays on triton. SGLANG_DL_GDN_DLIN_EXTEND=0 to keep extend on triton.
+        import os as _os
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+        if _is_dlin() and _os.environ.get("SGLANG_DL_GDN_DLIN") == "1":
+            from sglang.srt.layers.attention.linear.kernels.gdn_dlin import DLinGDNKernel
+
+            self.decode_kernel = DLinGDNKernel()
+            _dl_extend = _os.environ.get("SGLANG_DL_GDN_DLIN_EXTEND", "0") == "1"
+            self.extend_kernel = DLinGDNKernel() if _dl_extend else triton_kernel
+            self.verify_kernel = triton_kernel
+            self.supports_packed_decode = False
+            rank0_log(
+                f"GDN kernel dispatcher: decode=DLinGDNKernel, "
+                f"extend={'DLinGDNKernel(dl_chunk)' if _dl_extend else 'TritonGDNKernel'}, "
+                f"verify=TritonGDNKernel packed_decode=False"
+            )
+            return
+        # DL end
+
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel

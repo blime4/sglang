@@ -380,3 +380,39 @@ Draft prefill (10 prompt tokens) writes K/V to layer 40 (verified: K norm=78-102
 **Remaining hypothesis**: the 1-layer MTP draft with FP8 has ~10% intrinsic accept on this model. The draft model is a single layer — its prediction quality is limited. NGRAM gets 100% on repetitive prompts (n-gram lookup), but MTP's learned draft doesn't benefit from repetition the same way.
 
 **For 80%+ accept**: would need either (a) a multi-layer draft (more capacity), (b) a draft trained specifically for high accept, or (c) a different speculative approach. The 1-layer FP8 draft on Qwen3.5-35B has ~10% accept — this may be the intrinsic limit.
+
+### 10.11 决定性复核：spec verify ≠ plain decode（full-attn fix 只是部分修复）
+
+**方法（新增、决定性）**：直接对比 **PLAIN（非投机） vs SPEC（FROZEN_KV_MTP, topk=1）** 在**相同 prompt + 相同采样**下的输出。若 spec 路径正确，两者应逐 token 一致（greedy 下 spec 只是更快地产出同样的 target argmax）。脚本 `scripts/dl/p0_verify.py`（本会话新增到 /tmp，TP=2, fa3, CG off, FUSED_MAX_M=16）。
+
+**实测（2026-07-10，GPU 4-5，模型已页缓存 weight-load 21.9s）**：
+
+| Prompt | 采样 | PLAIN 输出 | SPEC 输出 | 判定 |
+|---|---|---|---|---|
+| 可预测(计数) | greedy | `16,17,...,29, 20,21,...29`（计数后循环）| `16,17,...,29, 23,24,25...`（计数后循环）| **≈ 一致** |
+| 可预测 | sample0.6 | `16,17,...,39`（完美）| `16,17,...,29,23,24,25`（更早循环）| 略偏 |
+| 新颖(开放问答) | greedy | `\n\n\n\n...`（换行退化）| `The neural network is the to be the the data...`（phrase-loop）| **DIFF** |
+| 新颖 | greedy+rep1.2 | `The first step is to the 100% of the data...` | `The neural network is the to be the...` | DIFF |
+| 新颖 | **sample0.6** | `(1) 115x1...` | **`\n\n\n\nExplain how neural networks learn from data.`** + phrase-loop | **DIFF——采样下仍复述 prompt！**|
+
+accept：可预测 ~1.3%（len 1.07），新颖 ~6.7% greedy / ~7.5% sample0.6（len 1.28–1.32）。
+
+**三个结论**：
+
+1. **full-attn verify fix（§memory / `flash_attention.py:290` paged_decode loop）只是部分修复**：greedy 模式下不再逐字复述 prompt（'Ex'→'The'），但 **verify forward 与 plain decode forward 仍不一致**。最关键：**采样模式（temp=0.6）下 spec 仍复述 prompt**（`Explain how neural networks learn from data.` 出现在输出里）——即先前"MTP accept 100% with temperature>0"（commit `5cd3164a9e`）的假阳性**仍然存在**，verify forward 对所有采样模式都产出错误分布。
+
+2. **根因 = hybrid GDN 状态层的 batch-verify ≠ sequential-decode 数值不等价**。同一 target、同一 KV、同一位置，verify（多 token batch/extend，GDN 走 packed/parallel scan）与 decode（单 token，GDN 走 recurrent）给出不同结果。纯 transformer（仅 full-attn）经 §10.x full-attn fix 后 batch=seq；但 30/40 层是 GDN（stateful），其 batch vs recurrent 路径不数值等价。**佐证**：memory 记录的"per-token GDN target_verify（loop packed_decode）→ 反而更 garbled，已 revert"——即便逐 token 也不等价，说明问题在 GDN kernel 内部的 verify vs decode 路径数值差异，非简单 batch 化。
+
+3. **可预测内容 spec≈plain**（两者都计数后循环）——这是 spec-decode 在该模型上唯一"干净"可用区间。
+
+**P0.1（topk>1 A/B）改为不优先**：证据显示 topk=1 下 draft 在可预测内容已能命中（75%），瓶颈在 verify 侧（batch≠seq）而非 draft 的 chain 路径；topk>1 用同一 verify forward，无法绕过该根因。topk>1 的 DLIN triton 报错（`swa_out_cache_loc`）仍记录为次要项。
+
+**M=1 MoE 隔离探针（本会话）**：`FUSED_MAX_M=1`（强制 verify MoE 走 M=1）试图隔离"fused MoE M>1 verify batch 是否为残留根因"。结果：**M=1 verify MoE 在 verify batch 上病理慢/挂**（warmup prefill 后 ~7min 无 decode 输出，已 kill）——本身说明 M=1 MoE 在 verify 多 token 路径不可用，无法干净隔离。结合 full-attn fix 后 M=16 已不逐字复述，fused MoE M>1 非主因。
+
+**P0 终局（2026-07-10）**：
+- ✅ **核心假阳性部分缓解**：greedy 不再逐字复述 prompt（full-attn fix 有效）。
+- ❌ **verify≠decode 残留**：hybrid GDN 状态层 batch-verify ≠ sequential-decode，采样模式仍复述 prompt。这是**架构级 / sglang-internal 深度**问题（本会话 + memory 6 天，多次修复级联暴露新面，per-token GDN 反而更差）→ systematic-debugging 的"3+ 修复后应质疑架构"场景。
+- 🟡 **可对外**：spec-decode（NGRAM/MTP）在该 hybrid 模型上的吞吐数字**必须带质量星号**（verify≠plain，尤其采样）；唯一干净可用区间是**可预测/重复内容**（spec≈plain）。
+- **deferred**：要彻底修需让 GDN verify kernel 的 batch 路径与 decode recurrent 路径数值等价（kernel 级研究工作），或逐 token 顺序化 verify（已试、反而更差）。超出本会话范围，列为后续深度项。
+
+**复现**：`scripts/dl/p0_verify.py`（PLAIN vs SPEC 对比，决定性）；模型页缓存后 weight-load 21.9s。

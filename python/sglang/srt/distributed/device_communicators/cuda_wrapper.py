@@ -119,8 +119,17 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
-            so_file = find_loaded_library("libcudart" if not _is_musa else "libmusart")
-            assert so_file is not None, "libcudart is not loaded in the current process"
+            # DL begin — DLIN uses libcurt (not libcudart) as the CUDA runtime.
+            # libcurt has cudaIpcGetMemHandle/cudaIpcOpenMemHandle (verified).
+            from sglang.srt.utils.common import is_dlin as _is_dlin
+            if _is_dlin():
+                so_file = find_loaded_library("libcurt")
+            elif _is_musa:
+                so_file = find_loaded_library("libmusart")
+            else:
+                so_file = find_loaded_library("libcudart")
+            # DL end
+            assert so_file is not None, "CUDA runtime (libcudart/libcurt) is not loaded in the current process"
         if so_file not in CudaRTLibrary.path_to_library_cache:
             lib = ctypes.CDLL(so_file)
             CudaRTLibrary.path_to_library_cache[so_file] = lib

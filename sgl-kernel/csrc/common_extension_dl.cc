@@ -84,6 +84,26 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("paged_decode_attn", torch::kCUDA, &sgl_kernel_dl::paged_decode_attn);
   // DL end
 
+  // DL begin — custom allreduce ops (from common_extension.cc).
+  // Source: csrc/allreduce/custom_all_reduce.cu (standard CUDA runtime APIs only —
+  // cudaMemcpyAsync, CUDAStream; no NVIDIA P2P/IPC. Uses fake IPC pointers = pre-
+  // allocated SHM). Enables sglang custom allreduce on DLIN (without this, sglang
+  // falls back to slow NCCL = 48.5% of decode GPU time per kprof profiling).
+  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+  m.def("register_graph_buffers", &register_graph_buffers);
+  m.def("dispose", &dispose);
+  m.def("meta_size", &meta_size);
+  m.def("register_buffer", &register_buffer);
+  m.def(
+      "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
+      "int rank, bool full_nvlink) -> int");
+  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
+  m.def(
+      "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  m.impl("all_reduce", torch::kCUDA, &all_reduce);
+  // DL end
+
   // STUB (no impl): sglang registers a module-level
   // @torch.library.register_fake("sgl_kernel::moe_fused_gate") (topk.py) which
   // requires the op to EXIST. Dense models never call it; the schema-only m.def

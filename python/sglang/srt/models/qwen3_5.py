@@ -22,6 +22,13 @@ import torch
 import torch.nn as nn
 import triton
 
+# DL begin — per-layer decode-breakdown profiling (env SGLANG_DL_LAYER_TIMING=1).
+# Accumulates GPU-synced wall time around GDN-attn / full-attn / MoE(mlp) per layer;
+# prints a per-step summary to stderr. Eager-only meaningful (CG replay bypasses host).
+import os as _dl_os, time as _dl_time
+_DL_LT = {"gdn_attn": 0.0, "full_attn": 0.0, "moe": 0.0, "n_layers": 0}
+# DL end
+
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
@@ -659,10 +666,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         )
 
         if not forward_batch.forward_mode.is_idle():
+            # DL begin — time GDN-attn (linear_attn) for decode-breakdown profiling
+            _dl_prof = _dl_os.environ.get("SGLANG_DL_LAYER_TIMING")
+            if _dl_prof:
+                torch.cuda.synchronize(); _t0 = _dl_time.time()
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
             )
+            if _dl_prof:
+                torch.cuda.synchronize(); _DL_LT["gdn_attn"] += _dl_time.time() - _t0
+            # DL end
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -678,6 +692,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch
             )
         )
+        # DL begin — time MoE (mlp) for decode-breakdown profiling
+        _dl_p2 = _dl_os.environ.get("SGLANG_DL_LAYER_TIMING")
+        if _dl_p2:
+            torch.cuda.synchronize(); _t1 = _dl_time.time()
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
             hidden_states = self.mlp(
                 hidden_states,
@@ -689,6 +707,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+        if _dl_p2:
+            torch.cuda.synchronize(); _DL_LT["moe"] += _dl_time.time() - _t1
+            _DL_LT["n_layers"] += 1
+            if _DL_LT["n_layers"] % 40 == 0:
+                import sys as _dl_sys
+                tot = _DL_LT["gdn_attn"] + _DL_LT["moe"] + 1e-9
+                _dl_sys.stderr.write(
+                    f"[DL decode-breakdown] gdn_attn={_DL_LT['gdn_attn']*1000:.1f}ms "
+                    f"({_DL_LT['gdn_attn']/tot*100:.0f}%) moe={_DL_LT['moe']*1000:.1f}ms "
+                    f"({_DL_LT['moe']/tot*100:.0f}%) /step\n"
+                )
+                _dl_sys.stderr.flush()
+        # DL end
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -750,7 +781,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             base=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,
-            is_neox_style=True,
+            # DL begin — is_neox_style: model has mrope_interleaved=True (Qwen3-VL),
+            # needs interleaved rotary (is_neox_style=False), not NeoX (True).
+            # Hardcoded True was the QUALITY ROOT CAUSE (wrong rotary → degenerate output).
+            is_neox_style=(not getattr(config, "rope_parameters", {}).get("mrope_interleaved", False)),
+            # DL end
             dtype=torch.get_default_dtype(),
         )
 
@@ -1037,6 +1072,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch
             )
         )
+        # DL begin — time MoE (mlp) for decode-breakdown profiling
+        _dl_p2 = _dl_os.environ.get("SGLANG_DL_LAYER_TIMING")
+        if _dl_p2:
+            torch.cuda.synchronize(); _t1 = _dl_time.time()
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
             hidden_states = self.mlp(
                 hidden_states,
@@ -1048,6 +1087,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+        if _dl_p2:
+            torch.cuda.synchronize(); _DL_LT["moe"] += _dl_time.time() - _t1
+            _DL_LT["n_layers"] += 1
+            if _DL_LT["n_layers"] % 40 == 0:
+                import sys as _dl_sys
+                tot = _DL_LT["gdn_attn"] + _DL_LT["moe"] + 1e-9
+                _dl_sys.stderr.write(
+                    f"[DL decode-breakdown] gdn_attn={_DL_LT['gdn_attn']*1000:.1f}ms "
+                    f"({_DL_LT['gdn_attn']/tot*100:.0f}%) moe={_DL_LT['moe']*1000:.1f}ms "
+                    f"({_DL_LT['moe']/tot*100:.0f}%) /step\n"
+                )
+                _dl_sys.stderr.flush()
+        # DL end
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:

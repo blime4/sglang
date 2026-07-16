@@ -1933,22 +1933,39 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 M = x.shape[0]
                 num_experts = layer.w13_weight.shape[0]
                 topk = topk_ids.shape[1]
+                # DL: MoE GEMM block sizes (configurable for tuning). Defaults
+                # 16/128/128. vLLM uses try_get_optimal_moe_config (default 64/64/32
+                # when no JSON config). For decode M=1 (memory-bound GEMV) smaller
+                # BM = less padding waste. A/B via SGLANG_DL_MOE_BM/BN/BK.
+                _BM = int(_os.environ.get("SGLANG_DL_MOE_BM", "16"))
+                _BN = int(_os.environ.get("SGLANG_DL_MOE_BN", "128"))
+                _BK = int(_os.environ.get("SGLANG_DL_MOE_BK", "128"))
                 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
                     moe_align_block_size as _mabs,
                 )
                 _G = torch.ops._dl_C.invoke_fused_moe_opt
-                srt, eid, npp = _mabs(topk_ids.to(torch.int32).contiguous(), 16, num_experts)
+                # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
+                # not every forward step — was 80 redundant copy kernels/step × ~0.04ms
+                # = ~3ms TPOT overhead if scales not already contiguous).
+                if not hasattr(layer, "_dl_w13s"):
+                    layer._dl_w13s = layer.w13_weight_scale_inv.contiguous()
+                    layer._dl_w2s = layer.w2_weight_scale_inv.contiguous()
+                # DL: skip .to()/.contiguous() if already correct dtype+layout (no-op
+                # avoids a captured CUDA kernel in CG).
+                _ti = topk_ids if (topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()) else topk_ids.to(torch.int32).contiguous()
+                _tw = topk_weights if (topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()) else topk_weights.to(torch.float32).contiguous()
+                srt, eid, npp = _mabs(_ti, _BM, num_experts)
                 c13 = torch.empty(M, topk, 2 * inter, dtype=x.dtype, device=x.device)
-                _G(x, layer.w13_weight, c13, None, layer.w13_weight_scale_inv.contiguous(), None,
-                   topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous(),
-                   srt, eid, npp, False, topk, 16, 128, 128,
+                _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
+                   _tw, _ti,
+                   srt, eid, npp, False, topk, _BM, _BN, _BK,
                    True, False, False, False, [128, 128], M)
                 gate, up = c13[:, :, :inter], c13[:, :, inter:]
-                he = (F.silu(gate) * up).contiguous()  # [M, topk, inter]
+                he = F.silu(gate) * up  # [M, topk, inter]
                 c2 = torch.empty(M, topk, hidden, dtype=x.dtype, device=x.device)
-                _G(he, layer.w2_weight, c2, None, layer.w2_weight_scale_inv.contiguous(), None,
-                   topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous(),
-                   srt, eid, npp, True, topk, 16, 128, 128,
+                _G(he, layer.w2_weight, c2, None, layer._dl_w2s, None,
+                   _tw, _ti,
+                   srt, eid, npp, True, topk, _BM, _BN, _BK,
                    True, False, False, False, [128, 128], M)
                 out = c2.sum(dim=1)  # mul_routed_weight applied; sum over topk → [M, hidden]
                 return StandardCombineInput(hidden_states=out)

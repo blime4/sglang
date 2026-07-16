@@ -522,25 +522,47 @@ def dlblas_w8a8_block_fp8_linear(
     _ensure_dl_C()
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
     N, K = weight.shape
-    # DL: gptq_dlblas_gemmex is correct with quant_type=1 (per-channel FP8), but
-    # the checkpoint is blockwise [128,128] and quant_type=2 (blockwise mode)
-    # produces wrong output (reads the plain FP8 weight in the wrong order).
-    # So dequant the blockwise weight once -> requantize per-channel -> cache, and
-    # call with quant_type=1 + per-channel scale. Verified rel_err ~0.003 vs bf16.
-    key = (weight.data_ptr(), N, K)
-    cached = _dl_pc_cache.get(key)
-    if cached is None:
-        bn, bk = block_size[0], block_size[1]
-        sc_full = weight_scale.float().repeat_interleave(bn, 0).repeat_interleave(bk, 1)  # [N,K]
-        w_bf = weight.float() * sc_full  # blockwise dequant to fp32
-        pc = w_bf.abs().amax(dim=1).clamp(min=1e-6)  # [N] per-channel scale
-        w_pc = (w_bf / pc.view(N, 1)).clamp(-1, 1).to(torch.float8_e4m3fn)  # [N,K]
-        cached = (w_pc.t().contiguous(), pc.to(torch.float32).view(N, 1).contiguous())
-        _dl_pc_cache[key] = cached
-    w_pc_t, pc_scale = cached
-    out = torch.ops._dl_C.gptq_dlblas_gemmex(
-        input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
-    )
+    # DL: DEFAULT = quant_type=1 (per-channel). The checkpoint is blockwise
+    # [128,128]; we dequant blockwise -> requantize PER-CHANNEL once (cached by
+    # weight data_ptr) and call gptq_dlblas_gemmex(quant_type=1). Verified
+    # rel_err ~0.003 vs bf16, correct + fast. This is the 39ms TPOT baseline
+    # (dense FP8 linear = attention QKV/O projections; NOT the decode bottleneck —
+    # the GDN kernel is, see docs/dl/sglang-vs-vllm-perf-gap.md §7.19).
+    #
+    # quant_type=2 (blockwise, hardware-fused dequant — what vLLM's fp8_dlblas
+    # uses) is opt-in via SGLANG_DL_FP8_Q2=1. Earlier crashed (SIGSEGV) because
+    # sglang added .contiguous() to weight.t()/scale; vLLM passes weight.t() as a
+    # NON-contiguous transposed view (the kernel hardcodes stride assumptions).
+    # Match vLLM fp8_dlblas.apply exactly: x.view (no contiguous) + weight.t() +
+    # weight_scale as-is. Scale layout is [N/128,K/128] in BOTH (verified vs
+    # vLLM's assert at fp8_dlblas.py:345). May also fix output degeneration
+    # (quant_type=1 per-channel requant loses blockwise precision).
+    import os as _os
+    if _os.environ.get("SGLANG_DL_FP8_Q2") == "1":
+        # DL: match vLLM fp8_dlblas.apply call layout (no .contiguous()).
+        # q2 op is VALID (runs in CG, 30.6ms). Earlier cudaErrorNotSupported
+        # seen on .cpu() sync / CUDA_LAUNCH_BLOCKING is a spurious DLIN runtime
+        # quirk (surfaces during init_model_parallel_group under blocking), NOT
+        # a q2 op error. Wrong output ("a majorly") is upstream GDN extend bug.
+        out = torch.ops._dl_C.gptq_dlblas_gemmex(
+            input.view(-1, input.shape[-1]), weight.t(),
+            weight_scale, weight_scale, quant_type=2, bit=8
+        )
+    else:
+        key = (weight.data_ptr(), N, K)
+        cached = _dl_pc_cache.get(key)
+        if cached is None:
+            bn, bk = block_size[0], block_size[1]
+            sc_full = weight_scale.float().repeat_interleave(bn, 0).repeat_interleave(bk, 1)
+            w_bf = weight.float() * sc_full
+            pc = w_bf.abs().amax(dim=1).clamp(min=1e-6)
+            w_pc = (w_bf / pc.view(N, 1)).clamp(-1, 1).to(torch.float8_e4m3fn)
+            cached = (w_pc.t().contiguous(), pc.to(torch.float32).view(N, 1).contiguous())
+            _dl_pc_cache[key] = cached
+        w_pc_t, pc_scale = cached
+        out = torch.ops._dl_C.gptq_dlblas_gemmex(
+            input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
+        )
     if bias is not None:
         out = out + bias
     return out.to(dtype=input.dtype).view(*input.shape[:-1], N)

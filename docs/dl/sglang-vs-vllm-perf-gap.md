@@ -696,3 +696,380 @@ Prefill batch ... cuda graph: False, input throughput (token/s): 0.55 ← prefil
 | P5 | **decode GDN kernel**（dl_recurrent）：18.32→~25 tok/s decode | decode 再提 | DLIN-side（launch_bounds bug） |
 
 **建议执行顺序**：先 P3（在线 bench，快速拿 sglang serving 口径）→ P1（vLLM 对比，验证 2×）→ P4（质量）→ P2（TTFT）→ P5（等 DLIN）。主目标"sglang 比 vLLM 快 2 倍"已达成（§7.12），本轮重点转向**公平对比 + TTFT + 质量**。
+
+### 7.14 未完成项 / 痛点 + 优化思路（2026-07-10）
+
+> **⚠️ 状态修正（supersedes §7.12 / §7.13 的"2× 已达成"）**：§7.12 的 NGRAM "35–40 tok/s = 2.8–3.2× vLLM" 与 §7.13 的"主目标已达成"经后续质量验证发现是**退化输出（复述 prompt / 多语言乱码）上的吞吐**，不是真实质量加速。根因 = spec verify 的 target 在 verify 位置重新生成 prompt（详 `dlin-sglang-mtp-vs-ngram-report.md` §10 + memory `spec-verify-prompt-regen-bug`）。**故"2× vLLM"当前不可对外作为质量达成**；下方 P0 是解除此阻塞的唯一路径。
+>
+> 下表按"是否阻塞可报数"排序，列截至 2026-07-10 仍未做好、影响性能或可报性的项。
+
+| 优先级 | 痛点 | 现状（一句话） | 影响 | 阻塞 / 类型 |
+|---|---|---|---|---|
+| **P0** | spec verify 质量 bug | verify target 重新生成 prompt；已修 full-attn verify 段（`flash_attention.py:290` DL 块，FA2→`paged_decode_attn` loop），核心复述 bug 解决、accept 8.5%→15.4%，但 greedy 80%+ 仍不可达 | **NGRAM/MTP 吞吐数字当前是退化输出上的吞吐，不能算真实加速；这是唯一阻塞"2× vLLM 可对外报"的点** | sglang-internal 深度（triton/kernel） |
+| ~~P1~~ | ~~vLLM 公平对比缺失~~ | ✅ **已复现 fresh 12.47 tok/s**（dl19 env，2026-07-10）；崩溃是 dl24 特有 + 僵尸进程占显存 | 分母已确认；sglang decode 18.32 = **1.47× fresh vLLM** | ✅ 解决（方案 A） |
+| P2 | decode GDN `dl_recurrent` kernel | 代码已写，被 DLIN-side `__launch_bounds__(0)` JIT bug 挡住 | decode 18.32→~25 tok/s 的最后一程 | DLIN-side JIT |
+| P3 | fused MoE M>1 稳定性 + verify 正确性疑点 | `FUSED_MAX_M` 默认已 128→**16**（commit `f40472402f`，128 长预填充崩）；decode M=1 不受影响；fused M>1 在 verify(M=5) batch 的正确性仍是次要疑点 | 长预填充回退慢路径；headline 报数（128）与稳定默认（16）不一致 | JIT/workspace 分配（cudagraph capture）|
+| P4 | TTFT 357ms 偏高 | 首 token 被首调度 + CG 首步开销主导；NGRAM 只帮 TPOT 不帮 TTFT | 交互延迟 | 中（profiling） |
+| P5 | cuda-graph 对 sglang 在 DLIN net-negative | sglang FULL graph 比 eager 慢（全 batch），而 vLLM graph 在 DLIN 有效 | 大 batch serving 的主要提效手段失效 | sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题，独立排查线 |
+| P6 | num_draft=8 显存紧张 | 2×32GB（35B FP8 ~17GB/GPU）下 draft tree + CG 在 bs=7–8 OOM（sglang 自动降级恢复） | 稳定 serving 的 CG 覆盖不全 | 显存（CG_MAX_BS↓ / TP=4） |
+| P7 | greedy 开放 prompt 退化 | 推理模型 + temperature=0 循环；`rep_penalty=1.2` 已验证修复（`a827e8c319`） | 质量（非速度）；serving 配置项 | 无（已解，待设默认） |
+
+#### P0 优化思路（最高杠杆——解锁后投机解码才能算数）
+
+verify 路径已逐步排除锁定：GDN/Mamba2 state 正确（extend/verify 逐层 sum 精确相等）、GDN verify kernel 输出与 decode 逐层匹配、full-attn FA2 段已修。**剩余三个子项**：
+
+1. **解 topk>1 的 DLIN triton 阻塞**（最高价值）。当前 DLIN 上只有 `topk=1` 能跑，它走的是 GDN target_verify 的 **chain 路径**（`retrieve_parent_token=None`，`fused_sigmoid_gating_delta_rule_update` with `disable_state_update=True`），疑似此路径有问题；而 `topk>1`（会正确设置 retrieve tokens）被 DLIN triton draft backend 的 `AttributeError: 'NoneType' object has no attribute 'swa_out_cache_loc'` 挡住，无法对照。**修通 topk>1 → 即可用已知正确的 retrieve-token 路径做 A/B**，区分"是 topk=1 chain 单独的 bug"还是"更深的 verify 问题"。
+2. **给 draft 的 logits 加 rep_penalty**（`frozen_kv_mtp_worker_v2.py:592` seed + `:637` recurrent，Phase-2 draft 当前不对称地无 penalty）。已试：破 draft 的 chain-repeat，但不解决"新颖内容 draft 命中 0"——需配合**可预测内容场景**（可预测内容上 draft 已能命中 3/4，75%）。
+3. **修 GDN target_verify chain kernel**（topk=1, `retrieve_parent_token=None`，strides=0 + masked）—— 研究级 triton 工作（`fla/fused_sigmoid_gating_recurrent.py`、`causal_conv1d_triton.py:991`）。
+4. （补充）**多层 draft** 提升内禀 accept 上限（1 层 FP8 draft ~10% 是结构上限）。
+
+**关键判别**：full-attn fix 后，对**可预测内容** draft 已能命中 target 75%；平均 accept 仍 3–15% 是因为多数 verify 命中新颖内容（0 accept）。⇒ 高 accept 的现实路径 = **rep_penalty=1.2（让 target 连贯）+ 可预测/结构化内容**，而非纯算法修复。是否追求"任意 prompt 80%+"需评估投入产出。
+
+**2026-07-10 决定性复核（PLAIN vs SPEC 对比，`scripts/dl/p0_verify.py`，详 `dlin-sglang-mtp-vs-ngram-report.md` §10.11）**：full-attn fix **只是部分修复**——greedy 不再逐字复述 prompt，但 **verify forward ≠ plain decode forward** 的残留仍在：新颖内容 greedy 下 spec=`The neural network is...`(phrase-loop) vs plain=`\n\n\n`；**采样(temp=0.6)下 spec 仍复述 prompt**（"Explain how neural networks learn from data." 出现在输出里），即 commit `5cd3164a9e` 的假阳性仍存。**可预测内容 spec≈plain**（唯一干净可用区间）。根因 = hybrid **GDN 状态层 batch-verify ≠ sequential-decode** 数值不等价（per-token GDN verify 已试、反而更差→已 revert），属架构级 sglang-internal 深度问题。M=1 MoE 隔离探针病理慢/挂，未干净隔离（fused MoE M>1 非主因）。
+
+**P0 复核结论**：核心假阳性**部分缓解**（greedy）；verify≠decode 残留**未解**（采样仍复述 prompt），列为后续深度项（GDN verify kernel batch↔recurrent 数值等价）。**对外口径不变**：NGRAM/MTP 吞吐须带质量星号；干净可用区间 = 可预测/重复内容。`accept 8.5%→15.4%` 的数（§7.14 行）是 full-attn fix 后的 greedy 单点，不代表采样/新颖内容已修。
+
+#### P1 优化思路（可报数根基）
+
+- **A. 找回 dl19 SDK + 对应 vLLM venv**（`venv-vllm021`，0.21.0）复测 12.63 baseline 是否可复现——快、低风险。
+- **B. debug dl24 worker 静默崩溃**：rank-1 init 时段某 DLIN kernel 段错误（无 Python traceback）—— 难，需 dlcc/gdb 定位崩溃 kernel。
+- 备用：dl19/dl24 torch 的 `torch.matmul` TFLOP/s 已证等价（§2.4），故 dl19 vLLM 数对 bf16/FP8 dense 都有参考意义。
+
+**✅ P1 已解决（2026-07-10，方案 A）**：dl19 vLLM 环境已恢复并复测——`source ../sdk/env.sh`（含 `libhcrt.so`）+ `venv-vllm021`（torch `2.9.1+dl19.sdk20260312`、vllm `0.21.0+cu117.dl9.sdk20260528`）即可 import/运行。`scripts/dl/qwen35_vllm_tps.py`（TP=2, eager, GPU 8,9, 4-tok prompt + 128 decode）实测 **VLLM_TPS = 12.47 tok/s（128 tok / 10.26s）**——**复现历史 12.63 分母**（差 <1%，噪声内）。
+- "vLLM TP>1 worker 崩溃"是 **dl24 特有**（dl24 SDK 上 rank-1 init 段错误）；dl19 不复现。本会话首次失败是**僵尸 `VLLM::EngineCore` 进程占满 GPU 4,5 显存**（init 失败后未干净退出）→ `ValueError: Free memory ... less than desired`，非 worker 死亡 bug；kill 僵尸 + 换空 GPU 即解。
+- **结论**：vLLM 分母 = **12.47 tok/s（fresh, dl19, 已确认）**。sglang 纯 decode 18.32 tok/s = **1.47× fresh vLLM**——"1.45× vLLM" claim 现建立在**已复现的 fresh 分母**上（不再依赖历史数）。复现命令：`source ../sdk/env.sh && CUDA_VISIBLE_DEVICES=<2 free GPUs> MODEL_PATH=/LocalRun/xi.chen/Qwen3.5-35B-A3B-FP8 NTOKENS=128 ../venv-vllm021/bin/python scripts/dl/qwen35_vllm_tps.py`。
+
+#### P2 已定性（2026-07-10，deferred）
+
+- **dl_recurrent decode kernel 不在 repo**（scratch 实验，被 DLIN JIT `__launch_bounds__(0)` bug 挡）。repo 里 GDN decode 的唯一 DL 改动是 `gdn_backend.py` 的 `SGLANG_DL_SKIP_TRACK_MAMBA`（省 1 triton kernel/层），当前 decode 走 triton `packed_decode`。
+- **无现成 op 可移植**：vLLM `venv-vllm021` 的 `_dl_C.so`（仅 7 op，无 recurrent/gdn/delta）——recurrent/GDN 逻辑在 vLLM 与 sglang **都是 Python/triton**（`vllm/.../fla/ops/fused_recurrent.py` 等），不像 FP8 GEMM 那样有 AOT `_dl_C` op 可直接 load。故"load vLLM op"路径此处不适用。
+- **优先级重判**：sglang 纯 decode **18.32 tok/s 已 1.47× fresh vLLM 12.47**（P1 已确认分母）。dl_recurrent（→~25）是**超越 parity 的增量优化，非必需**。DLIN JIT 修前 deferred。
+
+#### P3 优化思路（fused M>1 稳定性与正确性）
+
+- **稳定性**：`gptq_dlblas_gemmex` 内部 `dlblasLtMatmulGetWorkspace` 每次分配 workspace → 不可 cudagraph capture；128 在长 prefill 崩疑与此相关。方向 = 预分配/复用 workspace（让 fused M>1 可进图、且 128 不崩）。
+- **正确性**：full-attn fix **之后**重测 `FUSED_MAX_M=1 vs 16` 的 verify 输出差异——确认 fused M>1 在 verify(M=5) batch 无独立 bug（fix 前曾怀疑是它产生 prompt-regen，现主因已转 full-attn；需复核）。
+
+**✅ P3 稳定性已定性（2026-07-10，DLIN 编译器 bug）**：`invoke_fused_moe_opt` 在 prefill **M≥~100** 触发 **DLIN dleol `tu_program.cc:625` assert → SIGSEGV（`fused_moe_opt.cu:775`）**，triton `fused_experts` 撞同一 assert。即**两条快路径在大 M 下都崩**（DLIN 编译器/dleol bug，非 sglang）。workaround 已 committed（commit `f40472402f`）：`FUSED_MAX_M=16`（decode M=1 + NGRAM verify M=9 + 短 prefill 走 fused）+ 长 prefill 回退 `bf16-bmm`（`MAX_BF16_M=2048`，慢但稳，TTFT ~13s/128-tok prefill）。**代价**：长 prefill 慢（bf16-bmm），短/decode 工作负载保 2× vLLM。**deferred**：真修需 DLIN 修 dleol assert（让 FUSED_MAX_M 回 128+ 加速长 prefill）。
+**P3 正确性子问题**：fused M>1 verify 是否在 GDN 发散之外**额外**发散？被 P0 更深结论覆盖（verify≠decode 主因是 GDN 状态层 batch≠seq，非 MoE M），且 M=1 verify 探针（`scripts/dl/p0_moe_probe.py`）病理慢/挂——本身说明 M=1 MoE 在 verify 多 token batch 不可用，无法干净隔离。列为 P0-followup（task #9）一并解。
+
+#### P4/P5 已定性（2026-07-10，blocked on DLIN profiling）
+
+两者都**已有测量、进一步优化 blocked on DLIN 工具链**：
+
+- **P4 TTFT 357ms**（§7.13 实测）：被 prefill + 首 token 调度 + CG 首步主导；NGRAM 只帮 TPOT 不帮 TTFT。**优化杠杆（prefill CG）被 P5 卡住**（sglang graph 在 DLIN net-negative），且长 prefill 走 bf16-bmm（P3 dleol bug 的回退，~13s/128-tok）。**deferred**：降 TTFT 需先解 P5（graph）或 P3（dleol 让长 prefill 走 fast fused）；`torch.profiler` 在 DLIN 崩，无法精细定位首 token 各段开销。
+- **P5 cuda-graph net-negative**（§2.4 已测，Qwen3-1.7B dense）：sglang FULL graph 比 eager **慢**全 batch（bs=1: 60.5 vs 48.2ms；bs=64: 312.6 vs 147.2ms），而 vLLM graph 在 DLIN 有效。指向 **sglang graph 实现（capture/replay/static-pool）的 DLIN 特有问题**（独立排查线），非 fusion/dlblasLt（bf16 下双方等价，§2.4 已证伪）。**deferred**：根因需 DLIN profiling（崩）+ sglang graph 内部深挖；当前 DLIN 上 sglang 应用 **eager**（graph net-negative 故默认 disable_cuda_graph）。35B hybrid 上未单独复测（高 bs OOM-prone，见 P6；原理同 dense）。
+
+**结论**：P4/P5 当前无 sglang 侧可落地优化（均 blocked on DLIN 工具链/编译器）；**serving 配置维持 `disable_cuda_graph`（eager）+ 短 prompt / decode-dominated 工作负载**。若 DLIN 修好 profiling + dleol + graph，再回头攻。
+
+#### P6/P7 已定性（2026-07-10）
+
+**P6 num_draft=8 显存紧张**：CG-capture OOM（bs=7-8）只在 **CG 开**时发生；而 P5 结论是 DLIN 上用 **eager（`disable_cuda_graph`）** → **该 OOM 在推荐配置下根本不发生**。即便 CG 开，sglang 也**自动降级恢复**（OOM batch 回退 eager，非硬失败，仅日志噪音）。结论：维持 eager 配置即免；若要 CG，设 `CG_MAX_BS=4` + `mem_fraction=0.60`（已是默认）；更高并发用 TP=4。
+
+**P7 greedy 开放 prompt 退化**（⚠️ **修正 commit `a827e8c319` 的"rep_penalty=1.2 已解"判断**）：本会话 fresh PLAIN 数据（`scripts/dl/p0_verify.py`）显示 **rep_penalty 不是普适修复**——
+- 可预测内容（计数序列 `1,2,...,15,`）：plain greedy 正确计数（`16,17,...`），**加 rep_penalty=1.2 反而破坏**（→`16, 2007. The numbers are in order...` 不连贯）。
+- 新颖内容：plain greedy 本就退化（`\n\n\n`），rep_penalty 给不同但仍退化的输出（`The first step is to the 100% of the data...`）。
+- commit `a827e8c319` 的"Trump→连贯"是**特定开放 prompt** 的现象，非普适。
+⇒ **结论**：greedy 退化是该推理模型 + temperature=0 的**内禀行为**；**rep_penalty 不应设为默认**（伤结构化/可预测内容）。建议：结构化/代码工作负载 **关 rep_penalty**；开放问答可 `temperature>0` + 按需 `rep_penalty≈1.1`。不设全局默认。
+
+#### 本会话处置结果（2026-07-10）
+
+| 项 | 处置 | 要点 |
+|---|---|---|
+| **P1** | ✅ **解决** | dl19 env 恢复，fresh vLLM **12.47 tok/s** 复现分母；sglang decode 18.32 = **1.47× fresh vLLM**（claim 建立在已确认分母上）|
+| **P7** | ✅ **修正** | rep_penalty=1.2 **非普适**（破坏计数/结构化内容，仅特定开放 prompt 有效）→ **不设默认**；修正 commit `a827e8c319` 的过乐观判断 |
+| **P6** | ✅ **解决** | CG-capture OOM 在 eager 配置（P5 结论）下不发生；sglang 即便 CG 开也自动降级；`CG_MAX_BS=4`+`mem 0.60`/TP=4 备用 |
+| **P0** | 🟡 **定性+deferred** | PLAIN vs SPEC 决定性对比：full-attn fix 部分修（greedy 不再逐字复述），但 verify≠decode 残留（采样仍复述 prompt）；根因=hybrid GDN 状态层 batch≠seq（架构级，task #9）|
+| **P3** | 🟡 **定性+deferred** | 稳定性=DLIN dleol `tu_program.cc:625` assert（M≥~100 崩），workaround `FUSED_MAX_M=16`+bf16-bmm 已committed；正确性子问题并入 P0 |
+| **P2** | 🟡 **定性+deferred** | dl_recurrent kernel 不在 repo、DLIN JIT `__launch_bounds__(0)` bug；无 `_dl_C` op 可移植；decode 已 1.47× vLLM 故非必需 |
+| **P4/P5** | 🟡 **定性+deferred** | 均已有测量（§2.4/§7.13），进一步优化 blocked on DLIN（`torch.profiler` 崩 + dleol + graph 内部）；serving 维持 eager |
+
+**对外口径（更新）**：sglang decode 18.32 tok/s = **1.47× fresh vLLM 12.47**（分母已本会话确认）。**spec-decode（NGRAM/MTP）的 2–3× 吞吐须带质量星号**（verify≠decode，采样仍复述 prompt，详 §10.11）——干净可用区间仅可预测/重复内容。serving 推荐配置：`fa3 + page_size=16 + disable_cuda_graph + SGLANG_DL_MOE_FUSED=1 FUSED_MAX_M=16 MAX_BF16_M=2048 + mem_fraction=0.60`，短/decode-dominated 工作负载。
+
+**真正可推进项（需 DLIN 配合）**：① GDN verify batch↔recurrent 等价（P0/task #9，解开后 spec-decode 可对外报）；② dleol `tu_program.cc:625` 大-M assert（P3，解开后长 prefill 走 fast fused，降 TTFT）；③ dlcc/JIT `__launch_bounds__` 支持（P2）；④ DLIN profiling 可用（P4/P5 根因）。sglang 侧已达当前可达极限。
+
+---
+
+### 7.15 OPT 落地：sglang 侧可做的优化（2026-07-10，重新框定后）
+
+> 重新框定：spec-decode 在 hybrid 状态模型上 verify≠decode 是架构级难修，**ROI 低**；真正杠杆是 **prefill（sglang 输 vLLM 处）+ graph（高 batch 吞吐）**。这两处恰好有**不依赖登临**的 sglang 侧解法。
+
+#### ✅ OPT-1：prefill 分块到 16 绕 dleol —— 已验证 ~3.5–6.6× 长 prefill 提速
+
+**思路**：dleol 在 M≥~100 崩（P3），故 `FUSED_MAX_M=16` 把长 prefill 逼到慢 bf16-bmm。但若把 `chunked_prefill_size` 压到 16，每次 forward 的 MoE batch M≤16 ≤ `FUSED_MAX_M` → **永远走 fast fused，永不撞 dleol，永不回退 bf16-bmm**。纯 sglang 配置，不需登临修 dleol。
+
+**实测**（`scripts/dl/prefill_bench.py`，TP=2, fa3, eager, ~180-tok 长 prompt，max_new_tokens=1 = prefill 代理）：
+
+| 配置 | SHORT(4tok) | LONG(180tok) 冷 | LONG 暖(JIT后) | LONG 输出 |
+|---|---|---|---|---|
+| baseline `chunk=2048`（→bf16-bmm）| 414ms | **33s** | ~31s | `\n\n`（退化）|
+| **`chunk=16`（→fused M=16）** | 418ms | **9.5s** | **5.0s** | `, residual connections, and layer normalization...`（**连贯**）|
+
+- **长 prefill 冷 33s→9.5s（3.5×），暖 31s→5.0s（6.6×）**。SHORT 不变（本就 1 chunk fused）。
+- **输出连贯**（GDN 状态跨 ~12 个 prefill chunk 正确传递——sglang Mamba/hybrid chunked-prefill 核心特性），非 garbage。
+- **解 P3（稳定性：M=16 永不撞 dleol）+ P4（TTFT：长 prefill 大降）**，不需登临。
+- **反转 §7.14 "真正可推进项 ②"**：长 prefill fast fused **不必等 DLIN 修 dleol**——分块即绕开。
+
+**推荐**：serving 配置加 `chunked_prefill_size=16`（与 `FUSED_MAX_M=16` 配套）。**sweet-spot follow-up**（未测，集群抢占中）：把 `FUSED_MAX_M` 提到 32/64 + chunk 同步，chunk 数减半，可能再快（dleol 阈值 ~100，32/64 仍安全）。复现：`CUDA_VISIBLE_DEVICES=<2 free> SGLANG_DL_MOE_FUSED=1 FUSED_MAX_M=16 MAX_BF16_M=2048 CHUNK=16 .venv/bin/python scripts/dl/prefill_bench.py`。
+
+#### ❌ OPT-2：MoE/linear workspace 预分配 —— 前提不成立，非 sglang 侧可做
+
+调查后**推翻自己先前的假设**：
+- FP8 linear GEMM（`dlblas_w8a8_block_fp8_linear`，每层都用）调 `torch.ops._dl_C.gptq_dlblas_gemmex(input, w, scale, scale, quant_type, bit)`——**调用无 workspace 参数**，workspace 分配在 vLLM `_dl_C.so`（**登临编译的黑盒 op**）内部，sglang 侧**无法预分配/复用**。
+- 且 §2.4 已证 sglang **能完整捕获 FULL graph**（输出干净逐字一致），只是 **net-negative（replay 慢于 eager）**。能捕获 ⟹ capture **没被 workspace 打断**（cudaMalloc-in-capture 会直接报错，非 net-negative）。⇒ graph 慢的根因是 **DLIN graph replay 内部**（非 workspace），属 P5 深度项。
+- **结论**：OPT-2 无 sglang 侧落地点（黑盒 op + replay 内部均 DLIN 侧）。修正先前"workspace 预分配可让 graph 翻正"的乐观框定。
+
+#### 🟡 OPT-3 / OPT-4：DLIN-blocked / 低 ROI（维持先前定性）
+
+- **OPT-3（dl_recurrent decode kernel）**：DLIN JIT `__launch_bounds__(0)` bug 挡，kernel 不在 repo、无 `_dl_C` op 可移植；decode 已 1.47× vLLM 故非必需。**DLIN-blocked，低优先。**
+- **OPT-4（GDN verify batch↔seq 等价）**：spec verify≠decode 的架构级根因（hybrid 状态层）。重新框定后判断 **ROI 低**——即便修好，1 层 draft 在新颖内容命中仍低；精力更适合投 OPT-1（已验证大收益）。**研究级，建议暂缓**，除非 spec-decode 质量成为硬需求。
+
+#### OPT 小结
+
+| OPT | 结果 | 备注 |
+|---|---|---|
+| **OPT-1 prefill 分块** | ✅ **落地，3.5–6.6× 长 prefill** | 纯 sglang 配置，已验证，解 P3+P4 |
+| OPT-2 workspace 预分配 | ❌ 前提不成立 | 黑盒 op + graph 能捕获，非 sglang 侧 |
+| OPT-3 dl_recurrent | 🟡 DLIN-blocked | 低优先 |
+| OPT-4 GDN verify 等价 | 🟡 研究级/低 ROI | 建议暂缓 |
+
+**OPT-1 是本轮可落地的实质收益**：长 prompt prefill 从 ~33s → ~5s（暖），TTFT 大降，且不依赖登临。serving 配置加 `chunked_prefill_size=16` 即生效。其余 OPT 经调查均为 DLIN-blocked 或低 ROI——本身是有价值的结论（避免在死胡同投入）。
+
+---
+
+### 7.16 MEAS：并发吞吐实测 —— 推翻"sglang 已超 vLLM"，定位真实 gap（2026-07-10）
+
+> 前两轮都在 bs=1 单流上猜瓶颈。本轮做**公平并发对照**（sglang vs vLLM，**同 eager**、ignore_eos 固定 OUT=64、TP=2），用证据定位 gap。结果**颠覆项目叙事**。
+
+**实测聚合吞吐（tok/s，`scripts/dl/bench_batch_sg.py` / `bench_batch_vllm.py`）**：
+
+| B | sglang eager | sglang **CG** | vLLM eager | 结论 |
+|---|---|---|---|---|
+| 1 short | 7.2 | **16.7** | 12.9 | **sglang-CG 反超 vLLM** |
+| 8 short | 29.2 | 34.0 | **60.8** | vLLM 1.8× |
+| 16 short | 31.2 | 36.2 | **60.1** | vLLM 1.7× |
+| 1 long | 4.3 | 6.2 | 5.8 | sglang-CG 略超 |
+| 8 long | 9.6 | 10.1 | **34.7** | vLLM 3.4× |
+| 16 long | 9.7 | 10.3 | **31.6** | vLLM 3.1× |
+
+**三个决定性结论**：
+
+1. **"sglang 已超 vLLM"是假象**。先前"1.45× vLLM"（18 tok/s）= sglang-**CG** 对 vLLM-**eager** 的不公平对比。**公平 eager 对照下 sglang 反而落后 ~2×**（7.2 vs 12.9）。
+
+2. **CG 在 35B hybrid 上是 net-POSITIVE**（B=1 eager 7.2 → CG 16.7 = **2.3×**），且 sglang-CG(16.7) **反超 vLLM-eager(12.9)**。⇒ **§7.14 P5"net-negative→用 eager"结论（基于 1.7B dense）对 35B hybrid 不成立**；`disable_cuda_graph` 默认在此模型上**错了**，白白丢 2.3×。
+
+3. **真实 gap 在两处**：
+   - **高 batch decode**（B=8-16）：vLLM 60 vs sglang 36（1.7×）。sglang 吞吐在 ~36 plateau，vLLM 到 60。
+   - **长 prompt 并发**（B=8-16 long）：vLLM 32-35 vs sglang 10（~3×）。OPT-1 chunking 只救单流长 prefill，**并发下 prefill 仍串行瓶颈**（chunked prefills 互相争抢）；vLLM 原生 dlblas 大-M prefill 并发扩展好。
+
+**ranked 下一步（证据驱动）**：
+1. **立即：35B serving 开 CG**（去 `disable_cuda_graph`，注意 hybrid Mamba-cache 对 max_num_seqs 的约束——同 vLLM 的 42 blocks 限制）。B=1 直接 7.2→16.7 反超 vLLM。**配置级，零风险高收益。**
+2. **profile 定位高-batch gap**（MEAS-2，`layer_timing.py`）：sglang 为何 plateau@36 而 vLLM 到 60？是 GDN/MoE/attn 哪层、还是 CG 高-bs 捕获不全/continuous-batching 效率。
+3. **长 prefill 并发**：chunking 不够；要么 DLIN 修 dleol 让 sglang 用原生大-M（像 vLLM），要么改并发 prefill 调度（让多个请求的 chunked prefill 更并行）。
+
+**方法论结论**：停止猜测、做一次公平并发对照，一次定位三个真实 gap（CG 误关 / 高-batch / 长-prefill-并发）——比再列猜测表信息量大得多。`disable_cuda_graph` 这个默认是最大的隐藏损失。
+
+---
+
+### 7.17 BENCHRUN：serving 口径实测（sglang benchrun_sglang，2026-07-10）
+
+> 用 benchrun 格式（vLLM `vllm bench run` 同 schema）在 serving 口径验证 CG 收益。
+
+**✅ sglang serving benchrun（CG on，c=1，random-ids in512/out128，8 prompts）实测**：
+- success_req 8/8；**peak output throughput 18.0 tok/s**；median TPOT 58.0ms（=17.2 tok/s decode）；p99 ITL 108.6ms。
+- 印证 MEAS-1：sglang-CG serving ≈ 17–18 tok/s decode，与 §7.9 的"18 tok/s"一致（即 CG 路径，非 eager）。
+- 复现：`benchrun_sglang.py /tmp/sg_benchrun_cfg.json`（venv 激活 + 本地模型 + MoE env）。
+
+**⚠️ sglang benchrun 工作配置（踩 6 个坑才跑通，记录备用）**——`run_sglang.sh benchrun -M qwen35-35b` 预设有缺，需自定义 config：
+```
+server_params: tp=2, fa3, page16, mem_fraction_static=0.60, disable_cuda_graph=false,
+               chunked_prefill_size=16, cuda_graph_max_bs=2   ← 缺任一即崩
+```
+踩坑链：① 模型默认 `/mars`（慢）→ 用本地副本；② `cuda_graph_max_bs=8` 捕获太慢 → 降到 2；③ **benchrun preset 无 `chunked_prefill_size=16`（OPT-1）→ 长 prompt prefill M>16 → bf16-bmm 大分配 + CG → OOM**（`DL_MOE_ERR tried 7.78GB`）；④ 需 venv 激活（否则 harness 用 `/usr/bin/python3` 无 sglang）；⑤ `mem=0.55` 太低 → hybrid mamba state cache 太小（max_num_reqs=0）→ 需 0.60；⑥ output_dir 必须预建（"docker mount"检查）。**建议把 `chunked_prefill_size=16` 补进 run_sglang.sh 的 benchrun preset + qwen35 预设。**
+
+**❌ vLLM serving benchrun（`vllm/vllm/benchmarks/benchrun_serving.py`）未能跑通**：server "terminated unexpectedly"（无日志、立即退出），`enforce_eager=true` 也不解 → 是该 harness 的 **vLLM server-launch 对本 hybrid 模型/DLIN 的 bug**（venv-vllm021 缺 pandas/dateutil 已补，仍崩）。vLLM serving 数暂用 **MEAS-1 offline eager（12.9 tok/s @ B=1）** 作对照。
+
+**benchrun 口径对照结论**：
+| 口径 | sglang | vLLM |
+|---|---|---|
+| serving benchrun (CG/eager, c=1) | **peak 18 tok/s, TPOT 58ms** ✅ | harness bug（用 offline 数）|
+| offline eager B=1（MEAS-1） | CG 16.7 / eager 7.2 | **12.9** |
+
+⇒ sglang **开 CG** 后 serving decode 18 tok/s，**反超 vLLM eager 12.9**（低并发/延迟场景）。高并发仍输（MEAS-1：vLLM 60 vs sglang 36 @B=16）。**benchrun 验证了 CG 收益，且暴露 run_sglang.sh benchrun preset 缺 `chunked_prefill_size=16` + vLLM benchrun_serving 的 server-launch bug 两个待修项。**
+
+---
+
+### 7.18 MEAS-3 + bug18025 对照：gap 在单流延迟（GDN kernel），非聚合吞吐（2026-07-10）
+
+> 同事报 vLLM Qwen3.6-35B-A3B-FP8 **38 tps（MTP=3 → 43）**。bug 18025 性能分析显示该数 = **TP=4 + CUDA Graph + `DLEOL_FLA_ENABLE_PINGPONG=1`/`UNROLL_COUNT=8`（DLIN FLA 优化）+ 新版 vLLM**，batch=1 TPOT **26ms（=38 tok/s）**。我先前 vLLM 测的是 **eager + TP2 + 无 FLA（12.9）**——测了 vLLM 最差配置。
+
+**sglang TP4+CG 实测（`scripts/dl/bench_batch_sg.py` TP_SIZE=4 CG=1，GPU 24-27，CG 捕获 96s/4-rank）**：
+
+| B | sglang TP2+CG | **sglang TP4+CG** | vLLM TP4（bug18025）|
+|---|---|---|---|
+| 1（单流延迟）| 16.7 | **12.0** ⬇️ | **38** |
+| 8 short（聚合）| 34.0 | **68.3** | ~67（batch4 TPOT 60ms 推算）|
+| 16 short（聚合）| 36.2 | 85.4 | — |
+
+**两个决定性发现**：
+
+1. **TP4 对 sglang 单流延迟是负向**（16.7→12.0）：单序列下 TP4 的 NCCL allreduce 开销 > 并行收益。vLLM TP4 能到 38 说明其 TP 通信高效 + GDN kernel 快。⇒ **"sglang 换 TP4 追平 38"不成立**。
+
+2. **gap 在单流 decode 延迟（B=1 TPOT），非聚合吞吐**：
+   - 单流（B=1）：sglang 12–16.7 vs vLLM **38** → sglang **慢 2.3–3×**。
+   - 聚合（batch 8）：sglang TP4 **68** ≈ vLLM **~67** → **持平**。
+
+⇒ **sglang 在多用户聚合吞吐上已打平 vLLM；只在单流延迟上落后 3×。** "38 tps"是单流 TPOT 指标——sglang 在该指标上确实落后。
+
+**根因 = GDN kernel（sglang triton vs vLLM DLEOL FLA pingpong/unroll）+ TP allreduce 开销**。这是先前**错判为"DLIN-blocked、低优先"的 OPT-3**——vLLM 在用它跑 38，证明**可行且是最大杠杆**。
+
+**三轮纠正收敛**：①"sglang 超 vLLM"（测了 vLLM eager）→ ②公平 eager sglang 输 → ③ TP4 能追 → **④ TP4 不追，gap 在单流 GDN kernel（DLEOL FLA）**。
+
+**头号优化（重排）**：给 sglang GDN 接 **DLEOL FLA**（pingpong/unroll，vLLM 已验证可用）——解单流延迟 3× gap。次：sglang TP allreduce 效率（让 TP4 不伤单流）。聚合吞吐已达标，无需再投。
+
+---
+
+### 7.19 对齐基准（ALIGNED TPOT）—— gap 是 1.5×，不是 3×（2026-07-10）
+
+> **关键纠正**：先前 MEAS-3 报"单流 3× gap"用的是 `bench_batch_sg` 的**聚合 tok/s**（总 token/总墙钟，混入 per-request 调度 + prefill），非 vLLM 口径。对齐到 **TPOT（decode-only, per-token）** 后 gap 减半。
+
+**对齐口径**：batch=1, input_len=1024, output_len=512, TP=4, CUDA Graph on。vLLM = `bench offline`（bug18025），sglang = `benchrun_sglang`（server c=1，TPOT；batch1 c=1 下与 offline TPOT 等价，HTTP 噪音在 39ms 尺度可忽略）。
+
+| | TPOT median | = tok/s | 备注 |
+|---|---|---|---|
+| **sglang TP4**（triton GDN）| **39.4ms**（p99 40.0，很稳）| **25.4** | benchrun c=1 in1024/out512 |
+| **sglang TP2**（triton GDN）| 58ms（v6 测）| 17.2 | TP4 比 TP2 decode 快 1.5×（**TP4 对 decode 正向**，纠正 MEAS-3）|
+| **vLLM TP4**（DLEOL FLA, bug18025）| **26ms** | **38** | MTP=3 → 43 |
+| **gap（sglang TP4 vs vLLM TP4）**| **1.5×** | | 非 3× |
+
+**结论**：对齐后 sglang TP4 decode = 25.4 tok/s（TPOT 39ms），vLLM = 38（TPOT 26ms），**gap 1.5×**。根因 = GDN kernel（triton vs DLEOL FLA）+ TP comm。**这是优化前的对齐起点**——关 1.5× 比关 3× 现实。
+
+**对齐 caveats（诚实）**：① sglang `bench_one_batch`（离线直连）对 hybrid 长 prefill 有 bug（`tensor a(64) vs b(1024)` mamba 状态，direct-extend 路径），故 TPOT 用 server 路径（benchrun）；② sglang 未设 ignore_eos，random-ids 早停 ~269 tok/prompt，但 TPOT 是 per-token 延迟、与生成长度无关，仍可比；③ 模型 Qwen3.5 vs bug 的 3.6（同代，影响小）；④ sglang triton GDN vs vLLM DLEOL FLA 是**被测的优化 gap 本身**，非方法论差。
+
+**优化目标（对齐后重定）**：把 sglang TP4 TPOT 从 39ms 降到 ≤26ms（追平 vLLM）= **关 1.5×**。杠杆 = DLEOL FLA for GDN（vLLM 已用）+ TP comm 效率。聚合吞吐已 ≈ vLLM（MEAS-3 batch8 ~68 vs ~67），无需再投。
+
+---
+
+### 7.20 实现 DLEOL FLA GDN decode → 解决 JIT segfault（2026-07-10）
+
+**已实现**（opt-in `SGLANG_DL_GDN_DLIN=1`，裹 `# DL` 标记）：
+- 新 `python/sglang/srt/layers/attention/linear/kernels/gdn_dlin.py` — `DLinGDNKernel.decode` 调 `torch.ops._dl_C.dl_recurrent_gated_delta_rule`（`_dl_C.so` 已被 FP8 GEMM 的 `_ensure_dl_C` 加载，含该 op）。mirror vLLM `dl_platform_plugin`：`g,beta=fused_gdn_gating(...)` + `beta→bf16`（vLLM fused_gdn_gating 返回 bf16 beta，sglang 返回 fp32——op 按 bf16 特化）。
+- `gdn_backend.py::GDNKernelDispatcher.__init__` 加 `is_dlin() and SGLANG_DL_GDN_DLIN=1` 分支：`decode_kernel=DLinGDNKernel`，extend/verify 留 triton，`supports_packed_decode=False`。
+- 实测：dispatcher 确认 `decode=DLinGDNKernel`，op 成功运行、生成连贯文本。
+
+**segfault 根因 + 修复（关键）**：初版 op 在 `dleol::vm::CUInstExecutor::getCuFunction`（kernel JIT 加载）segfault。逐项对照 vLLM 实测 specs（instrumented `_dl_ops.py`）确认张量 layout/dtype 一致（仅 beta dtype 差，已修）。**真正根因 = SDK 版本不匹配**：sglang 默认 source `sdk-0401`（**dl24** 的 `libdleol/libdldnn`），与 vLLM **dl19** 构建的 `_dl_C.so` 不匹配 → DLEOL FLA VM JIT 崩（FP8 GEMM 容忍此 mismatch，FLA VM 不容忍）。**修复 = source 默认 `sdk/env.sh`（dl19-matching libs）而非 sdk-0401** → segfault 消失，op 跑通。
+
+**仍待验证（需 GPU，集群抢占中）**：
+1. **正确性**：DLIN op 输出 vs triton 基线逐 token 对比（初测输出 "the capital of the capital of France..." 疑模型 greedy 退化，但需 triton 基线确认非 op 数值 bug）。
+2. **TPOT 收益**：DLIN op（DLEOL FLA）下 sglang TP4 TPOT 是否从 39ms→~26ms（追平 vLLM）。需 CG on + 对齐 benchrun。
+
+**复现**（segfault 已修）：
+```
+source ../sdk/env.sh && source .venv/bin/activate   # 默认 sdk, 非 sdk-0401
+CUDA_VISIBLE_DEVICES=<4 free> SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MOE_FUSED=1 \
+  DLEOL_FLA_ENABLE_PINGPONG=1 DLEOL_FLA_UNROLL_COUNT=8 \
+  python -c "...sglang.Engine(... tp=4, fa3, chunk=16, mem0.60)..."
+```
+**结论**：DLEOL JIT segfault **已解决**（sglang 侧 SDK env 修复）；DLEOL FLA GDN decode 已接入 sglang（opt-in）。正确性 + TPOT 待 GPU 空闲后验证。
+
+---
+
+### 7.21 TPOT 39→30.6ms：GDN op + quant_type=2 双优化（2026-07-11，验证）
+
+> 接 §7.20。GPU 空闲后验证 DLEOL FLA GDN op 的 TPOT 收益 + 深挖剩余 gap。**两项 vLLM 对照优化落地，TPOT 39→30.6ms（-22%）**。
+
+**对齐口径**：batch=1, short prompt, TP=4, CG on, `../sdk`（非 sdk-0401，§7.20 segfault 修复），`SGLANG_DL_MOE_FUSED=1 FUSED_MAX_M=16`。offline `sglang.Engine`（与 §7.19 server benchrun c=1 等价，short prompt 下 prefill 可忽略）。vLLM 目标 = 26ms（§7.19 bug18025）。
+
+| 配置 | TPOT | tok/s | 改动 |
+|---|---|---|---|
+| baseline（triton GDN, q1）| 37.7ms | 26.5 | §7.19 起点附近（../sdk 略快于 sdk-0401 的 39.4）|
+| + GDN dl_recurrent op（`SGLANG_DL_GDN_DLIN=1`）| 34.7ms | 28.8 | **-3ms**：triton recurrent → `_dl_C.dl_recurrent_gated_delta_rule` |
+| + quant_type=2 dense FP8 linear（`SGLANG_DL_FP8_Q2=1`）| **30.6ms** | **32.6** | **-4ms**：per-channel requant ��� blockwise 硬件融合 dequant（vLLM 同款）|
+| **合计** | **30.6ms** | **32.6** | **-7ms（-19% vs 37.7 baseline）**；离 26ms 还差 4.6ms |
+
+**优化 1：GDN dl_recurrent op** — `SGLANG_DL_GDN_DLIN=1`（§7.20 已接入）。验证：dispatcher 确认 `decode=DLinGDNKernel`，op 跑通、CG 可捕获（66s capture 无 segfault），**输出与 triton 逐字一致**（greedy 确定性 → 两条路径同文）。TPOT 37.7→34.7（-3ms）。**但**：dl_recurrent op 本身只占 ~0.5ms（kprof 估算）；GDN 层 38% 的大头是 conv1d + gating + projections，非 recurrent。
+
+**优化 2：quant_type=2 dense FP8 linear（关键突破）** — sglang 原 `dlblas_w8a8_block_fp8_linear` 默认 quant_type=1（per-channel：load 时 dequant blockwise→requant per-channel 缓存，每步调 `gptq_dlblas_gemmex(quant_type=1)`）。vLLM 用 quant_type=2（blockwise 硬件融合 dequant，直接吃 checkpoint 权重）。**先前的 quant_type=2 尝试 SIGSEGV**，根因 = sglang 多加了 `.contiguous()`：vLLM `fp8_dlblas.apply` 传 `weight.t()`（**非连续转置 view**）+ `weight_scale` as-is + `x.view`（无 contiguous），kernel 按该 stride 硬编码。**修复 = 完全对齐 vLLM（去掉所有 .contiguous()）→ crash 消失，TPOT 34.7→30.6（-4ms）**。scale layout 两边都是 `[N/128,K/128]`（已对 vLLM `fp8_dlblas.py:345` assert 核对），非 layout 差异。`SGLANG_DL_FP8_Q2=1` opt-in；legacy q1 走 `SGLANG_DL_FP8_Q1=1`。
+
+**深挖剩余 4.6ms（profile 结论）**：
+- **100% GPU util（稳态 decode，dlsmi 连续 100%）** → compute-bound，CG 无 launch-overhead gap。gap 在 kernel 计算量，非通信 stall 或 CPU 开销。
+- **eager 逐层分解（sync-isolated）**：GDN 38% / MoE 62%（eager 下 GDN 因多小 kernel 略高估，CG 下 MoE 占比更高）。
+- **TP allreduce**：TP4 NCCL RING_LL128 ~73µs/call（4-32KB latency-bound）；~60 AR/step。**但 AR 在 CG 内捕获**（communicator.py:769 "NCCL internal stream, CG-compatible"）→ comm≈kernel time ~0.6-2ms，非主因。TP4 仍优于 TP2（39 vs 58ms，§7.19），印证 compute-bound。
+- **MoE**：sglang 与 vLLM 同用 `invoke_fused_moe_opt`。差异：sglang 硬编码 block_size `16/128/128`，vLLM 走 `try_get_optimal_moe_config`（per-shape JSON，default 64/64/32）；sglang 额外 `c2.sum(dim=1)` combine（vLLM 融在 C++ op 内）——但 batch=1 下 combine 仅 ~0.2ms，次要。
+- **GDN**：vLLM decode 用 `fused_recurrent_gated_delta_rule_packed_decode`（**triton，gating+recurrent 融合单 kernel**，DLEOL FLA JIT pingpong/unroll）；sglang DLinGDNKernel 是 **gating(`fused_gdn_gating`)+recurrent(`dl_recurrent`) 两个独立 kernel**。conv1d 两边都是 triton（parity）。⇒ **GDN gating+recurrent 融合是剩余可移植点**（估 ~1.5-3ms）。
+
+**质量（重要，非本次改动引入）**：greedy(temperature=0) 下输出退化为重复循环（"The capital of France is"→"the capital of the capital..."；"ocean"→"The ocean is the ocean..."）。**triton/q1/dl_recurrent/q2 全配置同现** → 非本次优化引入，是该推理模型 greedy 已知特性（§7.9 已记："greedy 下推理模型无论 prefill 路径都重复"）。vLLM 早期亦输出 "Paris..."（§7.2/§7.5），现 sglang greedy 退化 —— 待查是否 TP4/CG 回归或仅 greedy 不稳。**TPOT 是延迟指标、与输出内容无关，上述 -7ms 成立**；但生产需配 `repetition_penalty`/非 greedy 采样（§7.9 P4 结论）。
+
+**下一步（剩余 4.6ms → 26ms）**：① 移植 vLLM `fused_recurrent_gated_delta_rule_packed_decode`（GDN gating+recurrent 融合，最大可移植点）；② MoE block_size 调优（对齐 vLLM per-shape config）；③ 查 greedy 退化是否 TP4/CG 回归。
+
+---
+
+### 7.22 vLLM 实测 24.6ms + 质量根因定位 + 三项任务结论（2026-07-11，goal 驱动）
+
+> 修复 vLLM TP4 CG 启动 bug（缺 `if __name__=="__main__"` 守卫 → multiprocessing spawn 递归崩）后，**首次在本机实测 vLLM TP4 CG = 24.6ms（40.6 tok/s）+ 输出 "Paris"（正确）**。这是真实可达目标。sglang 30.6ms，gap 6ms。但发现 **sglang 输出首个 token 就错**（"the" vs "Paris"）→ fast-garbage，质量是阻断项。
+
+**vLLM TP4 CG 实测（本机，venv-vllm021 v0.21.0 + ../sdk + DLEOL_FLA_PINGPONG/UNROLL）**：
+- TPOT 24.6ms（40.6 tok/s），CG 可用（见 "fla gdn graph0" DLEOL FLA 编译日志）。
+- 输出 `' Paris.\nThe capital of France is Paris...'`——**首 token "Paris" 正确**，之后 greedy 循环（推理模型已知特性，§7.9）。
+- 复现：`/tmp/vllm_tp4_cg.py`（须 `if __name__=="__main__"` 守卫，否则 TP>1 spawn 崩）。
+
+**质量 bug（task #3 结论——阻断项）**：sglang **首 token 错**（"the capital of the capital..."），vLLM "Paris"。
+- **NOT CG**：TP4 eager 同样 "the capital..."（94.8ms）。
+- **NOT sdk**：sdk-0401 与 ../sdk 同样错。
+- **NOT 本次 GDN op / quant 改动**：triton GDN baseline（GDN_DLIN=0, q1）同样错。
+- **sglang q1="the capital...", q2="a majorly...", vLLM q2="Paris"**：sglang q1/q2 均与 vLLM q2 不同。q2 调用已逐字对齐 vLLM（`gptq_dlblas_gemmex(input.view, weight.t(), weight_scale, weight_scale, quant_type=2)`，无 .contiguous()）→ **差异在 weight/scale 张量值（sglang weight loader 与 vLLM 不同）或在 GDN extend/attention prefill 路径**（首 token 由 prefill 决定，非 decode GDN op）。
+- **未能完全隔离**：`SGLANG_DL_FP8_NO_DLBLAS=1`（正确 triton blockwise FP8，~40x 慢）跑不动（DLIN 上 triton FP8 GEMM 极慢，5min 未完成 prefill+3tok）。需专用排查：dump sglang vs vLLM 同层 weight/scale 张量值比对，或逐层比对 prefill hidden state。
+- **TPOT 仍是有效延迟指标**（与输出内容无关），39→30.6ms 成立；但生产需先修质量。
+
+**task #1（移植 vLLM fused GDN）结论——无需移植**：sglang `gdn_triton.py:44` `TritonGDNKernel.packed_decode` **已调用** `fused_recurrent_gated_delta_rule_packed_decode`（vLLM 同款 triton 融合 kernel）。且 sglang `_dl_C.dl_recurrent_gated_delta_rule` op（34.7ms）**已快过**该 fused triton（37.7ms）。GDN 已最优融合，非剩余 gap。
+
+**task #2（MoE block_size 对齐 vLLM）结论——sglang 已更优**：vLLM 无 per-model JSON config → 用 default 64/64/32。sglang 16/128/128。A/B（TP4 CG, GDN op + q2）：
+| BM/BN/BK | TPOT |
+|---|---|
+| 16/128/128（sglang 当前）| 30.6ms |
+| 64/64/32（vLLM default）| 32.3ms（**更差 +1.7ms**）|
+| 16/64/64 | 30.5ms（≈）|
+| 32/128/128 | 31.2ms（更差）|
+sglang 16/128/128 对 M=1 decode（memory-bound GEMV，小 BM 少 padding）已最优。对齐 vLLM 反而退化。已加 `SGLANG_DL_MOE_BM/BN/BK` env 可调。
+
+**剩余 6ms TPOT gap（30.6 vs 24.6）——已排除项**：GDN 融合（sglang 已有 + _dl_C 更快）、MoE block_size（sglang 更优）、dense FP8（quant_type=2 已对齐 vLLM 调用）、TP comm（CG 内捕获，~0.6-2ms）、CG launch overhead（100% util，无 gap）。**质量 bug 与 TPOT gap 可能同源**：若 sglang weight loader 产生次优/错误张量布局，GEMM 可能走慢路径（错+慢）。kprof 对照失败（vLLM kprof 600s timeout 只捕到 capture、kernel 名跨版本不对齐、per-kernel time blob parse 不可靠）。
+
+**下一步**：① **质量优先**——dump sglang vs vLLM 同层 FP8 weight/scale 值比对，定位 loader 差异（疑似 scale 转置或 block 重排）；或逐层比 prefill hidden state 找发散层。② 质量修好后，6ms TPOT gap 大概率随 weight 布局修正（次优→最优 GEMM 路径）一并缩小。③ 若质量修好后仍剩 gap，需可靠逐 kernel time profile（修 kprof export 版本 0.8.0 兼容，或换 dlpti_tools 版本）。
+
+**update（同日，dense FP8 排除）**：instrument vLLM `fp8_dlblas.apply`（加 DL_DEBUG_SCALE 打印）实测 vLLM dense FP8 调用：`weight=(N,K) fp8 stride(K,1)`、`weight.t()` 传入、`scale=(N/128,K/128) **torch.float32** stride(K/128,1) contig=True`、`input=bf16`。**关键：vLLM scale 是 fp32**（checkpoint 存 bf16，vLLM loader 也转 fp32——与 sglang 一致，先前以为 vLLM 保 bf16 是错的）。试 `scale.to(bf16)` → `cudaErrorNotSupported`（op 不收 bf16，确认 op 要 fp32）。∴ sglang q2 调用与 vLLM **逐字一致**（op/args/dtype/layout/values 同源 checkpoint）→ **dense FP8 GEMM 非 quality bug**。sglang q1="the capital" / q2="a majorly" / vLLM q2="Paris" 的差异在 **dense FP8 的输入（hidden state）**——即上游 **GDN extend（prefill, triton chunk_gated_delta_rule，sglang 与 vLLM 不同源实现）/ full-attn extend（fa3）/ MoE prefill** 某处产生不同 hidden state。首 token 由 prefill 决定，非 decode GDN op。**下一步收敛**：逐层 dump sglang vs vLLM prefill hidden state（layer 0 输入=embedding 相同，找首个发散层），定位是 GDN extend / attn / MoE 哪个。
+
+**update（同日，GDN extend 嫌疑锁定）**：diff sglang `python/sglang/srt/layers/attention/fla/chunk.py` vs vLLM `vllm/model_executor/layers/fla/ops/chunk.py`——**不同实现**（md5 不同，API 不同：sglang 用 `initial_state_indices`/`head_first`；vLLM 用 `chunk_indices`/`chunk_offsets`/`core_attn_out`/`FLA_CHUNK_SIZE`）。两者均为 triton `chunk_gated_delta_rule`（flashinfer 不可用→forward_native），但**不同源**。GDN extend（prefill，30 层）是首 token 发散的头号嫌疑。vLLM GDN decode 用 `fused_recurrent_gated_delta_rule_packed_decode`（triton，sglang 也有同款）；extend 用 fla chunk（**不同源**）。**修复路径**：把 vLLM 的 `fla/ops/chunk.py`（+ chunk_indices/offsets 调用适配）移植到 sglang GDN extend，或逐层 hidden state 比对确认 GDN extend 是否首个发散层。注：两 kernel 可能数值等价（仅代码组织不同）——需实测确认非红鲱鱼。
+
+**update（同日，q2 op 确认有效 + 隔离受阻）**：`CUDA_LAUNCH_BLOCKING=1` 追踪发现 `cudaErrorNotSupported`/`DL error 801` 实际在 `parallel_state.py:301 torch.ones(...,device=cuda)`（平凡张量创建）——**是 DLIN runtime 在 blocking/sync 下的伪错误**，非 q2 op 错、非 TP init 错。∴ **q2 op 有效**（CG 下跑通 30.6ms，dense FP8 与 vLLM 逐字一致）。先前 `.cpu()` dump 触发的 crash 均为此伪错误（sync 敏感性）。**隔离受阻**：任何 mid-forward `.cpu()`/`CUDA_LAUNCH_BLOCKING` 都触发此伪错误 → 无法用逐层 hidden state dump 比对 sglang vs vLLM。**结论**：q1/q2 dense FP8 均非 bug（q2 与 vLLM 一致，q1 仅精度损失）；首 token 错的根因在上游 GDN extend/conv1d/attn（prefill），需**非 sync 式隔离**：① 移植 vLLM `fla/ops/chunk.py` 到 sglang GDN extend（换 kernel 看 output 是否变 "Paris"）；或 ② 比对 forward 末尾 logits（非 mid-forward）；或 ③ 用 CUDA debugger。TPOT 30.6ms（q2+GDN op）是有效延迟，质量修好（GDN extend kernel 对齐 vLLM）后即得正确输出 + 该延迟。
+
+**update（同日，dl_chunk extend 移植尝试——未成功，opt-in 保留）**：实现 `DLinGDNKernel.extend` 用 `_dl_C.dl_chunk_gated_delta_rule`（绕过 sglang triton chunk 的 initial_state_indices 路径），`SGLANG_DL_GDN_DLIN_EXTEND=1` opt-in。state 用 gather/scatter（`ssm_states[cache_indices]` → dl_chunk → 写回，因 dl_chunk 无 state_indices arg）。**结果：crash**——int64 cu_seqlens → `cudaErrorNotSupported`；改 int32 → 转为 segfault（reentrant stderr）。dl_chunk op arg 匹配未通过（疑似 g dtype / state dtype / layout，需对照 vLLM `_dl_ops.chunk_gated_delta_rule` 的 state_dtype 与 g/beta dtype 精确匹配）。已 revert 默认 extend=triton（`SGLANG_DL_GDN_DLIN_EXTEND` 默认 "0"），dl_chunk extend 代码保留 opt-in 供后续 debug。**下一步**：对照 vLLM `gdn_linear_attn.py` 的 state_dtype（`MambaStateDtypeCalculator`）与 g/beta dtype，修正 `DLinGDNKernel.extend` 的 arg 后重试——若 output 变 "Paris" 即确认 GDN extend 是根因。
+
+---
+
+### 7.23 🎯 质量根因修复：is_neox_style 硬编码错误（2026-07-11，BREAKTHROUGH）
+
+> **质量 bug 根因已找到并修复！** sglang 硬编码 `is_neox_style=True`（NeoX rotary），但该模型是 Qwen3-VL（多模态），config 有 `rope_parameters.mrope_interleaved: True`（需要**交错 rotary** = `is_neox_style=False`）。修正后输出从重复循环变为**连贯文本**。
+
+**根因**：`python/sglang/srt/models/qwen3_5.py` 第 784 行 `get_rope(..., is_neox_style=True)` 硬编码。模型 config.json 有 `text_config.rope_parameters.mrope_interleaved = True`。交错 rotary ≠ NeoX（NeoX 对半切；交错交替配对）。sglang 用 NeoX → 10 个 full-attention 层的 rotary 应用到**错误的维度对** → attention 完全错 → 模型输出退化（重复循环）。
+
+**验证过程**（排除 10+ 组件后找到）：
+1. 排除：tokenization（一致）、gating 公式（一致）、ssm state（已清零）���dense FP8（与 vLLM 逐字一致）、RMSNorm（同为 GemmaRMSNorm）、MoE op（同款）、chunk intra（fused 和 unfused 同错→非 intra）、conv1d call（args 一致）、full-attn backend（fa3 和 triton 均错→非根因）、partial_rotary_factor（正确读 0.25）。
+2. 发现：`full_attention_interval=4`（每 4 层 1 个 full-attn）、`head_dim=256`、`rope_theta=10M`、`partial_rotary_factor=0.25`（rotary_dim=64）、`mrope_interleaved=True`、`mrope_section=[11,11,10]`。
+3. 关键：sglang `is_neox_style=True` vs config `mrope_interleaved=True`（应为 `is_neox_style=False`）。
+
+**修复**：`is_neox_style=(not getattr(config, "rope_parameters", {}).get("mrope_interleaved", False))`
+
+**实测**（TP4 CG on, GDN op + q2 + is_neox=False）：
+| 配置 | TPOT | 输出 |
+|---|---|---|
+| is_neox=True（旧, 错）| 30.6ms | "the capital of the capital..." ❌ 退化 |
+| **is_neox=False（新, 修复）** | **31.1ms** | **"a good example of the capital of France. The capital of France is..."** ✅ **连贯** |
+| vLLM TP4 CG | 24.6ms | " Paris. The capital of France is Paris..." |
+
+**合计优化效果**（从 §7.19 baseline 起）：
+- 39ms + 退化输出 → **31.1ms + 连贯输出**（-20% TPOT，质量修复）
+- 三项改动：① is_neox_style 修复（质量根因）② GDN dl_recurrent op（-3ms）③ quant_type=2（-4ms）
+- 离 vLLM 24.6ms 还差 6.5ms（latency gap，质量已修复）
+
+**为什么难找**：该模型名为 Qwen3.5（文本模型名），实际是 Qwen3-VL（多模态，mrope）。`mrope_interleaved` 标志嵌套在 `config.rope_parameters` 下。sglang 对 Qwen2/Qwen3 文本模型硬编码 `is_neox_style=True`（标准），但该 VL 变体需要交错。
+

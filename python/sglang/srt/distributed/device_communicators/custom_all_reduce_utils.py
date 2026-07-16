@@ -462,7 +462,12 @@ def can_use_custom_all_reduce_with_nvlink(
     # test nvlink first, this will filter out most of the cases
     # where custom allreduce is not supported
     # this checks hardware and driver support for NVLink
-    if world_size > 2 and not full_nvlink:
+    # DL begin — DLIN: skip the PCIe >2 GPU NVLink check. DLIN GPUs don't have
+    # NVLink but may support P2P via the DLIN CUDA-compatible runtime. The can_p2p
+    # test below (line ~477) will catch it if P2P truly doesn't work.
+    from sglang.srt.utils.common import is_dlin as _is_dlin
+    if world_size > 2 and not full_nvlink and not _is_dlin():
+    # DL end
         logger.warning(
             f"{cls_name} is disabled because it's not supported on"
             " more than two PCIe-only GPUs. To silence this warning, "
