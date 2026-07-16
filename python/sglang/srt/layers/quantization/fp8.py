@@ -1944,6 +1944,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     moe_align_block_size as _mabs,
                 )
                 _G = torch.ops._dl_C.invoke_fused_moe_opt
+                from sglang.jit_kernel.activation import silu_and_mul as _silu_and_mul
                 # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
                 # not every forward step — was 80 redundant copy kernels/step × ~0.04ms
                 # = ~3ms TPOT overhead if scales not already contiguous).
@@ -1954,21 +1955,189 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # avoids a captured CUDA kernel in CG).
                 _ti = topk_ids if (topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()) else topk_ids.to(torch.int32).contiguous()
                 _tw = topk_weights if (topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()) else topk_weights.to(torch.float32).contiguous()
-                srt, eid, npp = _mabs(_ti, _BM, num_experts)
+                # DL: only call moe_align_block_size if a GEMMEX path needs it;
+                # the use_moe_cu fused path (default) uses trivial dispatch tensors.
+                _need_mabs = _os.environ.get("SGLANG_DL_MOE_GEMMEX") is not None or _os.environ.get("SGLANG_DL_MOE_VLLM") == "1"
+                if _need_mabs:
+                    srt, eid, npp = _mabs(_ti, _BM, num_experts)
+                # DL begin — per-expert FP8 GEMM via gptq_dlblas_gemmex (SGLANG_DL_MOE_GEMMEX=1).
+                # invoke_fused_moe_opt is 97× slower than gptq_dlblas_gemmex (15.5ms vs 0.16ms for
+                # same FP8 GEMM) and produces garbage (routing bug). gptq_dlblas_gemmex is the fast
+                # FP8 GEMM used by the model's linear layers — VERIFIED correct ("Paris!") and CG-
+                # compatible (GPU-indexed gather, no .item() sync). For decode M==1 only.
+                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "1" and M == 1:
+                    _ensure_dl_C()
+                    _ti1d = _ti.reshape(-1)  # [topk] — expert ids for this token
+                    _w13_g = layer.w13_weight[_ti1d]  # [topk, 2*inter, hidden]
+                    _s13_g = layer._dl_w13s[_ti1d]    # [topk, nb, kb]
+                    _w2_g = layer.w2_weight[_ti1d]    # [topk, hidden, inter]
+                    _s2_g = layer._dl_w2s[_ti1d]      # [topk, nb, kb]
+                    out = torch.zeros(1, hidden, dtype=x.dtype, device=x.device)
+                    for k in range(topk):
+                        _c1 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                            x.view(-1, x.shape[-1]), _w13_g[k].t(),
+                            _s13_g[k], _s13_g[k], quant_type=2, bit=8)
+                        _gate, _up = _c1[:, :inter], _c1[:, inter:]
+                        _he = F.silu(_gate) * _up  # [1, inter]
+                        _c2 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                            _he.view(-1, _he.shape[-1]), _w2_g[k].t(),
+                            _s2_g[k], _s2_g[k], quant_type=2, bit=8)
+                        out += _c2 * _tw[0, k]
+                    return StandardCombineInput(hidden_states=out)
+                # DL: GEMMEX=2 — BATCHED: stack all topk experts into single GEMM calls
+                # (2 GEMMs per layer instead of 16 → 80 launches instead of 640)
+                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "2" and M == 1:
+                    _ensure_dl_C()
+                    _ti1d = _ti.reshape(-1)  # [topk]
+                    _w13_cat = layer.w13_weight[_ti1d].reshape(
+                        topk * 2 * inter, hidden).contiguous()
+                    _s13_cat = layer._dl_w13s[_ti1d].reshape(
+                        topk * (2 * inter // 128), hidden // 128).contiguous()
+                    _c1 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        x.view(-1, x.shape[-1]), _w13_cat.t(),
+                        _s13_cat, _s13_cat, quant_type=2, bit=8)
+                    _c1 = _c1.view(topk, 2 * inter)
+                    _gate, _up = _c1[:, :inter], _c1[:, inter:]
+                    _he = (F.silu(_gate) * _up).contiguous()
+                    _w2_cat = layer.w2_weight[_ti1d].reshape(
+                        topk * hidden, inter).contiguous()
+                    _s2_cat = layer._dl_w2s[_ti1d].reshape(
+                        topk * (hidden // 128), inter // 128).contiguous()
+                    _he_flat = _he.reshape(1, topk * inter).contiguous()
+                    _c2 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        _he_flat.view(-1, _he_flat.shape[-1]), _w2_cat.t(),
+                        _s2_cat, _s2_cat, quant_type=2, bit=8)
+                    _c2 = _c2.view(topk, hidden).contiguous()
+                    out = (_c2 * _tw[0:1].t().to(x.dtype)).sum(dim=0, keepdim=True).contiguous()
+                    return StandardCombineInput(hidden_states=out)
+                # DL: GEMMEX=3 — HYBRID: batched w1 (shared input → correct) + per-expert w2
+                # (different hidden per expert → MUST loop). 9 GEMMs/layer (1+8) vs 16 (GEMMEX=1).
+                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "3" and M == 1:
+                    _ensure_dl_C()
+                    _ti1d = _ti.reshape(-1)  # [topk]
+                    # w1 batched: stack [topk, 2*inter, hidden] → [topk*2*inter, hidden]
+                    _w13_cat = layer.w13_weight[_ti1d].reshape(
+                        topk * 2 * inter, hidden)
+                    _s13_cat = layer._dl_w13s[_ti1d].reshape(
+                        topk * (2 * inter // 128), hidden // 128)
+                    _c1 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        x.view(-1, x.shape[-1]), _w13_cat.t(),
+                        _s13_cat, _s13_cat, quant_type=2, bit=8)
+                    _c1 = _c1.view(topk, 2 * inter)
+                    _gate, _up = _c1[:, :inter], _c1[:, inter:]
+                    _he = F.silu(_gate) * _up  # [topk, inter]
+                    # w2 per-expert (CORRECT — each expert's hidden is different)
+                    _w2_g = layer.w2_weight[_ti1d]  # [topk, hidden, inter]
+                    _s2_g = layer._dl_w2s[_ti1d]    # [topk, nb, kb]
+                    out = torch.zeros(1, hidden, dtype=x.dtype, device=x.device)
+                    for k in range(topk):
+                        _c2 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                            _he[k:k + 1].view(-1, _he.shape[-1]), _w2_g[k].t(),
+                            _s2_g[k], _s2_g[k], quant_type=2, bit=8)
+                        out += _c2 * _tw[0, k]
+                    return StandardCombineInput(hidden_states=out)
+                # DL end (per-expert gemmex)
+                # DL begin — vLLM-exact MoE decode (SGLANG_DL_MOE_VLLM=1):
+                # replicate vLLM's dl_fused_moe fused_experts_impl decode path
+                # EXACTLY: invoke_fused_moe_opt over the FULL expert weight tensor
+                # (no Python-side gather) with use_moe_cu (trivial sorted_token_ids,
+                # skipping moe_align_block_size) + vLLM's DLIN KS38 decode block
+                # sizes (BM=32/BN=64/BK=32 from get_default_config). vLLM hits
+                # ~0.1ms/GEMM this way (8.64ms MoE / 40 layers). sglang's GEMMEX=2
+                # workaround gathers weights in Python (extra copies) because the
+                # pre-DLEOL_CACHE_SIZE=1024 era measured invoke_fused_moe_opt as
+                # 97× slower — that was JIT-cache thrash, now fixed. This path
+                # tests whether matching vLLM exactly is now both correct & fast.
+                # Block sizes overridable: SGLANG_DL_MOE_VLLM_BM/BN/BK.
+                if _os.environ.get("SGLANG_DL_MOE_VLLM") == "1" and M == 1:
+                    _VBM = int(_os.environ.get("SGLANG_DL_MOE_VLLM_BM", "32"))
+                    _VBN = int(_os.environ.get("SGLANG_DL_MOE_VLLM_BN", "64"))
+                    _VBK = int(_os.environ.get("SGLANG_DL_MOE_VLLM_BK", "32"))
+                    # use_moe_cu: trivial dispatch tensors. DL: the op reads
+                    # sorted_token_ids/expert_ids/npp BEYOND [0] (OOB). A bare size-1
+                    # tensor in sglang's allocator sits at a pool boundary → OOB read
+                    # hits unmapped memory → Device page fault. vLLM's size-1 happens to
+                    # have slack. FIX: back the size-1 tensor by a LARGE buffer (view) so
+                    # OOB reads land in valid zeroed memory. Op still sees size-1 (cu mode).
+                    if not hasattr(layer, "_dl_vllm_srt"):
+                        _PAD = int(_os.environ.get("SGLANG_DL_MOE_VLLM_PAD", "4096"))
+                        layer._dl_vllm_srt = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                        layer._dl_vllm_eid = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                        layer._dl_vllm_npp = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                    _vsrt = layer._dl_vllm_srt
+                    _veid = layer._dl_vllm_eid
+                    _vnpp = layer._dl_vllm_npp
+                    # DL: one-shot dump of sglang's tensor props to compare vs vLLM
+                    # [DL_VDUMP] wdump (w1=(256,512,2048) stride=(1048576,2048,1) etc).
+                    # A stride/contiguity mismatch on weights/scales could cause the op
+                    # to read OOB → Device page fault. See docs/dl §7.44.
+                    if not hasattr(layer, "_dl_vdump"):
+                        layer._dl_vdump = True
+                        _dv = lambda t, n: print(f"[DL_SG_VDUMP] {n} shape={tuple(t.shape)} dtype={t.dtype} contig={t.is_contiguous()} stride={tuple(t.stride())}", flush=True)
+                        _dv(layer.w13_weight, "w13"); _dv(layer._dl_w13s, "w13s")
+                        _dv(layer.w2_weight, "w2"); _dv(layer._dl_w2s, "w2s")
+                        _dv(x, "x"); _dv(_ti, "topk_ids"); _dv(_tw, "topk_weights")
+                        print(f"[DL_SG_VDUMP] M={M} topk={topk} num_experts={num_experts} BM={_VBM} BN={_VBN} BK={_VBK}", flush=True)
+                    # DL: call vLLM's DL plugin fused_experts DIRECTLY — uses the
+                    # EXACT same code path as vLLM (custom op wrapping, dispatch,
+                    # act-quant, use_moe_cu). sglang's manual invoke_fused_moe_opt
+                    # call skips the custom op context → crash. vLLM's path works.
+                    # See docs/dl §7.51.
+                    import sys as _dl_sys
+                    _vllm_lib = _os.path.join(
+                        _os.path.dirname(_os.path.dirname(_os.path.dirname(
+                            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+                        ))), "venv-vllm021", "lib", "python3.12", "site-packages"
+                    )
+                    if _vllm_lib not in _dl_sys.path:
+                        _dl_sys.path.insert(0, _vllm_lib)
+                    from vllm.plugins.dl_platform_plugin.ops.dl_fused_moe import (
+                        fused_experts as _dl_fe,
+                    )
+                    from vllm.model_executor.layers.fused_moe.config import (
+                        fp8_w8a8_moe_quant_config as _dl_qc,
+                    )
+                    _qc = _dl_qc(
+                        w1_scale=layer._dl_w13s,
+                        w2_scale=layer._dl_w2s,
+                        block_shape=[128, 128],
+                    )
+                    out = _dl_fe(
+                        hidden_states=x,
+                        w1=layer.w13_weight,
+                        w2=layer.w2_weight,
+                        topk_weights=_tw,
+                        topk_ids=_ti,
+                        quant_config=_qc,
+                    )
+                    return StandardCombineInput(hidden_states=out)
+                # DL end (vLLM-exact MoE)
+                # DL begin — use_moe_cu: trivial dispatch tensors, skip moe_align_block_size
                 c13 = torch.empty(M, topk, 2 * inter, dtype=x.dtype, device=x.device)
+                if not hasattr(layer, "_dl_moecu_srt"):
+                    _PAD = 4096
+                    layer._dl_moecu_srt = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                    layer._dl_moecu_eid = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                    layer._dl_moecu_npp = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                _srt = layer._dl_moecu_srt
+                _eid = layer._dl_moecu_eid
+                _npp = layer._dl_moecu_npp
                 _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
                    _tw, _ti,
-                   srt, eid, npp, False, topk, _BM, _BN, _BK,
+                   _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
                    True, False, False, False, [128, 128], M)
-                gate, up = c13[:, :, :inter], c13[:, :, inter:]
-                he = F.silu(gate) * up  # [M, topk, inter]
-                c2 = torch.empty(M, topk, hidden, dtype=x.dtype, device=x.device)
-                _G(he, layer.w2_weight, c2, None, layer._dl_w2s, None,
-                   _tw, _ti,
-                   srt, eid, npp, True, topk, _BM, _BN, _BK,
-                   True, False, False, False, [128, 128], M)
-                out = c2.sum(dim=1)  # mul_routed_weight applied; sum over topk → [M, hidden]
+                he = _silu_and_mul(c13.reshape(-1, 2 * inter)).reshape(M, topk, inter)
+                _M2 = M * topk
+                _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
+                _tw_w2 = _tw.reshape(-1, 1)  # [M*topk, 1]
+                c2 = torch.empty(_M2, 1, hidden, dtype=x.dtype, device=x.device)
+                _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
+                   _tw_w2, _ti_w2.to(torch.int32),
+                   _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
+                   True, False, False, False, [128, 128], _M2)
+                out = c2.reshape(M, topk, hidden).sum(dim=1)
                 return StandardCombineInput(hidden_states=out)
+                # DL end (use_moe_cu)
             # DL end (fused MoE)
 
             # DL begin — bf16 dequant+bmm MoE (handles BOTH decode M==1 and prefill M>1)

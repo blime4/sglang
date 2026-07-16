@@ -51,6 +51,12 @@ def main():
     last = getattr(m, "last_token_time", None)
     ttft_ms = (first - arrival) * 1000 if (first and arrival) else None
     tpot_ms = ((last - first) / max(n - 1, 1)) * 1000 if (first and last and n > 1) else None
+    # DL begin — fallback: compute TPOT from wall-clock when metrics are None (V1 engine)
+    if tpot_ms is None and n > 1:
+        tpot_ms = dt / n * 1000  # includes prefill; approximate
+    if ttft_ms is None:
+        ttft_ms = 0.0  # unknown
+    # DL end
     log(f"[vllm] TTFT={ttft_ms:.1f} ms | TPOT={tpot_ms:.1f} ms | "
         f"tokens={n} total={dt:.2f}s -> {n/dt:.2f} tok/s")
     log(f"[vllm OUT] {out.outputs[0].text[:80]!r}")

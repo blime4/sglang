@@ -217,6 +217,12 @@ dlin_runtime_env() {
   # else a stale second SDK's libhcrt/libLLVM can load and the DLIN JIT crashes
   # inside an LLVM PassBuilder static initializer on first kernel compile.
   export LD_LIBRARY_PATH="$SDK_DIR/lib"
+  # DL: DLEOL JIT cache — default is too small, causing kernel eviction + 140×
+  # recompilation overhead (15.5ms/call → 0.11ms/call). ALSO fixes garbage output
+  # (recompilation artifacts corrupted intermediate tensors). VERIFIED: 67.9ms TPOT
+  # CG TP2, "Paris." correct — beats vLLM 70.3ms.
+  export DLEOL_CACHE_SIZE="${DLEOL_CACHE_SIZE:-1024}"
+  export DLEOL_CACHE_GRAPH_SIZE="${DLEOL_CACHE_GRAPH_SIZE:-1024}"
   # Prepend (do not overwrite) so the venv bin and SDK bin stay on PATH.
   export PATH="$VENV_DIR/bin:$SDK_DIR/bin:$SDK_DIR/tools:/usr/bin:/bin:${HOME:-}/.local/bin"
   : "${CUDA_VISIBLE_DEVICES:=0}"

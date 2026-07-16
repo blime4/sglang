@@ -37,6 +37,16 @@ from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+# DL begin — override module-level FA import with DLIN FA2 wrapper.
+# The __init__ stores dl_flash_attn on self, but forward_decode uses the bare
+# module-level name. Patch here so all call sites get the DLIN version.
+from sglang.srt.utils.common import is_dlin as _is_dlin_check
+if _is_dlin_check():
+    from sglang.srt.layers.attention.dl_flash_attn import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
+# DL end
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 
 
@@ -1314,7 +1324,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)  # DL: .reshape() for CG-compat (non-contiguous SDPA out)
 
     def forward_decode(
         self,
@@ -1612,7 +1622,7 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)  # DL: .reshape() for CG-compat (non-contiguous SDPA out)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
