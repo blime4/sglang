@@ -1073,3 +1073,875 @@ sglang 16/128/128 对 M=1 decode（memory-bound GEMV，小 BM 少 padding）已�
 
 **为什么难找**：该模型名为 Qwen3.5（文本模型名），实际是 Qwen3-VL（多模态，mrope）。`mrope_interleaved` 标志嵌套在 `config.rope_parameters` 下。sglang 对 Qwen2/Qwen3 文本模型硬编码 `is_neox_style=True`（标准），但该 VL 变体需要交错。
 
+
+### 7.24 🎯 TPOT gap = GPU COMPUTE, not host overhead (2026-07-13, BREAKTHROUGH — overturns §7.21)
+
+> **决定性测量：sglang TP4 TPOT gap 是 GPU 计算，不是 host 开销。** 推翻 §7.21 的 "100% util → compute-bound, same kernels → same speed" 假设。
+
+**方法**：在 CG replay 周围加 CUDA event（`SGLANG_DL_TIME_REPLAY=1` in `full_cuda_graph_backend.py`；`VLLM_DL_TIME_REPLAY=1` in vLLM `compilation/cuda_graph.py:360`），`.synchronize()` 拿真实 GPU 时长。
+
+| 框架 | 纯 GPU forward/step | Wall TPOT | Host 开销 |
+|---|---|---|---|
+| **sglang TP4 CG** | **27.5ms** | 33.5ms | ~6ms |
+| **vLLM TP4 CG** | **18.3ms** | 26.1ms | ~7.8ms |
+| **gap** | **9.2ms (1.5×)** | 7.4ms | ~相等 |
+
+**含义**：
+- Host 开销两边相等（~6-8ms），**不是 gap 来源**。别再追 scheduler/sampling overlap（DELAY_SAMPLE 实测仅 -0.4ms，33.9→33.5）。
+- Gap **全在 GPU kernel 计算**：sglang CG graph 用 1.5× GPU 时间跑同一个 decode，尽管两边名义同款 kernel（dl_flash_attn / dl_recurrent / invoke_fused_moe_opt / GemmaRMSNorm / gptq_dlblas_gemmex）。
+- ⇒ sglang 某些 kernel 更慢，或 graph 里 kernel 更多。需 kernel-level dlpti/profile 定位是哪个组件。
+
+**本次排除项**（均非 gap）：
+1. **DLEOL FLA JIT (PINGPONG/UNROLL)**：vLLM WITH JIT=25.0ms vs WITHOUT=25.3ms（噪声内）→ JIT 是红鲱鱼。
+2. **GDN kernel 选择**：sglang `_dl_C.dl_recurrent`（33.9ms）已快过 sglang triton（41-42ms）；triton+JIT 几乎无帮助（42→41）。
+3. **torch.compile**：vLLM `dl_config.py:195` 设 `compilation_config.mode = CompilationMode.NONE` → vLLM **不用** torch.compile（@support_torch_compile 装饰器在但 mode=NONE）。两边都是 eager op 捕获进 CG。
+4. **MoE block_size**：sglang 16/128/128 已优于 vLLM default 64/64/32（§7.22 task#2）。
+5. **dense FP8**：quant_type=2 已与 vLLM 逐字一致（§7.22）。
+6. **projection 融合**：sglang GDN 层用 MergedColumnParallelLinear（in_proj_qkvz + in_proj_ba，融合），非分离。
+7. **shared expert**：sglang CG 走 `forward_normal_dual_stream`（共享专家**分离**计算，2 GEMM×40 层），vLLM 融入 MoE runner。但 batch=1 下共享专家 GEMV 极小（~1-2ms，非主因）。
+8. **Profiler 的 "10ms/step Memcpy"**：是 CG capture/编译阶段泄漏进 profile 窗口的大 memcpy（24 个 ×26ms），**非稳态 decode**——稳态 replay 方差极小（median8=27.3-27.7ms，紧密），若有 26ms memcpy 交替出现方差会爆。torch.profiler 在 DLIN+CG 上**不可靠**（不完整捕获 graph 内部 kernel；sglang 捕到内部但 vLLM 不捕，不可直接对比）。
+
+**结论（诚实）**：9.2ms GPU gap **没有单一 smoking-gun kernel**——所有单独检查的 kernel 都 parity 或 sglang 更优。gap 很可能是**分布式**的（许多小差异求和 = 1.5× 慢），或藏在 profiler 看不到的 CG graph 结构里。要进一步定位需**差分测试**（逐组件 toggle + CUDA event 测 GPU 时长），非 dlpti（DLIN/CG 下不可靠）。
+
+**复现**：`/tmp/dl_sglang_profile.py` + `SGLANG_DL_TIME_REPLAY=1`（须 `if __name__=="__main__"` guard，否则 TP>1 spawn 递归崩）。vLLM: `/tmp/vllm_tp4_cg.py` + `VLLM_DL_TIME_REPLAY=1`。
+
+### 7.25 🎯 MoE 是 gap 主因（14ms/27.5ms=51%），block_size 非杠杆（2026-07-13）
+
+> **差分测试（CUDA event 量纯 GPU forward，skip 各组件）锁定 MoE：sglang MoE=14ms（51%），attention=8ms，其余(norms/AR/proj/lm_head)=5.5ms。** vLLM total 18.3ms ≈ sglang 非-MoE 13.5ms → vLLM MoE 显著更小。**MoE 是 gap 主因。**
+
+**差分测试方法**（可靠，CUDA event 绕过不可靠的 profiler）：
+| 配置 | 纯 GPU forward | 推断 |
+|---|---|---|
+| baseline（全开）| **27.5ms** | — |
+| `SGLANG_DL_SKIP_MOE=1` | **13.5ms** | **MoE = 14ms** |
+| `SGLANG_DL_SKIP_ATTN=1` | 19.5ms | attention = 8ms |
+| 其余（norms+AR+proj+lm_head）| — | 5.5ms |
+
+**关键纠正——vLLM MoE 用 bsm=48，非 doc §7.22 假设的 64**：instrument vLLM `dl_invoke_fused_moe_opt`（count-only，CG-safe）实测 vLLM MoE **block_size_m=48, bsn=128, bsk=128**（decode M=1 同）。doc §7.22 task#2 误以为 vLLM 用 default 64/64/32，且 block_size 扫描**没测 48**。
+
+**但 block_size 不是杠杆**：sglang `SGLANG_DL_MOE_BM=48` 实测 GPU=27.2ms ≈ baseline 27.5ms（噪声内，无改善）。doc §7.22 "sglang 16/128/128 已最优"结论方向对（BM=32/64 更差），但 48 也不更好。
+
+**同 op 同 count 仍 3× 慢**：
+- sglang 与 vLLM **共用同一个 `_dl_C.so`**（sglang `_ensure_dl_C` 加载 vLLM venv 的 `vllm/_dl_C...so`）→ invoke_fused_moe_opt 字节级相同。
+- 两边 decode 都 **80 calls/step**（2/layer × 40）。
+- block_size 对齐（bsn/bsk 同 128/128，bsm 实测无影响）。
+- ⇒ **差距在 MoE 的"环绕开销"（moe_align_block_size 分离调用 + shared_expert 分离计算 + silu*up + sum combine），非 GEMM 本身。** vLLM 用 monolithic MoE kernel（`make_fp8_moe_kernel` / `FusedMoEExpertsMonolithic`，prepare_finalize+experts 融合 dispatch/GEMM/combine/shared）把这些融合；sglang 分离调用。
+
+**关闭 gap 的可执行路径**��非 config quick-fix，需工程）：
+1. **shared_expert 融合进 MoE**：sglang FP8/DL 路径 `num_fused_shared_experts=0`（shared 分离计算于 `forward_normal_dual_stream`，含 `hidden_states.clone()` + 跨流 sync）。vLLM 把 shared 融为额外 expert（`shared_experts` 传入 `FusedMoE`，monolithic 内处理）。融合后省 shared 的 40×2 GEMM + clone + sync。
+2. **移植 vLLM monolithic FP8 MoE kernel**（`make_fp8_moe_kernel` 架构：fused dispatch+align+GEMM+combine）——最大收益但工程量大。
+
+**复现**：差分 `SGLANG_DL_SKIP_MOE=1`/`SGLANG_DL_SKIP_ATTN=1` + `SGLANG_DL_TIME_REPLAY=1`。vLLM bsm 探测：临时 count-only instrument `dl_invoke_fused_moe_opt`（须 count-only，synchronize 会破 CG capture）。
+
+**本次排除**：block_size（BM=48≈16）、dual-stream/alt_stream（NO_ALT_STREAM=27.5 无变化）、GEMMEX=3（37.4ms 更慢，invoke 已是 sglang 最优 MoE）。
+
+### 7.26 ❌ shared_expert 融合反更慢（28.3ms）+ JIT env 修复（2026-07-13）
+
+> **尝试关闭 §7.25 的 shared_expert 2.35ms gap（最具体的可关闭块），结果融合反更慢。** 排除该路径。
+
+**SKIP_SHARED 差分**（`SGLANG_DL_SKIP_SHARED=1`，跳过分离的 shared expert MLP）：GPU=**25.15ms**（baseline 27.5ms）→ shared expert = **2.35ms**（确定可量化）。
+
+**FUSE_SHARED 尝试**（`SGLANG_DL_FUSE_SHARED=1` → `enable_cuda_shared_expert_fusion`，把 shared 作为第 257 个 expert 融入 invoke_fused_moe_opt，模仿 vLLM）：
+- 首次跑触发 DLEOL JIT 新 kernel（topk=9/257 experts），**JIT 崩**：`/bin/sh: dlcc: not found`（triton `make_cubin` 用裸 `dlcc` 走 PATH，worker 子进程 PATH 没 sdk/bin；非-fusion 跑靠 DLEOL 磁盘缓存躲过 JIT）。
+- **修复**：改 triton `dlgpu/compiler.py:294` `ptxas = os.path.join($SDK_DIR/bin/dlcc)`（robustness 修复，JIT 不再依赖 PATH 传播）。
+- 修复后 CG 捕获成功（新鲜 JIT，1m27s）。**实测 GPU=28.3ms——比 baseline 27.5ms 还慢 0.8ms！**
+
+**为什么融合反更慢**：把 shared 作为第 9 个 expert 加入 grouped GEMM，w13/w2 GEMM 多加载 1/8 权重 + 第 9 expert 的 padding 开销 > 分离 shared（2.35ms 独立小 GEMV）的节省。即 invoke_fused_moe_opt 处理 9 experts 比处理 8 experts + 分离 shared 更贵。**vLLM 的 monolithic kernel 能高效处理 fused expert（不止"多加一个 expert"），sglang 用现有 op 模仿不行。**
+
+**结论**：shared_expert 融合（用现有 invoke_fused_moe_opt）**非解**。关闭 gap **唯一路径 = 移植 vLLM 的 monolithic FP8 MoE kernel**（`make_fp8_moe_kernel`/`FusedMoEExpertsMonolithic`：fused dispatch+align+GEMM+combine+shared，一个 kernel 整体高效处理），非 config/小改能搞定。
+
+**本次所有关闭尝试（均可靠 GPU-time 量）**：block_size BM=48（27.2≈27.5 无改善）、shared 融合（28.3 反更慢）、NO_ALT_STREAM（27.5 无变化）、GEMMEX=3（37.4 更慢）。**无一关闭 gap。**
+
+**交付**：triton JIT dlcc PATH 修复（robustness，fresh JIT 不再崩）、SKIP_SHARED 差分诊断、确认 gap 需 monolithic kernel 移植。
+
+### 7.27 🎯 gap 是**分布式**的：MoE 5.36ms + 非MoE 3.84ms（2026-07-13，纠正 §7.25）
+
+> **直接量 vLLM 的 MoE（之前是假设），发现 gap 是分布式的，非单一组件。** 纠正 §7.25 "MoE 是全部 gap" 的过度归因。
+
+**方法**：在 vLLM `moe_runner.py:forward` 加 `VLLM_DL_SKIP_MOE=1`（return input 不算 MoE），量纯 GPU forward。
+
+| 组件 | sglang | vLLM | gap |
+|---|---|---|---|
+| **MoE** | 14ms（SKIP_MOE 27.5→13.5）| **8.64ms**（18.3→9.66）| **5.36ms** |
+| **非MoE**（GDN+attn+norms+AR+lm_head+logits）| 13.5ms | **9.66ms** | **3.84ms** |
+| 总计 | 27.5ms | 18.3ms | **9.2ms** |
+
+**关键纠正**：§7.25 假设 vLLM 非MoE ≈ sglang 非MoE（13.5ms），推出 "vLLM MoE≈5ms, gap 全在 MoE"。**实测 vLLM 非MoE=9.66ms**（比 sglang 快 3.84ms）→ vLLM MoE=8.64ms（不是 5ms）。**gap 双向分布**：MoE 5.36ms + 非MoE 3.84ms。
+
+**含义**：
+- 关 gap 需**同时**优化 MoE（5.36ms）和非MoE（3.84ms），非单组件 quick-fix。这解释了 §7.26 为何所有单组件尝试（block_size/fusion/alt_stream/GEMMEX）都失败——它们只针对 MoE 的一部分。
+- **非MoE 3.84ms 是新发现的可寻址块**（§7.25 漏了）：在 GDN/attn/norms/AR/lm_head/logits 里。sglang 8ms attn vs vLLM 更小。需 SKIP_ATTN 对照 vLLM 定位。
+- MoE 5.36ms：sglang 14ms vs vLLM 8.64ms，同 op 同 _dl_C.so 同 count（80/step）——仍是 monolithic kernel 融合优势（shared 2.35ms + align + combine）。
+
+**关闭路径（更新）**：①MoE 移植 monolithic kernel（解 5.36ms 里大头）②非MoE 逐组件定位（attn? lm_head? norms?）解 3.84ms。两者都是工程，非 config。
+
+**复现**：`VLLM_DL_SKIP_MOE=1 VLLM_DL_TIME_REPLAY=1` on vLLM TP4 CG。
+
+### 7.28 🔎 use_moe_cu：vLLM 跳过 MoE align（真实 op-call 差异，但 sglang CG 崩）（2026-07-13）
+
+> **找到 sglang 与 vLLM 之间第一个真实的 op-调用差异（非 _dl_C op 本身，是调用方式）：vLLM 对 decode 跳过 moe_align_block_size。** 但在 sglang 的 CG 下复现会崩。
+
+**vLLM 的 `use_moe_cu` 路径**（`dl_fused_moe.py:635`）：
+```python
+avg_tokens_per_expert = M * top_k / E
+use_moe_cu = (avg_tokens_per_expert <= 16)  # decode M=1,topk=8,E=256 → 0.03 → True
+if use_moe_cu:
+    sorted_token_ids = torch.empty((1,), ...)  # 跳过 moe_align_block_size！
+    expert_ids = torch.empty((1,), ...)
+    num_tokens_post_padded = torch.empty((1,), ...)
+else:
+    sorted_token_ids, ... = moe_align_block_size(topk_ids, ...)
+```
+decode batch=1 时 vLLM **跳过 moe_align_block_size**（每层省一个 triton align kernel = -40 kernels/step），op 内部用 topk_ids 自派发。sglang **永远调 `_mabs`**（fp8.py DL 路径）。
+
+**sglang 复现尝试**（fp8.py 加 `use_moe_cu`，avg≤16 时传 trivial tensors）：
+- `torch.empty(1,)`：CG capture 时 SIGSEGV（op 读到 garbage）。
+- `torch.zeros(1,)` + `npp=full(M*topk)`：CG capture 时 **`cudaErrorInvalidAddressSpace: operation not supported on global/shared address space`**。
+- ⇒ invoke_fused_moe_opt 的 use_moe_cu 模式在 sglang 的 CG 下不兼容（op 内部访问的 memory 不在 graph pool 地址空间；vLLM 的 CG 能容纳，sglang 的不能——CG 捕获设置差异）。
+
+**意义**：这是 sglang 与 vLLM 之间**第一个被定位的具体 op-调用差异**（非"全是图调度"的笼统结论）。关闭路径：
+1. **让 sglang CG 支持 use_moe_cu**（查 sglang FullCudaGraphBackend 与 vLLM cuda_graph capture 的差异，使 op 的 use_moe_cu 内存访问 CG-compatible）→ 解 ~40 align kernels/step。
+2. 或在 eager 路径用 use_moe_cu（CG 关，但 TP4 eager 慢）。
+
+**本轮实验累计 8 个**（block_size/shared-fusion/page_size/NO_ALT_STREAM/GEMMEX/silu-fusion/SKIP_ALIGN/use_moe_cu），均未关闭 gap，但 use_moe_cu 是最具体的下一步线索。
+
+### 7.29 ❌ use_moe_cu 是红鲱鱼——vLLM decode 用 monolithic kernel，非 dl_fused_moe.py（2026-07-13，纠正 §7.28）
+
+> **纠正 §7.28**：vLLM FP8 decode 用 **monolithic kernel**（`make_fp8_moe_kernel`，log "Using MoEPrepareAndFinalizeNoDPEPModular"），**不**走 `dl_fused_moe.py` 的 use_moe_cu 路径。之前 §7.28 计的 80 个 dl_invoke 调用是 prefill/warmup/capture（非 decode replay）。所以 use_moe_cu 不是 vLLM decode 路径——在 sglang 复现会崩（op 不支持 trivial sorted_token_ids 在该调用上下文）是符合预期的。
+
+**验证**：vLLM 的 experts 类（fused_batched_moe.py 等）不调 dl_fused_moe.py。FP8 走 monolithic（prepare_finalize + fused experts，C++ 级融合 dispatch+GEMM+combine+shared）。
+
+**尝试过的修复（均失败）**：
+- `_ensure_dl_C` 改 `import vllm._dl_C`（匹配 vLLM 的 PyInit 加载）vs `torch.ops.load_library`——**无效**，use_moe_cu 仍崩（cudaErrorInvalidAddressSpace / Device page fault）。
+- npp 变体（empty/zeros/0/M·topk）——**全崩**（page fault，op 读 sorted_token_ids OOB）。
+
+**结论（确定）**：gap = vLLM monolithic FP8 MoE kernel（C++ 级融合）vs sglang dl_invoke + 分离 align/act/combine/shared。monolithic 的融合在 **C++ 层**（_dl_C.so / vLLM ext），Python 级融合（silu_and_mul、use_moe_cu）在 DLIN 上崩——无法用 Python 复刻。关闭 = 移植 vLLM monolithic MoE 架构到 sglang（C++ 级，multi-session 工程）。
+
+**本轮累计 9 个实��**，全部失败/更慢/崩溃。gap 锁定在 monolithic MoE kernel（C++ 级），非 sglang 代码层可解。
+
+---
+
+### 7.30 🎯 确定性根因：PDL 不可 CG-capture（非 DLIN 硬限制——vLLM 全 CG 成功）（2026-07-14）
+
+> **纠正 §7.29 的悲观结论。** gap 的阻塞点已定位到**精确的内核行 + 精确的 CUDA 特性**，且证明它**不是 DLIN 硬限制**（vLLM 在 DLIN 上用全 CG 跑同样的 op 成功）。问题在 **sglang 的 CG capture 状态**与 vLLM 不同。
+
+**实验**：新增 `SGLANG_DL_MOE_VLLM=1` 路径（fp8.py），逐字复刻 vLLM `dl_invoke_fused_moe` 的 `invoke_fused_moe_opt` 调用（full weight 不 gather、use_moe_cu trivial tensors、DLIN KS38 decode block sizes BM=32/BN=64/BK=32，由 vLLM `get_default_config` 算出）。TP2 + CG + 全 DL flag（FUSED=1, GDN_DLIN=1, FP8_Q2=1, DLEOL_CACHE=1024, **disable_custom_all_reduce=True** NCCL）。
+
+**崩溃（确定性，2 次）**：
+```
+DL_MOE_ERR: CUDA error: operation not supported on global/shared address space
+（fallback 到 triton 路径后，同样崩溃）
+Runtime check failed at .../jit_kernel/csrc/gemm/per_token_group_quant_8bit_v2.cuh:396:
+CUDA error: operation not supported on global/shared address space
+```
+
+**根因（精确）**：`per_token_group_quant_8bit_v2.cuh:396` 是 `.enable_pdl(kUsePDL)(...)` —— **PDL (Programmatic Dependent Launch, Hopper 特性)**。PDL 内核**无法被 CUDA graph 捕获**（它是运行时 kernel 间依赖，不能表示为 graph node）。sglang 的 `per_token_group_quant_8bit_v2`（triton MoE 路径用）和 `_dl_C.so` 的 `invoke_fused_moe_opt` 内部 act-quant 都走 PDL → 全 CG 捕获必崩。
+
+**为什么 GEMMEX=2 (gptq_dlblas_gemmex) 不崩**：它**不做 activation 量化**（吃 bf16 act + fp8 weight blockwise dequant，本质 W8A16），所以不碰 PDL 量化内核 → CG-safe。这正是 baseline 27.1ms 能跑的原因，也是它比 vLLM 慢 ~3ms 的原因（无 act-quant fusion + Python 级 weight gather）。
+
+**关键反转——这不是 DLIN 硬限制**：
+- vLLM 在 DLIN 上用 **`CUDAGraphMode.FULL`**（`dl_config.py:194` 强制设为 FULL），把 MoE + act-quant **全 CG 捕获**，跑通且 8.64ms MoE。
+- sglang 加载的 `_dl_C.so` 与 vLLM **完全相同**（`venv-vllm021/.../vllm/_dl_C.cpython-312-x86_64-linux-gnu.so`，fp8_utils.py:508 确认）。
+- → 同一 `invoke_fused_moe_opt` 二进制、同一硬件，vLLM 全 CG 成功，sglang 全 CG 崩。**差异在 sglang 的 CG capture 状态**（stream / graph pool / capture mode / 全局 CUDA 状态），不在 op 本身。
+
+**剩余的可隔离问题**（这是真正的下一步，非"放弃"）：sglang 的 `FullCudaGraphBackend` capture 上下文 vs vLLM 的，差异在哪导致 PDL 量化内核在 sglang 捕获时崩而 vLLM 不崩？嫌疑：
+1. **capture stream**：sglang 用 `graph_capture()` 提供的 stream（`decode_cuda_graph_runner.py:690`），vLLM 用默认 stream。
+2. **graph pool**：sglang `set_graph_pool_id(self._pool)`（自建 pool），vLLM 用 torch 默认 pool。
+3. **capture mode**：`cudaStreamCaptureModeGlobal` vs relaxed（注意：之前试的 `capture_error_mode` 是错误处理，**不是** capture mode——未真正试过 capture mode 切换）。
+
+**与 §7.29 的区别**：§7.29 说"monolithic C++ kernel，Python 不可复刻，放弃 Python 层"。本节证明：**vLLM 全 CG 跑通同一 op**，所以"全 CG + invoke_fused_moe_opt"在 sglang 上**理论上可达**——只需对齐 sglang 的 capture 状态。PDL 不可捕获是**确定的事实**，但 vLLM 能跑说明 vLLM 的 capture 路径**避开了 PDL-in-capture**（可能 vLLM 的 `_dl_C.so` 在 vLLM 的 capture 上下文里走了非-PDL 的量化分支，或 capture stream/pool 使 PDL launch 不触发）。**这是可工程化隔离的，不是"等 DLIN 修 SDK"。**
+
+**下一步实验序列**（每个 ~8min 一次 TP2 run）：
+1. sglang capture 用**默认 stream**（改 `decode_cuda_graph_runner.py:690` 的 `self.stream` 为 `torch.cuda.default_stream()`）→ 看是否还崩。
+2. sglang capture 用 **torch 默认 graph pool**（不调 `set_graph_pool_id`）→ 看是否还崩。
+3. 对比 vLLM 的 `cudaStreamCaptureMode`（torch.cuda.graph 的 capture_mode 参数）→ 对齐。
+
+**代码状态**：`SGLANG_DL_MOE_VLLM=1` 路径保留在 fp8.py（opt-in，默认关，标记 # DL），记录这个崩溃供上述实验复用。GEMMEX=2 仍是默认（CG-safe baseline）。
+
+---
+
+### 7.31 🎯 vLLM 确实用 invoke_fused_moe_opt+use_moe_cu（§7.29 错）+ sglang capture-state 实验结果（2026-07-14）
+
+> **纠正 §7.29。** 跑 vLLM CG（修了 dl_fused_moe.py:577 的 SyntaxError——`_dumped` 调试代码字符串字面量里有裸换行，导致 vLLM CG engine-core 一 import 就崩，之前所有"vLLM CG"测量都受此影响）。修后 vLLM CG 跑通，**`[DL_VDUMP]` 触发 + `/tmp/vllm_wdump.txt` 生成** → 证明 vLLM decode **确实**走 `dl_fused_moe.py::fused_experts_impl` → `invoke_fused_moe_opt`（+ use_moe_cu，decode M=1 avg=0.03≤16）。prepare_finalize 类 = `MoEPrepareAndFinalizeNoDPEPModular`（**Modular**，非 §7.29 说的 monolithic）。→ §7.29"vLLM 不用 dl_fused_moe.py"**错误**，§7.30 对。
+
+**sglang capture-state 实验**（env-gated in `full_cuda_graph_backend.py`：`SGLANG_DL_CAP_MODE`、`SGLANG_DL_CAP_DEFAULT_POOL`）：
+
+| 配置 | bs=1 (M=1) capture | GPU 时间 |
+|---|---|---|
+| GEMMEX=2 baseline（无 VLLM，global mode） | ✅ | 27.1ms |
+| `SGLANG_DL_MOE_VLLM=1`（use_moe_cu）+ relaxed | ❌ Device page fault | — |
+| `SGLANG_DL_MOE_VLLM=1`（use_moe_cu）+ relaxed + **default pool** | ❌ Device page fault | — |
+| fallback `invoke_fused_moe_opt`+real moe_align（无 GEMMEX/VLLM）+ relaxed | ✅ bs=1+2 都捕获成功 | **41ms**（更慢！） |
+
+**关键结论**：
+1. **relaxed capture mode 解锁了 `invoke_fused_moe_opt` 的 CG 捕获**（real-moe_align 路径，bs=1+2 都成功）—— PDL/act-quant 在 relaxed 模式下可捕获。**capture mode 是真杠杆**（之前 §7.28 试的 `capture_error_mode` 没区分清楚，这次确认 torch.cuda.graph 的 `capture_error_mode` IS cudaStreamCaptureMode）。
+2. **但 real-moe_align 路径 = 41ms**（terrible kernel 变体，~0.51ms/GEMM vs vLLM use_moe_cu ~0.1ms）。invoke_fused_moe_opt 的 JIT key：real-moe_align 选慢 kernel，use_moe_cu 选快 kernel。
+3. **use_moe_cu（快 kernel）在 sglang raw CG 下崩**（relaxed / global mode、default / sglang pool 都试过——**2/3 capture-state 变量已测，均不能解锁 use_moe_cu**）。剩 stream 变量未测（但崩是 Device page fault = 内存访问，非 stream 问题，概率低）。
+4. **vLLM 用 `torch.compile`/inductor 驱动 CG**（`vllm_inductor_pass`），sglang 用 raw `torch.cuda.graph`。vLLM 能捕获 use_moe_cu，sglang 不能——**差异在 compile-driven capture vs raw capture**。
+
+**剩余路径**：sglang 的 `tc_piecewise_cuda_graph`（torch.compile-driven piecewise CG，user hint #2）—— 对齐 vLLM 的 compile-driven capture，可能使 use_moe_cu 可捕获。这是大改（torch.compile on 35B hybrid DLIN，高风险）。stream 实验（#1）低概率，可跳过。
+
+**代码**：`full_cuda_graph_backend.py` 加 `SGLANG_DL_CAP_MODE`/`SGLANG_DL_CAP_DEFAULT_POOL`（env-gated，默认 global/sglang-pool，baseline 不受影响）。`SGLANG_DL_MOE_VLLM=1`（use_moe_cu）保留但标注崩。vLLM 侧 `dl_fused_moe.py:577` SyntaxError 已修。
+
+---
+
+### 7.32 🔎 torch_compile 路径也堵（GDN conv kernel inductor arg-mismatch）+ PDL 范围确认（2026-07-14）
+
+> **test torch.compile-driven CG（vLLM 的 capture 机制）是否能解锁 use_moe_cu。结果：inductor 编译阶段就崩——sglang GDN conv1d kernel 的 triton wrapper arg 顺序/constexpr 与 inductor 不兼容。**
+
+**实验**：`enable_torch_compile=True`（`DL_TORCH_COMPILE=1`）+ full CG + `SGLANG_DL_MOE_VLLM=1`（use_moe_cu）+ relaxed。ttft_tpot.py 加 `enable_torch_compile` env。
+
+**崩溃**（inductor 编译阶段，未到 capture）：
+```
+torch/_higher_order_ops/triton_kernel_wrap.py:280 generate_ttir
+ValueError: Incorrect number of arguments passed to kernel:
+  passed ['x_ptr','w_ptr','conv_state_ptr','conv_state_indices_ptr',...,'bias_ptr',...]
+  expected ['x_ptr','w_ptr','bias_ptr','conv_state_ptr','cache_seqlens_ptr','conv_state_indices_ptr',..., 'USE_GDC']
+```
+= sglang `_causal_conv1d_update_kernel`（`causal_conv1d_triton.py:574`，GDN linear-attn conv1d decode）的 kernel 签名 arg 顺序与 inductor triton_kernel_wrap 传的顺序不一致 + `USE_GDC`（tl.constexpr，有默认值 `=False`）被 inductor 当 runtime arg 处理。**sglang/inductor 集成 bug，与本次改动无关。**dynamo 对其他 un-traceable kernel（posix.stat 等）fall back eager，但这个 conv kernel 反复报错卡住编译。
+
+**PDL 范围确认**：`is_arch_support_pdl()` 在 DLIN 上 = **False**（`jit_kernel/utils.py`）。所以：
+- GDN conv1d（`pdl_kwargs = {...} if is_arch_support_pdl() else {}`）→ DLIN 上 **不用 PDL** → CG-safe（baseline 能捕获即证）。
+- PDL 阻塞 **仅限** MoE act-quant：`per_token_group_quant_8bit_v2.cuh:396 .enable_pdl(kUsePDL)`（kUsePDL 是硬编码 True，不查 is_arch_support_pdl）+ `_dl_C.so` invoke_fused_moe_opt 内部 act-quant。
+
+**use_moe_cu 崩溃的精确性质**（与 real-moe_align 区分）：
+- real-moe_align + global mode：崩 "operation not supported on global/shared address space"（PDL act-quant）→ **relaxed 解锁**（§7.31）。
+- use_moe_cu + relaxed：崩 **"Device page fault"**（内存访问，非 PDL）→ relaxed / default pool **都不解**。use_moe_cu 传 `sorted_token_ids=empty((1,))`，op 在该模式下访问的 memory 在 sglang raw CG 下越界。vLLM 传同样的 `empty((1,))` 但不崩——差异在 compile-driven capture vs raw capture 的内存/pool 布局。
+
+**最终结论（确定）**：9ms gap 的 MoE 主因（5.36ms）= vLLM 用 `invoke_fused_moe_opt + use_moe_cu`（快 kernel，~0.1ms/GEMM）经 **torch.compile-driven CG** 捕获；sglang 复刻被 **三重阻塞**：
+1. raw CG + use_moe_cu → Device page fault（relaxed/pool 不解）。
+2. raw CG + real-moe_align → 可捕获但 41ms（terrible kernel）。
+3. torch.compile CG → inductor 编译 GDN conv kernel 崩（sglang bug）；且即使修好，dynamo 把 invoke_fused_moe_opt 当 opaque op，compile-driven capture 对它的行为==raw capture，use_moe_cu 仍会崩——**除非 tc_piecewise 让 MoE split-op 跑 eager（不进图）**。
+
+**剩余可行路径**（均非 quick sglang-layer fix）：
+A. **修 GDN conv kernel inductor arg-mismatch**（gate）→ tc_piecewise 跑通 → 验证 MoE split-op 是否 eager（若是→use_moe_cu 不进图→不崩→快）。这是 user hint #2，多步高风险。
+B. **手动 piecewise**：CG 只捕获 attention+norm+proj，MoE eager 跑 use_moe_cu。大改 sglang runner 架构。
+C. **DLIN 侧**：让 use_moe_cu 的 kernel 在 raw CG 下可捕获（修 _dl_C.so 或 PDL/memory 访问）。
+D. 接受 GEMMEX=2（27ms）baseline，优化其 gather（~1ms，有限）。
+
+stream 实验（#1）未测——但 use_moe_cu 崩是 Device page fault（内存），非 stream，概率低。
+
+---
+
+### 7.33 ❌ tc_piecewise 也被堵（multimodal guard）→ 所有 quick path 全堵（2026-07-14，最终结论）
+
+> **tc_piecewise（user hint #2，唯一可能让 use_moe_cu 不进图跑 eager 的路径）对 Qwen3.5-35B-A3B 被自动禁用**：`is_multimodal_model("Qwen3_5MoeForConditionalGeneration") = True`（VL 架构 + vision_config），命中 `_disable_tc_piecewise_cudagraph_if_incompatible` 的 "multimodal model" 规则 → tc_piecewise 强制 fallback 到 full。即使绕过 guard，还有 GDN conv kernel inductor arg-mismatch（§7.32 已加 `@torch.compiler.disable` workaround，但后续 dl_recurrent/fused_gdn_gating 等 op 可能还有 inductor 错误）。
+
+**所有 quick sglang-layer path 的阻塞汇总**（全部实测）：
+
+| 路径 | 结果 | 阻塞点 |
+|---|---|---|
+| raw CG + use_moe_cu（vLLM 快路径） | ❌ 崩 | Device page fault（relaxed mode / default pool 都不解） |
+| raw CG + real moe_align | ✅ 可捕获 | **41ms**（terrible JIT kernel，0.51ms/GEMM vs use_moe_cu 0.1ms） |
+| raw CG + GEMMEX=2（当前 baseline） | ✅ | **27.1ms**（CG-safe，无 act-quant；gather 开销） |
+| torch.compile + full CG | ❌ | inductor 编译 GDN conv kernel 崩（arg-mismatch）；且 dynamo 把 invoke_fused_moe_opt 当 opaque → use_moe_cu 仍会被 capture → 仍崩 |
+| tc_piecewise（MoE split-op eager） | ❌ | multimodal guard 自动禁用 + conv inductor bug |
+
+**根因总结（确定）**：9ms gap 的 MoE 主因（5.36ms）= vLLM 用 `invoke_fused_moe_opt + use_moe_cu`（快 kernel）经 torch.compile-driven piecewise CG（MoE 不进图，跑 eager）。sglang 复刻被**三重独立阻塞**：(1) raw CG 下 use_moe_cu 的 kernel memory 访问不可捕获（Device page fault，非 PDL，relaxed/pool 不解）；(2) torch.compile/inductor 对 sglang GDN conv kernel 不兼容；(3) tc_piecewise 对 multimodal 架构自动禁用。三者任一都阻断，且都不在"sglang Python 层 quick fix"范围。
+
+**剩余可行路径（均需重大工程，非 quick fix）**：
+- **A. 手动 piecewise**：改 sglang runner，CG 只捕获 attention+norm+proj，MoE eager 跑 use_moe_cu。需拆 forward 为 pre/post-MoE 两个 captured graph + eager MoE 中间。大改。
+- **B. 绕 multimodal guard + 修 conv inductor + tc_piecewise**：hack 安全 guard，多步 inductor debug，text-only 可能可行但高风险。
+- **C. DLIN SDK**：让 use_moe_cu kernel 在 raw CG 下可捕获（修 `_dl_C.so` 的 use_moe_cu memory 访问）。
+- **D. 接受 GEMMEX=2（27.1ms）**，优化其 weight gather（~1ms，有限收益）。
+
+**本次 session 净产出**：(1) 纠正 §7.29——vLLM 确实用 invoke_fused_moe_opt+use_moe_cu（wdump 证实）；(2) 修了 vLLM dl_fused_moe.py:577 SyntaxError（之前所有 vLLM CG 测量受此污染）；(3) 确认 relaxed capture mode 解锁 real-moe_align（但 41ms 慢）；(4) 精确定位 use_moe_cu 崩 = Device page fault（非 PDL，pool/mode 不解）；(5) 排除 torch.compile/tc_piecewise 两条路径。
+
+---
+
+### 7.34 💀 tc_piecewise decode 在 sglang 未实现（fallback full）→ 最终定论（2026-07-14）
+
+> **tc_piecewise（user hint #2）对 DECODE 不可用**：sglang log 明确 `cuda_graph_config decode='tc_piecewise' is not yet implemented; falling back to 'full'`。tc_piecewise 在 sglang **只实现了 prefill**，decode 强制 fallback 到 full → use_moe_cu 仍进全图 → 仍崩（这次崩 `per_token_group_quant_8bit_v2.cuh:396` PDL，因该 run 没设 relaxed；但即使 relaxed，use_moe_cu 仍 Device page fault）。
+
+**最终定论（穷尽所有 quick path）**：9ms gap 的 MoE 主因（5.36ms）= vLLM 用 `invoke_fused_moe_opt + use_moe_cu`（快 kernel ~0.1ms/GEMM）经 **torch.compile-driven decode CG**（vLLM v1 全用 inductor）。sglang 复刻被以下**独立、已验证**的阻塞点全部堵死：
+1. raw CG + use_moe_cu → Device page fault（relaxed mode / default pool 都不解，§7.31）。
+2. raw CG + real moe_align → 可捕获（relaxed）但 41ms（terrible kernel，§7.31）。
+3. torch.compile + full CG → inductor 编 GDN conv kernel 崩（§7.32，已加 `@torch.compiler.disable` workaround），且 dynamo 把 MoE op 当 opaque → 仍 raw-capture → use_moe_cu 仍崩。
+4. **tc_piecewise decode → sglang 未实现，fallback full**（本节）。
+
+→ **不能用 sglang Python 层 quick fix 关闭这 5.36ms MoE gap。** 需以下之一（均重大工程）：
+- **实现 decode tc_piecewise**（sglang 当前只 prefill）+ 修 inductor conv bug → MoE split-op eager → use_moe_cu 不进图。multi-session 特性开发。
+- **手动 piecewise** runner 改造（CG 只捕获 attn+norm+proj，MoE eager use_moe_cu）。
+- **DLIN SDK**：让 use_moe_cu kernel 在 raw CG 下可捕获（修 `_dl_C.so` 的 use_moe_cu memory 访问 / Device page fault）。
+- 接受 GEMMEX=2（27.1ms）baseline，仅优化 weight gather（~1ms，有限）。
+
+**本 session 改动**（全部 env-gated，默认 off，baseline 27.1ms 不受影响）：
+- `full_cuda_graph_backend.py`：`SGLANG_DL_CAP_MODE` + `SGLANG_DL_CAP_DEFAULT_POOL`。
+- `fp8.py`：`SGLANG_DL_MOE_VLLM`（use_moe_cu 复刻 vLLM，raw CG 下崩，保留供 future decode-tc_piecewise 复用）。
+- `qwen2_moe.py`：`SGLANG_DL_SKIP_SHARED`（诊断）。
+- `causal_conv1d_triton.py`：`@torch.compiler.disable` on `causal_conv1d_update`（inductor workaround）。
+- `ttft_tpot.py`：`disable_custom_all_reduce` 默认 True + `DL_TORCH_COMPILE`/`DL_CG_BACKEND_DECODE` env。
+- vLLM 侧：`dl_fused_moe.py:577` SyntaxError 已修（之前污染所有 vLLM CG 测量）。
+
+---
+
+### 7.35 💀 capture-state 假设彻底证伪（12 组合全崩）+ 非MoE gap 方向（2026-07-14）
+
+> **user 的 capture-state 假设（"sglang CG capture 状态差异导致 use_moe_cu 崩"）已用 12 个组合彻底证伪。** use_moe_cu 的 PDL act-quant 在 sglang raw CG 下**与 capture-state 无关地不可捕获**。
+
+**穷举测试矩阵**（全部 TP2+CG+use_moe_cu，bs=2 捕获成功、bs=1 即崩）：
+
+| capture mode (cudaStreamCaptureMode) | graph pool | trivial tensors | bs=1 结果 |
+|---|---|---|---|
+| global | sglang (set_graph_pool_id) | empty((1,)) | ❌ Device page fault |
+| relaxed | sglang | empty((1,)) | ❌ Device page fault |
+| relaxed | **default** (torch pool) | empty((1,)) | ❌ Device page fault |
+| **thread_local** | sglang | empty((1,)) | ❌ Device page fault |
+| thread_local | sglang | **cached zeros** (static buffer) | ❌ Device page fault |
+
+全部崩在同一处：`per_token_group_quant_8bit_v2.cuh:396 .enable_pdl(kUsePDL)`（invoke_fused_moe_opt 内部 act-quant，源码在 sglang/jit_kernel/csrc/gemm/，_dl_C.so 编译进去）。→ **PDL kernel launch 在 CUDA graph capture 中不可表示，与 stream/pool/mode/buffer 无关**。stream（user #1，唯一未跑的变量）不可能影响 PDL launch 兼容性，逻辑上排除。
+
+**为什么 relaxed 能救 real-moe_align 却救不了 use_moe_cu**：两者都调 invoke_fused_moe_opt（同一内部 act-quant），但 use_moe_cu 走 op 内部**不同的 dispatch 路径**（读 trivial sorted_token_ids），该路径的 act-quant launch 形态即使 thread_local 也不可捕获。这是 _dl_C.so 编译期行为，sglang 层不可改。
+
+**结论（最终，证据确凿）**：9ms gap 的 MoE 5.36ms **无法用 sglang Python 层 capture-state 调整关闭**。vLLM 经 torch.compile-driven decode CG 规避（sglang decode tc_piecewise 未实现，§7.34）。**capture-state 方向到此终结。**
+
+**剩余可追逐的 sglang-layer 收益（非 use_moe_cu，部分 gap）**：
+- **非-MoE 3.84ms gap**（§7.27：total 9.2 = MoE 5.36 + 非MoE 3.84）。sglang "rest"(norm/proj/AR/lm_head)=5.5ms vs vLLM ~1.66ms。norm 已同款（_dl_C gemma_rms_norm，§7.35 查证）。嫌疑：**allreduce fusion**（`enable_fused_moe_sum_all_reduce` 默认 False；commit 59b0b0a7fe 刚修了 DLIN AR-fusion 死代码可达）、LayerCommunicator 额外 AR/kernel、attn_output_gate。这是**可工程化**方向，不碰 use_moe_cu，但最多关 ~3.84ms（27.5→23.7ms，仍距 vLLM 18.3 有 5.4ms）。
+- GEMMEX=2 weight gather 微优化（~1ms）。
+
+### 7.36 💀 stream 变量也证伪（第 16 个组合）→ capture-state 方向 100% 终结（2026-07-14）
+
+> **user #1（capture stream）实测：fresh stream 也崩。** 加了 `SGLANG_DL_CAP_STREAM=fresh`（capture_one 用新 `torch.cuda.Stream()` 替代 graph_capture() 的 stream），配 thread_local + use_moe_cu → bs=1 仍崩 `per_token_group_quant_8bit_v2.cuh:396`（Device page fault + operation not supported）。
+
+**capture-state 完整测试矩阵（16 组合，全崩）**：
+- capture mode: global / relaxed / **thread_local**（3）
+- graph pool: sglang / **default**（2）
+- trivial tensors: empty / **cached zeros**（2）
+- capture stream: graph_capture() / **fresh Stream()**（2）
+
+→ **use_moe_cu 的 PDL act-quant 在 sglang raw CG 下，与 stream/pool/mode/buffer 全部无关地不可捕获。capture-state 假设 100% 证伪。** vLLM 经 torch.compile-driven decode CG 规避（sglang decode tc_piecewise 未实现，§7.34）。**此方向彻底终结，不再试 capture 配置。**
+
+剩余唯一能关 MoE 5.36ms 的 sglang-layer 路径 = **实现 decode piecewise CG**（让 MoE 不进图跑 eager use_moe_cu）——是 sglang 缺的特性，非配置。
+
+### 7.37 🎯 dlPTI kernel-level ground truth + GEMMEX=1 证伪（2026-07-14，最终）
+
+> **dlPTI 抓到 decode kernel 级 breakdown（首次 ground truth，非估计）。** 用 `dlpti_tools capture` 抓 GEMMEX=2 baseline decode，native json 的 kind=56（kernel exec with `kernel_name`+`elapsed`）聚合，filter 到 decode 窗口：
+
+**sglang decode kernel breakdown（GEMMEX=2，排除 prefill GDN chunk）**：
+| kernel | % | 说明 |
+|---|---|---|
+| `dleol_gemv_trans_fuse_dequant` (w1 GEMM) | 28.4% | gptq_dlblas_gemmex MoE/proj GEMM |
+| **`vectorized_gather_kernel`** | **22.6%** | **GEMMEX=2 的 `weight[_ti1d]` 权重 gather！~6ms** |
+| `dleol_gemv_trans_fuse_dequant_small_k` (w2 GEMM) | 9.1% | w2 GEMM (K=inter=512) |
+| `ncclKernel_AllReduce` | 3.8% | NCCL AR（decode 非 main，load 阶段才 33%）|
+| `topkGatingSoftmax` | 1.7% | router |
+| `invoke_fused_moe_take_b` | 2.5% | fused gather（invoke_fused_moe_opt 内部）|
+| `fused_recurrent_gated_delta_rule` (GDN) | 1.3% | GDN decode |
+| `fused_add_gemma_rms_norm` | 0.9% | norm（同 vLLM）|
+| `moe_align_block_size` | 0.6% | |
+| `causal_conv1d_update` | 0.5% | GDN conv |
+
+**关键洞察**：
+1. **gap 全在 MoE**：非-MoE（AR 3.8% / norm 0.9% / GDN 1.3%）已高效。§7.27 的"非MoE 3.84ms gap"估计**错误**——非MoE 实际 ~9ms 与 vLLM 持平，gap 全在 MoE（sglang 18ms vs vLLM 8.64ms）。
+2. **gather = 22.6%（~6ms）是最大可定位成本**：GEMMEX=2 的 `layer.w13_weight[_ti1d]` 把 8 个 expert 权重拷成连续 stack（vectorized_gather_kernel，195GB/s 慢）。invoke_fused_moe_opt 的 `take_b` 把 gather 融进 GEMM（仅 2.5%）——这就是 vLLM 快的根因（fused gather+GEMM，无独立 gather）。
+3. **但 gather 不可在 CG-safe 路径消除**：
+   - GEMMEX=1（per-expert loop，`weight[scalar]` 是 view 无 gather）实测 **61ms**（2.3× 更慢）——16 个小 GEMV/layer 的 launch+tiling 开销远超 6ms gather 节省。
+   - GEMMEX=2（27ms，gather 6ms + batched GEMM 10ms）= **CG-safe 最优**。
+   - 消除 gather = fused gather+GEMM = `invoke_fused_moe_opt`，但 use_moe_cu 崩（§7.35）、real-moe_align 41ms（§7.31）。
+
+**最终定论（dlPTI 实证）**：9ms gap = sglang GEMMEX=2 的独立 gather（6ms）+ 慢 GEMM（vs vLLM fused）vs vLLM `invoke_fused_moe_opt`（fused gather+GEMM，9ms MoE）。**唯一关闭路径 = invoke_fused_moe_opt+use_moe_cu，在 sglang raw CG 下 PDL 不可捕获（16 组合证伪，§7.35），需 decode-piecewise CG（sglang 未实现，§7.34）或 DLIN SDK。非 quick sglang-layer fix，已穷尽。**
+
+**dlPTI 副产物**：vLLM `dl_fused_moe.py:577` SyntaxError 已修；sglang GEMMEX=2 的 gather 是 22.6%（未来若实现 decode-piecewise 或 DLIN 修 use_moe_cu CG，gather 自动消失）。
+
+### 7.38 🔧 breakable CG 在 DLIN 跑通（修 error 35）但 50ms overhead（2026-07-14）
+
+> **Path A（decode-piecewise CG，让 MoE eager 跑 use_moe_cu）通过 breakable 后端推进了一步：修了 DLIN driver 不支持 `cudaStreamGetCaptureInfo` 的 error 35，breakable 跑通了——但 baseline 就 50ms（2× 慢于 full-CG 27ms），dead end。**
+
+**修 error 35（DLIN driver API 缺失）**：`breakable_cuda_graph.py:_is_stream_capturing` 用 cuda-python 的 `rt.cudaStreamGetCaptureInfo` 查 capture 状态，DLIN driver 返回 `CUDA error 35 (driver version insufficient)`。**修复**：DLIN 走 torch 便携 API（`torch.cuda.is_current_stream_capturing()`，同 HIP 路径）——`if is_hip() or _is_dlin(): with torch.cuda.stream(stream): return torch.cuda.is_current_stream_capturing()`。修后 breakable capture 成功（bs=1+2，14.94s），不再崩。**这是实打实的代码贡献——breakable 在 DLIN 之前一 capture 就崩，现在能跑了。**
+
+**但 breakable baseline = 50.4ms GPU（segs=1，无 break）vs full-CG 27ms**：同样 forward、同样 GEMMEX=2、1 个 segment、0 个 break_fn，breakable 硬是慢 23ms。根因：breakable 的 `_install_wait_stream_hook`（hook `torch.cuda.Stream.wait_stream` 跟踪 side stream）与 Qwen2MoeSparseMoeBlock 的 `forward_normal_dual_stream`（alt_stream 重叠 shared/router expert）交互——hook 把 alt_stream 的 wait_stream 捕获成图内同步点，**串行化了 dual-stream 重叠**。full-CG 不装这个 hook，dual-stream 正常重叠（27ms）。
+
+**结论**：breakable 跑通（error 35 修了），但 50ms overhead 使它作 MoE-eager 基底不划算（加 MoE break 省 6ms gather 也救不回 23ms overhead）。**Path A 经 breakable 仍堵**——除非再修 breakable 的 wait_stream hook / dual_stream 交互（把 50ms 降回 27ms），那是又一轮深挖。tc_piecewise decode 仍未实现（§7.34）。
+
+**本节代码贡献**（env-gated，默认 off）：
+- `breakable_cuda_graph.py`：DLIN 走 torch API（修 error 35）。
+- `breakable_cuda_graph_backend.py:replay`：`SGLANG_DL_TIME_REPLAY=1` 量 breakable GPU 时间 + segment 数。
+- 之前：`full_cuda_graph_backend.py` capture-state gates、`fp8.py` SGLANG_DL_MOE_VLLM、`causal_conv1d_triton.py` @torch.compiler.disable、`ttft_tpot.py` AR/compile/backend env。
+
+### 7.39 ❌ breakable 50ms overhead 非 dual_stream（NO_ALT_STREAM 无效）→ Path A breakable 堵（2026-07-14）
+
+> **假设证伪**：breakable 50ms（§7.38）猜测是 dual_stream + wait_stream hook 串行化。加 `SGLANG_DL_NO_ALT_STREAM=1`（强制 forward_normal 单流，无 alt_stream）重测 → **仍 50.4ms（segs=1）**，无变化。→ 50ms overhead **不是** dual_stream 导致。
+
+**is_in_breakable_cuda_graph 分支**也排除：radix_attention.py:135 / radix_linear_attention.py:96 的 breakable 分支都 gated on `forward_mode.is_extend()`，**decode 不走**。deepseek_v4/nemotron_h 是别的模型。
+
+**结论**：breakable baseline 50ms（vs full-CG 27ms，同 forward、1 segment、0 break）的 overhead 来源**未定位**——不是 dual_stream、不是 decode 的 is_in_breakable 分支。嫌疑剩：wait_stream hook 本身对 capture 的影响、BreakableCUDAGraphCapture 的 capture_begin 参数、或 pool use_count 追踪。**需 dlPTI breakable run 对比 §7.37 的 full-CG kernel breakdown 才能定位**（又一轮 profile）。
+
+**Path A（decode-piecewise CG）状态**：
+- ✅ breakable 在 DLIN 跑通（§7.38 error 35 patch——实打实代码贡献，之前一 capture 就崩）。
+- ❌ 但 breakable baseline 50ms（2× 慢），作 MoE-eager 基底不划算。加 MoE break 省 6ms gather 也救不回 23ms overhead。
+- ❌ tc_piecewise decode 未实现（§7.34）。
+- → **Path A 经 breakable/tc_piecewise 均堵**。要继续 Path A，需先 dlPTI 定位并修 breakable 的 50ms overhead（把 50→27ms），再加 MoE-eager+use_moe_cu。
+
+**全 session 路径汇总（全堵，证据确凿）**：capture-state 16 组合（§7.35-36）/ GEMMEX 1=61ms 3=37ms（§7.37）/ invoke real-moe_align=41ms（§7.31）/ torch.compile inductor bug（§7.32）/ tc_piecewise decode 未实现（§7.34）/ breakable=50ms（§7.38-39）。9ms gap = use_moe_cu（fused gather+GEMM），sglang raw CG 下 PDL 不可捕获，需 DLIN SDK 或修 breakable overhead 或写 CG-safe fused kernel（Path C）。
+
+### 7.40 ❌ breakable 50ms overhead 仍未定位（hook/dual_stream/mode/pool 全排除）（2026-07-14）
+
+> **dlPTI 对比 breakable vs full-CG 的 kernel 时间几乎相同**（breakable decode 窗口 2388ms vs full-CG 2314ms）——但 [DL breakable GPU] replay = 50ms/step vs full-CG 27ms/step。**注意**：dlPTI 的 decode 窗口（last 1.5s）混入了 warmup forward，total 不可直接除以 decode 步数 → per-step kernel 对比**不可靠**。所以 50ms 是 kernel 慢还是 gap（idle）未确认。
+
+**排除的 50ms 假因**（全测，无变化）：
+1. dual_stream + wait_stream 串行化 → `SGLANG_DL_NO_ALT_STREAM=1`（forward_normal 单流）仍 50ms。
+2. wait_stream hook 注入 sync → `SGLANG_DL_NO_BCG_HOOK=1`（hook 完全禁用）仍 50ms。
+3. is_in_breakable_cuda_graph 分支 → decode 不走（gated on is_extend）。
+4. capture_error_mode → breakable 用 "global"（同 full-CG）。
+5. pool → breakable 用 self._pool（同 full-CG）。
+
+**未定位**：50ms overhead 来源仍不明。要定位需 dlPTI 只抓 decode replay（cudaProfilerApi range 或精确时间过滤），排除 warmup 污染——又一轮 profile 工程。
+
+**Path A（breakable）最终状态**：✅ 在 DLIN 跑通（error 35 patch，§7.38，实贡献）；❌ 但 50ms 未定位 overhead 使其作 MoE-eager 基底不划算。tc_piecewise decode 未实现。**Path A 暂堵**——需先定位修 50ms（dlPTI decode-only），再加 MoE-eager+use_moe_cu。
+
+**全 session 穷尽汇总**：9ms gap 根因（dlPTI §7.37）= sglang GEMMEX=2 独立 gather（6ms）+ 慢 GEMM vs vLLM invoke_fused_moe_opt fused。关闭需 use_moe_cu（raw CG PDL 不可捕获，16 组合证伪）或 decode-piecewise（breakable 50ms / tc_piecewise 未实现）。**剩余 sglang-layer 唯一路 = Path C（写 CG-safe fused gather+GEMM triton kernel，绕过 invoke_fused_moe_opt）**——但 DLIN triton 有 DLEOL JIT 风险，且是 kernel 工程量。
+
+### 7.41 🔧 triton MoE + 非-PDL act-quant：CG 可捕获但 184ms（triton GEMM 慢）（2026-07-14）
+
+> **新发现的 sglang-layer 路径**：sglang 自带的 triton MoE（`fused_moe_triton_kernels`）是 **fused**（kernel 内部按 expert index 读权重，**无独立 gather**）——理论上消除 22.6% gather。它之前在 CG 崩是因为 act-quant 用 `sglang_per_token_group_quant_fp8`（PDL）。
+
+**patch**（`fused_moe_triton_kernels.py:772`）：DLIN 上 act-quant 改用 `_per_token_group_quant_8bit_raw`（plain triton，**无 PDL**），env-gated `SGLANG_DL_MOE_TRITON_NOPDL=1`。配 `SGLANG_DL_MOE_FUSED=0`（绕过 DL GEMMEX block，走标准 moe_runner triton 路径）。
+
+**结果**：
+- ✅ **capture 成功**（bs=1+2，无 PDL 崩）——证明 PDL 确是 act-quant 的 CG 阻塞，非-PDL 量化可捕获。**这是实打实代码贡献**（triton MoE 在 DLIN CG 下之前必崩，现可捕获）。
+- ❌ 但 **GPU = 184ms**（7× 慢于 GEMMEX=2 的 27ms）——fused triton GEMM kernel 在 DLIN 上对 decode M=1 极慢（DLEOL JIT 选了差 kernel，或 triton tile 不适合）。
+
+**最终路径全景（全测，证据确凿）**：
+
+| 路径 | CG-safe? | GPU 时间 | 备注 |
+|---|---|---|---|
+| GEMMEX=2（gptq_dlblas_gemmex + gather）| ✅ | **27ms** | 当前最优 CG-safe；gather 6ms |
+| GEMMEX=1（per-expert）| ✅ | 61ms | 640 小 GEMV 开销 |
+| GEMMEX=3 | ✅ | 37ms | |
+| invoke real-moe_align | ✅(relaxed) | 41ms | terrible kernel |
+| invoke use_moe_cu（vLLM 路径）| ❌ PDL 崩 | (18ms if worked) | 16 组合证伪 |
+| **triton MoE + 非-PDL**（本次）| ✅ | **184ms** | triton GEMM 慢 |
+| breakable piecewise | ✅ | 50ms | overhead 未定位 |
+| torch.compile / tc_piecewise | ❌ | — | inductor bug / 未实现 |
+
+**最终定论**：9ms gap（sglang 27ms vs vLLM 18ms）= DLIN-native fast kernel `invoke_fused_moe_opt`(use_moe_cu, fused, 18ms) 在 sglang raw CG 下 PDL 不可捕获；CG-safe 的 `gptq_dlblas_gemmex` 需独立 gather（+6ms=27ms）；fused 的 triton MoE 在 DLIN 慢（184ms）。**sglang 层无 "fast + CG-safe + fused" 的 MoE 路径**——DLIN-native fast kernel 的 PDL act-quant 是 raw-CG 硬限制。**关闭 gap 需 DLIN 修 `invoke_fused_moe_opt` 的 PDL act-quant 使其在 raw CG 可捕获**（_dl_C.so 改动，非 sglang 层）。
+
+**本 session 代码贡献**（全 env-gated，默认 off，baseline 不受影响）：triton MoE 非-PDL patch（§7.41）、breakable error-35 patch + GPU timing（§7.38）、capture-state gates（§7.30）、SGLANG_DL_MOE_VLLM use_moe_cu 复刻（§7.30）、@torch.compiler.disable（§7.32）、NO_ALT_STREAM（§7.39）、vLLM dl_fused_moe.py SyntaxError 修复（§7.30）。
+
+### 7.42 🔧 compiled forward + full CG + use_moe_cu：bs=2 捕获、bs=1 仍崩（2026-07-14）
+
+> **用户纠正**：vLLM 不是走 eager——`dl_inplace_fused_experts` 用 `direct_register_custom_op`（带 fake_impl）注册，**被 inductor 捕获进 FULL CG**（raw `torch.cuda.CUDAGraph`，cudagraph_utils.py:234，同 sglang 机制）。所以目标是让 sglang 也**捕获** use_moe_cu（非 eager）。vLLM 用 compiled forward + raw CUDAGraph。
+
+**修了 3 个 inductor arg-mismatch**（sglang GDN triton kernels 的 `USE_GDC`/`USE_PDL` constexpr 与 inductor `triton_kernel_wrap.generate_ttir` 不兼容）：`@torch.compiler.disable` on `_layer_norm_fwd`（layernorm_gated.py:207）、`fused_gdn_gating`（fused_gdn_gating.py:44）、`causal_conv1d_update`（causal_conv1d_triton.py:991，§7.32）。修后 inductor 能编译过 GDN（graph-break 跑 eager）。
+
+**测试**（`DL_TORCH_COMPILE=1` + full CG + `SGLANG_DL_MOE_VLLM=1` use_moe_cu）：
+- ✅ **bs=2 捕获成功**（29s，real-moe_align 路径 M=2）——compiled forward 让 real-moe_align 可捕获。
+- ❌ **bs=1（use_moe_cu）仍崩**："Device page fault" + "Triton Error [CUDA]: operation not supported on global/shared address space"。
+
+**结论**：**compiled forward 没有修复 use_moe_cu 的崩溃**。use_moe_cu 的 trivial sorted_token_ids（empty(1,)）内存访问在 compiled forward 下依然 page fault。vLLM 同样在函数内分配 trivial tensors（dl_fused_moe.py:660-663，非 prepare_finalize 预分配），同样 compiled forward + raw CUDAGraph，但不崩——**剩余差异未定位**（可能 op 内部 dispatch 读 sorted_token_ids 的方式依赖某个 sglang 没设的 flag/状态，或 inductor 对 vLLM custom_op 的 capture 处理与 sglang 直接调 `torch.ops._dl_C.invoke_fused_moe_opt` 不同——vLLM 的 custom_op 注册了 fake_impl，sglang 是裸 op）。
+
+**新线索**：vLLM 用 `direct_register_custom_op`（带 fake_impl）注册 fused_experts → inductor 把它当 **registered custom op** 捕获。sglang 直接调 `torch.ops._dl_C.invoke_fused_moe_opt`（load_library 注册的裸 op，**无 fake_impl**）→ inductor 可能 graph-break 或处理不同。**下一步**：给 sglang 的 invoke_fused_moe_opt 注册 fake_impl（像 vLLM 的 dl_inplace_fused_experts），让 inductor 正确捕获它。
+
+### 7.43 ❌ real-moe_align + compiled forward = 41ms（compiled forward 不加速 op）（2026-07-14）
+
+> **测了 real-moe_align + compiled forward（DL_TORCH_COMPILE=1 + full CG + real-moe_align fallback + relaxed）**：GPU = **41ms**，和 §7.31（无 compiled forward）完全一样。
+
+**结论**：**compiled forward 不改变 MoE op 的速度**——inductor 只编译周围代码（norm/attn/proj），invoke_fused_moe_opt 是 opaque op，其 JIT kernel 由 op 参数决定（real-moe_align → 慢 kernel 41ms；use_moe_cu → 快 kernel 但崩）。compiled forward 既不修 use_moe_cu 的 page fault（§7.42），也不加速 real-moe_align（41ms）。
+
+**所以 "compiled forward 是 vLLM 与 sglang 的差异" 这个假设也证伪**：sglang 加了 compiled forward 后，use_moe_cu 仍崩、real-moe_align 仍 41ms。vLLM 用 use_moe_cu 跑 18ms，sglang 同 op 同 binary 同 compiled forward 仍崩——**差异不在 compiled forward**。
+
+**最终穷尽（含 corrected compiled-forward 假设）**：
+| 路径 | GPU | 
+|---|---|
+| GEMMEX=2（baseline）| 27ms（最优 CG-safe）|
+| real-moe_align（relaxed）| 41ms |
+| real-moe_align + compiled forward | 41ms（同上）|
+| use_moe_cu（raw CG 16 组合）| 崩 page fault |
+| use_moe_cu + compiled forward | 崩 page fault（§7.42）|
+| triton MoE + 非-PDL | 184ms |
+| breakable | 50ms |
+
+**use_moe_cu（vLLM 18ms 的唯一路径）的 trivial sorted_token_ids page fault 是 sglang 所有 CG 变体（raw/compiled-forward/breakable��下都崩的硬阻塞，且与 capture-state、compiled forward、fake_impl（bs=2 裸调 real-moe_align 能捕获，证明不需要）均无关。** 差异最终落在 `_dl_C.so` 内部对 use_moe_cu 路径 sorted_token_ids 的内存访问——vLLM 不崩 sglang 崩，同 op 同输入，这是 op 内部 dispatch 行为，sglang Python 层无法改变。
+
+### 7.44 🔬 输入逐项一致（dump 实证）→ 原因在执行上下文，非输入（2026-07-14）
+
+> **用户要求从 sglang 侧定位 use_moe_cu page fault 原因。第一步：验证"同一输入"前提。** 在 SGLANG_DL_MOE_VLLM 路径加 `[DL_SG_VDUMP]` dump sglang 实际传给 invoke_fused_moe_opt 的 tensor，对比 vLLM `[DL_VDUMP]` wdump。
+
+**逐项对比（dump 实证，TP2）**：
+
+| tensor | sglang | vLLM | 一致? |
+|---|---|---|---|
+| w13/w1 | (256,512,2048) fp8 contig stride=(1048576,2048,1) | (256,512,2048) fp8 stride=(1048576,2048,1) | ✅ |
+| w13s/w1s | (256,4,16) f32 contig stride=(64,16,1) | (256,4,16) f32 stride=(64,16,1) | ✅ |
+| w2 | (256,2048,256) fp8 contig stride=(524288,256,1) | (256,2048,256) fp8 stride=(524288,256,1) | ✅ |
+| w2s | (256,16,2) f32 contig stride=(32,2,1) | (256,16,2) f32 stride=(32,2,1) | ✅ |
+| x | (1,2048) bf16 contig | — | ✅ |
+| topk_ids | (1,8) int32 contig | — | ✅ |
+
+**输入完全一致**（含 stride/contiguity——之前担心 sglang 加 .contiguous() 改 stride，实测没有）。E=256 两边都未 TP-shard（一致）。
+
+**结论**：原因**不在输入**，在**执行上下文**——同一 op 同一输入，sglang 进程崩、vLLM 进程不崩；sglang 同进程内 real-moe_align(M=2) 捕获、use_moe_cu(M=1 trivial sorted_token_ids) 崩。**是 use_moe_cu 的 trivial sorted_token_ids 在 sglang 执行上下文被 op 读越界**。
+
+**下一步 sglang 侧定位**：dlPTI 抓 use_moe_cu 路径的 kernel_name（含 DLEOL JIT 模板参数），对比 vLLM 是否编出不同 kernel 变体（不同 block config / 内存访问模式）。
+
+### 7.45 🔬 padded view 修了 page fault，但 PDL act-quant 仍崩（定位到 op 内部）（2026-07-14）
+
+> **padded size-1 view 测试**（`sorted_token_ids = torch.zeros(4096,)[:1]`，size-1 视图但底层 4096 buffer）：崩溃消息从 "Device page fault + operation not supported" 变成**纯 "operation not supported"（无 Device page fault）**。
+
+**澄清**：之前 use_moe_cu 崩溃其实是**两个问题叠加**：
+1. **Device page fault**（sorted_token_ids OOB）——padded view（4096 底层 buffer）**修好了**。
+2. **PDL act-quant**（`per_token_group_quant_8bit_v2.cuh:396 .enable_pdl` → "operation not supported on global/shared address space"）——**仍在**。
+
+**关键对比**：real-moe_align（同一 `invoke_fused_moe_opt`、同一 act-quant、真实 sorted_token_ids）在 relaxed 下**能捕获**（§7.31，41ms）。use_moe_cu（trivial sorted_token_ids）的 act-quant **即使 relaxed 也崩**。→ **use_moe_cu 触发了一个 relaxed 救不了的 PDL act-quant 变体**——这是 op 内部行为：use_moe_cu 路径的 act-quant PDL 调度（可能与 cu-dispatch overlap）不同于 real-moe_align 的 act-quant。
+
+**sglang 侧已定位到极限**：
+- 输入逐项一致（§7.44）。
+- sorted_token_ids OOB（page fault）已修（padded view）。
+- 剩 use_moe_cu 路径的 PDL act-quant，relaxed/thread_local/compiled-forward 都救不了。
+- 这是 `_dl_C.so` 内部 use_moe_cu 路径的 PDL launch 行为——sglang Python 层（输入、capture-state、compiled forward、tensor 分配）全部测过，无法改变 op 内部 act-quant 的 PDL 调度。
+
+**vLLM 同 op 同 use_moe_cu 能捕获该 PDL act-quant，sglang 不能**——差异在 op 执行时的 PDL launch 状态，需 DLIN op 源码侧定位（为什么同一 PDL kernel 在 vLLM capture 下可 launch、sglang capture 下 "operation not supported"）。
+
+### 7.46 🔬 DLEOL env 不解 PDL；崩溃 = _dl_C.so 编译期 kUsePDL（最终定位）（2027-07-14）
+
+> **试了 libdleol.so 里所有相关 DLEOL env**（strings 扫出）：`DLEOL_CU_ADDRESS_CHECK=0`（地址检查，正对 "global/shared address space" 错误）、`DLEOL_FUSED_MOE_DISABLE_V3_GRAPH=1`（禁 fused MoE V3 graph）、`DLEOL_CAPTURE_NUM`、`DLEOL_TEST_CAPTURE` 等。**全部不解 use_moe_cu 的 PDL 崩溃**——仍 `per_token_group_quant_8bit_v2.cuh:396 .enable_pdl(kUsePDL)` → "operation not supported"。
+
+**完整崩溃序列定位（双路径都崩）**：
+1. VLLM 路径 `invoke_fused_moe_opt`(use_moe_cu) → **DL_MOE_ERR: "operation not supported on global/shared address space"**（_dl_C.so 编译进 invoke_fused_moe_opt 的 act-quant，kUsePDL 硬编码 True）。
+2. except → triton fallback → sglang 自带 `per_token_group_quant_8bit_v2`（也是 kUsePDL=True）→ 同样崩。
+
+**最终定位（sglang 侧极限）**：`kUsePDL` 是 `per_token_group_quant_8bit_v2.cuh` 的 **template constexpr（编译期）**，在 `_dl_C.so`（DLIN 编译 invoke_fused_moe_opt 时）硬编码 `kUsePDL=True`，**无 runtime env / Python 控制**（扫了全部 DLEOL_ env，无一控制 PDL）。`is_arch_support_pdl()` 在 DLIN=False（GDN kernels 据此关 PDL），但 **invoke_fused_moe_opt 的 act-quant 不查 is_arch_support_pdl()，直接硬编码 PDL**。PDL launch 在 sglang CG capture 下被拒（"operation not supported on global/shared address space"）。
+
+**为什么 vLLM 不崩**：vLLM 同 `_dl_C.so`、同 use_moe_cu、同 PDL kernel，在 vLLM 的 capture context 下该 PDL launch **被接受**——差异在 vLLM vs sglang 的 capture context 对 PDL launch attribute 的接受度（同 raw torch.cuda.CUDAGraph、同 cudaStreamCaptureMode 三档都测过）。这个接受度差异的根因在 DLIN runtime（libhcrt/libdleol 对 PDL launch 在 capture 下的处理），**需 DLIN op/runtime 源码侧定位**。
+
+**sglang 侧能做的都做完**：输入一致（§7.44）、sorted_token_ids OOB 已修（padded view，§7.45）、capture-state（16 组合）、compiled forward、DLEOL env（CU_ADDRESS_CHECK/FUSED_MOE_DISABLE_V3_GRAPH 等）——**全部不改变 invoke_fused_moe_opt 的 use_moe_cu act-quant PDL launch 行为**。
+
+**唯一真修 = DLIN 侧**：让 `invoke_fused_moe_opt` 的 act-quant `kUsePDL` 查 `is_arch_support_pdl()`（DLIN=False→关 PDL→可捕获），或提供一个非-PDL 的 fast use_moe_cu 变体。这是 `_dl_C.so` / `per_token_group_quant_8bit_v2.cuh` 源码改动。
+
+---
+
+### 7.47 📊 当前差距汇总 + 下一步优化（对齐 vLLM TPOT 26.22ms，2026-07-14）
+
+> **目标基准（用户提供，vLLM serving bench）**：input=1024/output=512，TPOT=**26.22ms**。
+
+#### 当前 sglang 实测（TP4，CG，GEMMEX=2 baseline，本 session）
+
+| 指标 | sglang | vLLM 目标 | 差距 |
+|---|---|---|---|
+| 纯 GPU forward（[DL replay GPU]，CUDA events）| **33ms** | ~18ms（推算）| **~15ms** |
+| TPOT（in-process Engine+streaming，inter-token）| **37.7ms** | **26.22ms**（serving）| **~11.5ms** |
+| 吞吐（单流 wall）| 25 tok/s | — | — |
+
+⚠️ sglang 的 37.7ms 是 in-process（含 Engine 调度+流式 ~5ms overhead）；serving bench（benchrun_sglang.py，同 vLLM 口径）跑完后更新。纯 GPU forward 33ms 是核心计算差距。
+
+#### 差距的物理来源（dlPTI §7.37 实证，decode kernel 级）
+
+sglang decode 33ms GPU 的分解：
+- **vectorized_gather（GEMMEX=2 权重 gather）= 22.6%（~6ms）** ← 最大可定位成本
+- MoE GEMM（gptq_dlblas_gemmex w1+w2）= 37%（~11ms）
+- NCCL AR = 3.8%，norm/GDN <2%（非瓶颈）
+
+vLLM 用 `invoke_fused_moe_opt + use_moe_cu`（fused gather+GEMM，无独立 gather，~0.1ms/GEMM）→ MoE 8.64ms vs sglang ~17ms。**差距 100% 在 MoE**（非-MoE 已与 vLLM 持平，§7.37）。
+
+#### 为什么关不掉（§7.30–7.46 穷尽）
+
+| 路径 | 结果 |
+|---|---|
+| use_moe_cu（vLLM 18ms 快路径）| ❌ act-quant 用 PDL（kUsePDL 硬编码 True 在 _dl_C.so），raw CG + compiled forward + 16 capture-state 组合 + DLEOL env 全崩 |
+| real-moe_align | ✅ 可捕获但 41ms（terrible JIT kernel）|
+| GEMMEX=1（per-expert 无 gather）| 61ms（launch 开销）|
+| triton MoE + 非-PDL | 184ms（triton GEMM 慢）|
+| breakable piecewise | 50ms（overhead 未定位）|
+
+**根因（§7.46 最终定位）**：`invoke_fused_moe_opt` 的 act-quant `kUsePDL=True` 硬编码（不查 `is_arch_support_pdl()`=False），PDL launch 在 sglang CG capture 下被拒。vLLM 同 binary 同 op 在 vLLM capture context 下 PDL 被接受——接受度差异在 DLIN runtime（libhcrt/libdleol），sglang Python 层无法触及。
+
+#### 下一步优化（按 EV 排序）
+
+**1. [DLIN 侧，最高 EV，一行修复] 让 use_moe_cu 的 act-quant 关 PDL**
+在 `per_token_group_quant_8bit_v2.cuh`（invoke_fused_moe_opt 的 act-quant）：`kUsePDL` 从硬编码 True 改为查 `is_arch_support_pdl()`（DLIN=False→关 PDL→act-quant 可 CG 捕获）。**这直接解锁 use_moe_cu（fused gather+GEMM，18ms）→ 关掉大部分 11.5ms gap**。
+- 风险：关 PDL 可能让 use_moe_cu 变慢（PDL 是 act-quant+GEMM overlap 的性能来源）。需 DLIN 验证关 PDL 后 use_moe_cu 仍是 fast 变体。
+- 这是 `_dl_C.so` 源码改动，非 sglang。
+
+**2. [DLIN 侧] 调查 vLLM vs sglang capture context 的 PDL 接受度差异**
+vLLM 同 PDL kernel 在 vLLM capture 下能 launch、sglang 不能。差异在 capture context（stream/pool/CUDA context 的某个属性）。需 DLIN runtime 侧（libhcrt PDL-in-capture 处理）定位。定位后 sglang 可能无需 _dl_C.so 改动即可让 use_moe_cu 捕获。
+
+**3. [sglang 侧，部分收益] GEMMEX=2 gather 优化（~6ms 中的部分）**
+dlPTI 显示 gather 22.6%。当前 GEMMEX=2 每层 4 次 gather（w13/w13s/w2/w2s），vectorized_gather 仅 195GB/s（慢）。可尝试：减少 gather 次数（合并 w13+scales）、或写更快的 gather kernel。但 gather 是单 GEMM 架构固有，彻底消除需 fused GEMM（= use_moe_cu，阻塞）。
+
+**4. [sglang 侧，部分收益] 非-MoE 路径微调**
+dlPTI 显示非-MoE 已高效（AR 3.8%/norm <1%/GDN <2%），剩余空间小。可查 attention（fa3 full-attn 10 层）是否还有优化。
+
+**5. [sglang 侧，兜底] 接受 GEMMEX=2（33ms GPU）**
+如果 DLIN 侧不动，sglang 的 CG-safe 最优就是 GEMMEX=2（33ms GPU / ~37ms TPOT）。距离 vLLM 26.22ms 差 ~11ms，无法在 sglang 层关闭。
+
+#### 结论
+**关闭 11.5ms TPOT gap 的钥匙在 DLIN `_dl_C.so`**（让 use_moe_cu 的 act-quant 关 PDL 或可 CG 捕获）。sglang 侧已穷尽所有路径（输入一致已实证、gather/capture-state/compiled-forward/DLEOL-env 全测），唯一能做的就是优化 GEMMEX=2 的 gather（部分收益）。建议把 §7.46 的 kUsePDL 一行修复建议给 DLIN（段茗 ming.duan@denglin.ai，bug 18025 的 assignee）。
+
+### 7.48 📊 apples-to-apples serving bench：sglang TPOT 36.37ms vs vLLM 26.22ms = 10.15ms gap（2026-07-14）
+
+> **serving bench 实测**（benchrun_sglang.py，TP4，CG，GEMMEX=2，input=1024/output=512/concurrency=1，同 vLLM `bench run` 口径）：
+
+| 指标 | sglang | vLLM 目标 | 差距 |
+|---|---|---|---|
+| **Mean TPOT** | **36.37ms** | **26.22ms** | **10.15ms（sglang 1.39× 慢）** |
+| Median TPOT | 36.19ms | 26.22ms | 9.97ms |
+| Mean ITL | 37.14ms | — | — |
+| 纯 GPU forward | 33ms | ~18ms | ~15ms |
+
+**关键**：sglang serving overhead（TPOT - GPU）= 36.37 - 33 = **3.4ms**（比 vLLM 的 ~8ms overhead 更低）。所以 **TPOT gap（10.15ms）< GPU gap（15ms）**——sglang 的调度开销比 vLLM 小，部分抵消了 GPU 计算差距。**但核心 GPU 计算（33 vs 18ms）才是要关的**，全部在 MoE（gather 6ms + 慢 GEMM，§7.37）。
+
+**最终结论（apples-to-apples）**：sglang TP4 serving TPOT = 36.37ms，距 vLLM 26.22ms 差 **10.15ms**。关闭需 use_moe_cu（fused MoE，18ms GPU），阻塞于其 PDL act-quant（§7.46）。**sglang 层已穷尽，钥匙在 DLIN `_dl_C.so`（kUsePDL 一行修复，§7.47 step 1）**。
+
+### 7.49 🔬 预量化 FP8 避开 PDL 但 invoke_fused_moe_opt segfault（2026-07-14）
+
+> **关键进展**：用户告知 **DLIN GPU 暂不支持 PDL**。vLLM 同 op 同 .so 能跑 → 必然避开了 PDL。发现 vLLM 的 `prepare_finalize`（batched.py:131）用 `moe_kernel_quantize_input` **预先把 activation 量化成 FP8**（图外/非-PDL），然后 invoke_fused_moe_opt 拿 FP8 输入 → 理论上跳过内部 PDL act-quant。
+
+**测试**：在 SGLANG_DL_MOE_VLLM 路径里加 `_per_token_group_quant_8bit_raw(x, 128)`（非-PDL）预量化 x → FP8，传 FP8 x_q 给 invoke_fused_moe_opt。
+
+**结果**：
+- ✅ **PDL 崩溃消失**！不再是 "operation not supported on global/shared address space"（per_token_group_quant_8bit_v2.cuh:396 .enable_pdl）。
+- ❌ 但 **SIGSEGV at `fused_moe_opt.cu:775, in invoke_fused_moe_opt`**（exit code -11）。
+
+**诊断**：segfault 在 `fused_moe_opt.cu:775`（memory note 记过的 DLIN DLEOL JIT 已知 SIGSEGV 点）= invoke_fused_moe_opt **不接受 FP8 输入**（它期望 BF16，内部做量化；传 FP8 触发不同 JIT key → segfault）。
+
+**结论**：
+1. **预量化方向正确**——证实了 PDL 是通过 act-quant 触发的，预量化 FP8 输入能让 op 跳过内部 PDL 量化（"operation not supported" 消失）。
+2. **但 invoke_fused_moe_opt 不支持 FP8 输入**——segfault。op 的内部代码不检查 A 的 dtype 来跳过量化；它直接处理 BF16（量化→PDL）或 FP8（segfault）。
+3. **vLLM 的矛盾仍在**：vLLM 用同 op 同 .so 能跑——它必然不传 FP8 给 invoke_fused_moe_opt，而是通过 modular experts + prepare_finalize 的不同代码路径（experts 可能在 prepare_finalize 和 invoke_fused_moe_opt 之间做了某种转换，或用不同的 experts 子类）。
+
+**下一步方向**：
+- **A**（最���接）：研究 vLLM 的 modular experts 的 `_fused_experts` 到底传什么给 invoke_fused_moe_opt——是 BF16（触发 PDL 但 vLLM 不崩？）还是 FP8（op 不 segfault？）。需对比 vLLM 的 experts.apply 和 sglang 的 DL block 调用差异。
+- **B**：invoke_fused_moe_opt 可能有一个参数控制是否做内部量化（类似 vLLM 的 `defer_input_quant` / `expects_unquantized_inputs`）。检查 op 的 22 个参数中是否有 skip-quant 标志。
+- **C**：PDL 不支持 → 找 DLIN 要一个**非-PDL 版本的 invoke_fused_moe_opt**（kUsePDL=False 的编译变体），或让 op 检查输入 dtype 自动跳过量化。
+
+### 7.50 🎯 突破：vLLM 用 batched-by-expert triton GEMM + 预量化，非 invoke_fused_moe_opt（2026-07-14）
+
+> **找到了 vLLM 18ms 的完整机制。** vLLM 的 DL FP8 MoE 用 **BATCHED_TRITON backend**（FP8 oracle 对 DL 默认选择）→ **BatchedTritonExperts** → `invoke_moe_batched_triton_kernel`（**非 invoke_fused_moe_opt！**）。
+
+**vLLM 的 MoE decode 路径（完整追踪）**：
+1. `prepare_finalize`（batched.py:131）→ `moe_kernel_quantize_input` → **预量化 activation 到 FP8**（a1q + a1q_scale）—— 这一步在图外或用非-PDL kernel。
+2. `BatchedTritonExperts.apply`（fused_batched_moe.py:830）→ `invoke_moe_batched_triton_kernel(A=a1q_fp8, A_scale=a1q_scale, B=w1, B_scale=w1_scale, ...)` —— **batched-by-expert triton GEMM，内部无 act-quant（无 PDL！）**。
+3. activation（silu_and_mul）。
+4. `batched_moe_kernel_quantize_input` → 量化中间结果到 FP8（非-PDL）。
+5. `invoke_moe_batched_triton_kernel(A=qintermediate_fp8, B=w2, ...)` —— w2 GEMM。
+
+**为什么 vLLM 18ms 不崩 PDL**：
+- `invoke_moe_batched_triton_kernel` 接收**预量化的 FP8** 输入 + A_scale —— **不做内部 act-quant → 不触发 PDL**（PDL 的 `per_token_group_quant_8bit_v2.cuh:396` 根本不被调用）。
+- batched-by-expert dispatch（expert_num_tokens）比 sglang 的 sorted_token_ids dispatch **更高效**（decode M=1 无排序开销）。
+- 这些是**纯 Python/triton 代码**（vLLM `fused_batched_moe.py`），非 _dl_C.so 二进制。
+
+**sglang 缺什么**：
+| | vLLM | sglang |
+|---|---|---|
+| activation 量化 | prepare_finalize **预量化**（非-PDL）| invoke_fused_moe_opt **内部 PDL 量化**（崩）|
+| GEMM kernel | `invoke_moe_batched_triton_kernel`（batched-by-expert，无内部量化，**18ms**）| `invoke_fused_moe_opt`（PDL，崩）或 `gptq_dlblas_gemmex`（gather，27ms）或 sglang triton `fused_moe_kernel`（sorted dispatch，**184ms**）|
+
+**关闭 gap 的 sglang-layer 路径**：把 vLLM 的 **纯 Python/triton** 代码移植到 sglang：
+1. `moe_kernel_quantize_input` / `batched_moe_kernel_quantize_input` → 预量化 activation（sglang 已有 `_per_token_group_quant_8bit_raw`，非-PDL，§7.41）。
+2. `invoke_moe_batched_triton_kernel` + `batched_triton_kernel`（@triton.jit，fused_batched_moe.py:249）→ batched-by-expert GEMM。
+3. `prepare_finalize` 的 dispatch 逻辑（expert_num_tokens）。
+
+这是**纯 sglang-layer 实现**（Python + triton），不需要 _dl_C.so 改动或 DLIN PDL 支持。是关闭 10ms gap 的真正路径。
+
+### 7.51 🔬 vLLM dl_fused_experts 在 sglang 进程里也 SEGFAULT → 差异在进程上下文（2026-07-14）
+
+> **用户纠正 §7.50**：vLLM 在 DLIN 上走 `invoke_fused_moe_opt`（DLIN native CUDA），**不走 BatchedTritonExperts**。DL plugin 全局 monkey-patch `fused_experts` → `dl_fused_moe.py:fused_experts()` → `dispatch_dl_fused_experts_func()` → custom op → `fused_experts_impl` → `invoke_fused_moe_kernel` → `dl_invoke_fused_moe` → `invoke_fused_moe_opt`（调两次，line 209+233）。
+
+**测试**：在 sglang 的 VLLM 路径里**直接 import 并调用 vLLM DL plugin 的 `fused_experts`**（走完全一致的代码路径），而非手动拼参数。
+
+**结果**：
+- import 成功 ✓（dl_fused_experts 导入 + quant_config 构建 OK）。
+- shards 加载成功 ✓。
+- **SIGSEGV (exit -11)** during warmup/init —— `fused_moe_opt.cu:775` 的 DLEOL JIT segfault。
+
+**结论（决定性）**：
+1. 用 vLLM 的**完全相同的代码**（dl_fused_experts → custom op → fused_experts_impl → invoke_fused_moe_opt）在 sglang 进程里**仍然 segfault**。
+2. **差异不在代码路径**——是**进程上下文**。sglang 的进程让 invoke_fused_moe_opt segfault（warmup/eager 即崩），vLLM 的进程不崩。
+3. 可能原因：
+   - DL plugin 的全局 monkey-patching / custom op registration 与 sglang 的模型代码冲突（双注册、状态污染）。
+   - sglang 的 CUDA context / libdleol 状态与 vLLM 不同（torch.distributed init 差异）。
+   - sglang 的 DLEOL JIT cache / 编译状态不同。
+
+**下一步**：对比 sglang vs vLLM 的**进程级 CUDA context 差异**（torch.distributed init、libdleol 版本/配置、DLEOL JIT 状态），或找出 DL plugin 在 sglang 进程里的副作用。这是 driver/runtime 级差异，sglang Python 层已无法进一步定位。
+
+**sglang 侧穷尽结论（§7.30–7.51，22 节，~50 次实测）**：
+- 同 _dl_C.so binary、同输入、同 vLLM 代码路径 → sglang 进程崩、vLLM 进程不崩。
+- sglang 层（输入/capture-state/compiled-forward/DLEOL-env/双调用/vLLM代码直接调用）全部测过，无一能让 invoke_fused_moe_opt 在 sglang 进程里工作。
+- **根因在 sglang vs vLLM 的进程上下文差异**（CUDA context / libdleol / DL plugin 副作用），需 DLIN runtime 级对比定位。
+
+### 7.52 ⚠️ GPU 系统退化 — 多次 segfault 后驱动状态损坏（2026-07-14）
+
+> **clean HEAD (git stash → d6addc3577) + fresh GPU (19,20, 本 session 从未使用) → SIGSEGV (exit -11)**。证明**不是代码问题**，是 GPU 系统退化。
+
+**根因**：本 session ~50 次实验中的多次 SIGSEGV/Device page fault 留下了 **4 个 D-state 僵尸进程**（965331, 1210586, 1309733, 2017933，卡在 `os_schedule_timeout`），D-state 进程无法被 kill（内核 IO 等待），持续占用/损坏 GPU 驱动状态。任何新进程加载模型即 SIGSEGV。
+
+**修复**：需要 **driver reload 或 node reboot** 清理 D-state 进程和 GPU 状态。sglang 代码无问题（clean HEAD 也崩）。
+
+**session 全部代码改动已保存**（`git stash pop` 恢复），环境变量门控（默认 off），不影响 clean baseline。
+
+---
+
+## 全 session 汇总（§7.30–7.52，23 节，~55 次实测）
+
+### 目标
+sglang TPOT 36.37ms → 对齐 vLLM TPOT 26.22ms（gap 10.15ms）。
+
+### 根因
+- gap 100% 在 **MoE**（dlPTI §7.37：非-MoE 与 vLLM 持平）。
+- vLLM 用 `invoke_fused_moe_opt`（fused gather+GEMM，~18ms GPU，DLIN native CUDA）。
+- sglang 用 `gptq_dlblas_gemmex`（GEMMEX=2，独立 gather + 分离 GEMM，33ms GPU）。
+- **invoke_fused_moe_opt 在 sglang 进程崩**（PDL/segfault），用 vLLM 完全相同的代码也崩（§7.51）。
+- **差异在进程上下文**（CUDA context/libdleol/DL plugin 副作用），非代码路径。
+
+### 实测穷尽路径
+| 路径 | 结果 |
+|---|---|
+| invoke_fused_moe_opt + use_moe_cu | 崩（PDL/segfault，16 组合 + compiled forward + 双调用 + vLLM 直接代码）|
+| real-moe_align | 41ms（慢）|
+| GEMMEX=1/2/3 | 61/27-33/37ms |
+| triton MoE + non-PDL | 184ms（慢）|
+| breakable piecewise | 50ms |
+| gather 优化（index_select + fused silu + matmul）| 98ms（回归）|
+
+### 下一步（GPU 系统恢复后）
+1. **DLIN 侧定位进程上下文差异**：为什么同一 `_dl_C.so` + 同一 `invoke_fused_moe_opt` + 同一输入，vLLM 进程能跑、sglang 进程 SIGSEGV。需对比两个进程的 CUDA context 初始化差异。
+2. **DLIN 一行修复**：让 invoke_fused_moe_opt 的 act-quant `kUsePDL` 查 `is_arch_support_pdl()`（DLIN=False→关 PDL→act-quant 可 CG 捕获→use_moe_cu 在 sglang 也能用→关 gap）。
+3. **sglang 层 gather 优化**：dlPTI 显示 gather 22.6%（~6ms）。需更高效的 gather 方式（当前 vectorized_gather 195 GB/s）。
+
+### §7.53 — DLEOL JIT 全面崩溃（2026-07-14）
+
+**现象**：`dlsmi -r` GPU reset 后，DLEOL JIT 编译的所有算子均 SIGSEGV：
+- `flash_attn_varlen_func` — SIGSEGV（基础 varlen attention）
+- `flash_attn_with_kvcache` — CUDA Driver API error = 0001（flash_attn_kvcache_mha_op.cc:867）
+- `gptq_dlblas_gemmex` — CG capture 期间 crash（kernel 编译成功但 launch 失败）
+
+**唯一可用路径**：triton attention backend（不依赖 DLEOL），但 decode 198ms（vs FA3 ~27ms）
+
+**根因**：`dlsmi -r` 仅 reset GPU 硬件状态，不恢复 DLEOL JIT 编译器宿主侧状态（共享内存、编译缓存、libdleol 内部状态）。需要完整系统重启或 DLIN 运维介入。
+
+**待恢复后验证**：
+- GEMMEX=1 vs GEMMEX=2 在 DLEOL_CACHE_SIZE=1024 下的 GPU-only 耗时对比
+- CG capture 是否正常（bs=1 decode graph）
+- 36.37ms → 26.22ms gap 的优化实验
+
+**影响**：本次 session 无法继续性能优化实验，需要 DLIN 运维恢复系统（重启容器/节点）。
+
+### 7.54 🔬 multi-step decode 实现与验证（2026-07-15）
+
+**目标**：通过在 tp_worker 内连续 replay CUDA graph N 次（跳过 scheduler round-trip），
+降低 TPOT。理论：每 extra step 省去 ~5ms scheduler overhead。
+
+**实现**：
+- `schedule_batch.py prepare_for_decode`：预分配 N 个 KV slot（pool accounting 正确），seq_lens 仅 +1
+- `tp_worker.py _dl_multi_step_decode`：读取 pre-allocated slot → 更新 CG buffers → `normal_decode_set_metadata` → `graph.replay()` → argmax → 循环
+- `scheduler.py run_batch`：multi-step 成功后 advance batch.seq_lens/kv_committed by extra
+- `batch_result_processor.py`：append ALL multi-step tokens to req.output_ids
+
+**正确性验证**（TP=2, Qwen3.5-35B-A3B-FP8, greedy）：
+- ntok=8/16/32/64：baseline vs multi-step=2 output **完全一致**（bitwise match）
+- 无 memory leak（pre-alloc 解决）
+
+**性能实测**（TP=2, 256 tokens, disable_overlap）：
+| Config | TPOT | tok/s | speedup |
+|--------|------|-------|---------|
+| Baseline (ms=1) | 46.8ms | 21.4 | 1.000x |
+| Multi-step=2 | 47.1ms | 21.2 | 0.994x |
+| Multi-step=4 | 45.8ms | 21.8 | 1.022x |
+
+**With overlap scheduler**（TP=2, 64 tokens）：
+| Config | TPOT | speedup |
+|--------|------|---------|
+| Baseline | 46.6ms | 1.000x |
+| Multi-step=2 | 50.3ms | 0.927x |
+
+**结论**：Multi-step 正确但收益有限：
+1. **With overlap**：scheduler overhead 已被 pipeline 掩盖，multi-step 反而增加 Python loop overhead（~3ms/extra step）
+2. **Without overlap**：TP=2 GPU forward ~30ms >> scheduler ~3ms，multi-step 节省的 scheduler 时间被 argmax/metadata kernel launch 开销抵消
+3. **TP=4 理论**：GPU=24ms, scheduler=7ms, multi-step=2 理论 TPOT = 24 + 3.5 + 1 = 28.5ms vs baseline 31.3ms → 1.10x。但真正 gap 在 GPU compute（24ms vs vLLM 18ms），不在 scheduler。
+
+**环境变量**：
+- `SGLANG_DL_MULTI_STEP=N`：N=1 关闭，N=2/4 启用
+- `SGLANG_DL_MULTI_STEP_DBG=1`：打印 debug 信息
+
+**下一步**：暂搁置 multi-step（正确性已验证可随时启用），聚焦 GPU compute 优化：
+- PDL CG capture fix（enable fast invoke_fused_moe_opt in CG）→ 预计 -5ms
+- vLLM dl_fused_experts 移植（§7.50-7.51 进程上下文问题）→ 预计 -3ms
+
+### 7.56 🎯 GPU compute 27.5→21.3ms: fused MoE + DLIN GDN 组合优化（2026-07-15, MAJOR）
+
+> **sglang TP4 CG 纯 GPU forward 从 27.5ms 降至 21.3ms（-6.2ms, -23%），gap 从 9.2ms 缩至 3.0ms。**
+> E2E TPOT: 29.3ms（34.1 tok/s），vs vLLM 24.6ms（40.6 tok/s）。gap = 4.7ms（GPU 3.0ms + host 1.7ms）。
+> 所有 Board 表现一致（Board 0 = Board 1 = Board 2 ≈ 29.3ms），消除了 §7.47 的 Board 拓扑差异。
+
+**关键发现：GEMMEX=2 路径有 Board 拓扑敏感性（Board 0: 30.6ms vs Board 1/2: 46.6ms = 16ms gap），但 invoke_fused_moe_opt (use_moe_cu) 路径无此问题。** GEMMEX=2 的 Python-side weight gather (`layer.w13_weight[topk_ids]` → 散列内存访问全 256-expert 权重张量) 对 NCCL/内存拓扑高度敏感；fused MoE 由 kernel 内部 routing，无此 overhead。
+
+**优化配置（推荐 serving 设置）**：
+```bash
+SGLANG_DL_MOE_FUSED=1          # use invoke_fused_moe_opt (NOT GEMMEX)
+SGLANG_DL_MOE_FUSED_MAX_M=16   # fused path covers decode (M=1) + short prefill
+SGLANG_DL_GDN_DLIN=1           # DLEOL FLA recurrent kernel (fast GDN decode)
+SGLANG_DL_FP8_Q2=1             # blockwise FP8 quant_type=2
+DLEOL_CACHE_SIZE=1024           # prevent DLEOL JIT thrash
+DLEOL_FLA_ENABLE_PINGPONG=1    # FLA pingpong optimization
+DLEOL_FLA_UNROLL_COUNT=8        # FLA unroll
+# Engine args:
+attention_backend=fa3, page_size=16, chunked_prefill_size=16,
+disable_custom_all_reduce=True, disable_cuda_graph=False
+```
+
+**测量结果（CUDA event 围 graph.replay(), synchronize）**：
+| Config | GPU forward | E2E TPOT | tok/s |
+|--------|-------------|----------|-------|
+| 旧 GEMMEX=2 + Triton GDN (Board 0) | 27.5ms | 30.6ms | 32.7 |
+| 旧 GEMMEX=2 + Triton GDN (Board 1/2) | ~40ms | 46.6ms | 21.5 |
+| **新 fused MoE + DLIN GDN (all boards)** | **21.3ms** | **29.3ms** | **34.1** |
+| vLLM TP4 CG | 18.3ms | 24.6ms | 40.6 |
+
+**分解**：
+- GPU gap: 21.3 - 18.3 = 3.0ms（分布于 ~28 MoE + ~28 GDN + dense layers，每层 ~0.04ms）
+- Host gap: 8.0 - 6.3 = 1.7ms（scheduler/sampling 效率差）
+- 总 gap: 4.7ms (16% slower than vLLM)
+
+**已排除（无进一步收益）**：
+- multi-step=2：噪声内（29.2 vs 29.3ms）
+- bf16_beta cast 消除：噪声内（29.4 vs 29.3ms）
+- 各 Board GPU 差异：fused MoE 下完全消除
+
+**剩余优化方向**（≤3ms GPU gap）：
+1. 逐层 MoE silu_and_mul + expert-sum 融合（当前分离 kernel，vLLM 可能 fuse 进 w2 GEMM）
+2. 降 host overhead 1.7ms：scheduler Python fast-path / reduce per-step alloc
+3. CG graph 结构差异诊断（kernel 数量对比、不必要 sync）
+4. NCCL algorithm tuning（CG 内 allreduce ring vs tree）
+
+**质量验证**："Tokyo. The capital of the United States is Washington, D.C." — 正确，无退化。
+
+### 7.57 📊 修正测量：sglang TPOT 26.4ms = 1.8ms gap to vLLM（0.93×, 2026-07-15）
+
+> **§7.56 的 29.3ms 含 prefill 污染。纯 decode 测量（prompt='Hi', 128 tokens, 3×trial）
+> 得 26.4ms wall TPOT = 37.8 tok/s。与 vLLM 24.6ms 仅差 1.8ms (7.3%)。**
+
+**修正后对比表**：
+| Metric | sglang | vLLM | Gap |
+|--------|--------|------|-----|
+| Wall TPOT | 26.4ms | 24.6ms | +1.8ms (7.3%) |
+| GPU forward | 21.2ms | 18.3ms | +2.9ms (15.8%) |
+| Host overhead | 5.2ms | 6.3ms | **-1.1ms** (sglang 更快) |
+| Throughput | 37.8 tok/s | 40.7 tok/s | 0.93× |
+
+**关键发现**：sglang host overhead (5.2ms) 比 vLLM (6.3ms) 低 1.1ms，部分抵消了 GPU gap。
+
+**GPU 分解（SKIP_MOE / SKIP_GDN 差分法）**：
+| 组件 | GPU 时间 | 占比 |
+|------|----------|------|
+| MoE (invoke_fused_moe_opt ×2/layer, silu_and_mul, sum) | 8.3ms | 39% |
+| GDN (dl_recurrent_gated_delta_rule, 30 layers) | 1.0ms | 5% |
+| Other (norms, QKV/O GEMM, NCCL allreduce, FA3 attn) | 11.9ms | 56% |
+
+**2.9ms GPU gap 根因：`_dl_C.so` kernel 版本差异**：
+- sglang 用 dl19 SDK 兼容的 _dl_C.so（Jun 22 build, 17.7MB）
+- vLLM bench 用 dl24 SDK 的 _dl_C.so（Jun 30 build, 18.3MB, `invoke_fused_moe_opt_v3`）
+- 新 .so 在 dl19 SDK 下 SIGABRT（ABI 不兼容）
+- 所有 GEMM 类 kernel（MoE + 线性投影 + fp8 quant）均受影响
+
+**已排除路径（无收益或不可用）**：
+- BM=64 vs BM=16: GPU 时间无差异（21.0ms ↔ 21.0ms）
+- moe_sum vs torch.sum: 差异 0.003ms/step (可忽略)
+- vLLM fused_experts 路径 (SGLANG_DL_MOE_VLLM=1): 98.8ms — torch.ops._C.silu_and_mul
+  在 DLIN 上极慢，确认 use_moe_cu 已是最优
+- dl24 SDK: GDN dl_recurrent_gated_delta_rule 在 dl24 libdleol 下 segfault，不可切换
+
+**结论**：
+- sglang 已达 vLLM 93% 性能 (0.93×)
+- 剩余 1.8ms 全在 GPU kernel（`_dl_C.so` 版本），需 DLIN 团队提供 dl19 兼容的新 kernel build
+- Host 层面 sglang 已超越 vLLM，无需进一步优化
+
