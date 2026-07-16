@@ -137,7 +137,7 @@ pick_model() {
       ;;
     qwen35-35b)
       MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
-      DLIN_TP_SIZE=2; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
+      DLIN_TP_SIZE=4; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
       # mem_fraction=0.60 (not 0.85): the stable bf16-bmm prefill path (M>16) dequants
       # expert weights and needs several GB headroom, else OOM (docs §7.14). 0.85 OOMs.
       DLIN_MEM_FRACTION=0.60; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
@@ -148,12 +148,16 @@ pick_model() {
       #   MAX_BF16_M=2048 — bf16-bmm (torch-native, stable) for larger prefill (17-2048).
       #                     Slow but the only non-crashing path on dl24.
       export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=16 SGLANG_DL_MOE_MAX_BF16_M=2048
-      # TP=2 needs 2 GPUs; ensure CUDA_VISIBLE_DEVICES has >=2 devices.
+      # Matches the tuned TP4 config in scripts/dl/compare_tp4.py (~27ms TPOT = ~vLLM parity):
+      # FP8 Q2 GEMM, DLIN GDN op, multi-step decode, FLA pingpong/unroll.
+      export SGLANG_DL_FP8_Q2=1 SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MULTI_STEP=1
+      export DLEOL_CU_ADDRESS_CHECK=0 DLEOL_FLA_ENABLE_PINGPONG=1 DLEOL_FLA_UNROLL_COUNT=8
+      # TP=4 needs 4 GPUs; ensure CUDA_VISIBLE_DEVICES lists >=4 devices.
       local _ndev
       _ndev=$(echo "${CUDA_VISIBLE_DEVICES:-0}" | tr ',' '\n' | wc -l)
-      if [ "$_ndev" -lt 2 ]; then
-        CUDA_VISIBLE_DEVICES="0,1"
-        log "TP=2: set CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (override with CUDA_VISIBLE_DEVICES=X,Y)"
+      if [ "$_ndev" -lt 4 ]; then
+        CUDA_VISIBLE_DEVICES="0,1,2,3"
+        log "TP=4: set CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (override with CUDA_VISIBLE_DEVICES=...)"
       fi
       ;;
     *) die "unknown preset '$1'. Available: qwen3-1.7b qwen35-35b" ;;
@@ -426,11 +430,11 @@ Usage:
   ./run_sglang.sh install               # editable-install sglang (DLIN pyproject)
   ./run_sglang.sh test | smoke          # import + GPU smoke (torch.version.dl, matmul, platform)
 
-Quick tests (handy for verifying a model runs on DLIN):
-  ./run_sglang.sh gen                   # end-to-end generation (default Qwen3-1.7B)
-  ./run_sglang.sh gen -m <model> -p "prompt" -n 32 -b fa3
-  ./run_sglang.sh gen -M qwen35-35b     # use optimized preset for Qwen3.5-35B-FP8
-  ./run_sglang.sh serve --port 30000    # HTTP server (OpenAI-compatible)
+One-click run Qwen3.5-35B-A3B-FP8 (TP4) — the DEFAULT model for gen/serve:
+  ./run_sglang.sh serve                 # OpenAI-compatible HTTP server on :30000
+  ./run_sglang.sh gen                   # one-shot generation (prints text + tok/s)
+  ./run_sglang.sh gen -m <model> -p "prompt" -n 32 -b fa3   # override model/prompt
+  ./run_sglang.sh serve -M qwen3-1.7b   # any other model via -M/-m
   ./run_sglang.sh bench -c 16           # concurrent bench (auto-starts a server)
   ./run_sglang.sh bench --offline       # per-batch latency, no server (bench_one_batch)
   ./run_sglang.sh benchrun -M qwen35-35b --num-prompts 8   # vLLM-format bench (auto-starts a server)
@@ -439,7 +443,7 @@ Quick tests (handy for verifying a model runs on DLIN):
 
 Optimized model presets (-M flag):
   -M qwen3-1.7b    Qwen3-1.7B (default, bf16)
-  -M qwen35-35b    Qwen3.5-35B-A3B-FP8 (TP=2, fused MoE, CG; decode ~18 tok/s = 1.45x vLLM)
+  -M qwen35-35b    Qwen3.5-35B-A3B-FP8 (TP=4, fused MoE + multi-step, CG; ~27ms TPOT = ~vLLM) [gen/serve default]
                    add -S for NGRAM spec-decode -> 35-40 tok/s = 2.8-3.2x vLLM (docs 7.12)
 
   Example: ./run_sglang.sh gen -M qwen35-35b -S -n 128      # 2x+ vLLM generation
@@ -492,8 +496,8 @@ EOF
 parse_test_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      -m|--model)          MODEL_PATH="$2"; shift 2;;
-      -M|--model-preset)   pick_model "$2"; shift 2;;
+      -m|--model)          MODEL_PATH="$2"; MODEL_EXPLICIT=1; shift 2;;
+      -M|--model-preset)   pick_model "$2"; MODEL_EXPLICIT=1; shift 2;;
       -p|--prompt)         PROMPT="$2"; shift 2;;
       -n|--max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
       -b|--backend)        ATTN_BACKEND="$2"; shift 2;;
@@ -559,10 +563,9 @@ phase_gen() {
 
 #-------------------------------------------------------------------------------
 # Phase: serve -- OpenAI-compatible HTTP server (launch_server) on DLIN.
-#   WARNING: currently exits at import time with ModuleNotFoundError: flashinfer
-#   (launch_server eagerly imports multimodal models that need flashinfer, which
-#   DLIN lacks). The in-process 'gen' path is unaffected. Kept here so it works
-#   unchanged once the flashinfer imports are guarded.
+#   Verified: launch_server imports cleanly (no flashinfer ImportError) and the
+#   TP4 server boots for Qwen3.5-35B-A3B-FP8 — same launch_server path the bench
+#   harness (start_server_bg) uses. First launch JIT-compiles (~5 min), then cached.
 #-------------------------------------------------------------------------------
 phase_serve() {
   log "Phase [serve]: HTTP server on DLIN (launch_server)"
@@ -579,6 +582,8 @@ phase_serve() {
   [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
   [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
   [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
+  # DL: TP>1 on DLIN must use NCCL — the custom allreduce kernel hits HC_CUK Error=28.
+  [ "$tp" -gt 1 ] && extra_flags="$extra_flags --disable-custom-all-reduce"
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
   log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT | ngram=$USE_NGRAM"
@@ -617,6 +622,8 @@ start_server_bg() {  # launches launch_server detached; sets SERVER_PID
   [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
   [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
   [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
+  # DL: TP>1 on DLIN must use NCCL — the custom allreduce kernel hits HC_CUK Error=28.
+  [ "$tp" -gt 1 ] && extra_flags="$extra_flags --disable-custom-all-reduce"
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
   BENCH_LOG="${BENCH_LOG:-/tmp/sglang_bench_server.log}"
@@ -782,7 +789,11 @@ PHASE="${1:-all}"; shift || true
 case "$PHASE" in
   gen|serve|bench|benchrun) parse_test_args "$@" ;;
 esac
-apply_ngram_overrides   # no-op unless -S/--spec-ngram (or USE_NGRAM=1)
+# One-click default: gen/serve with no -m/-M -> Qwen3.5-35B-A3B-FP8 (TP4 preset).
+if [ -z "${MODEL_EXPLICIT:-}" ]; then
+  case "$PHASE" in gen|serve) pick_model qwen35-35b ;; esac
+fi
+apply_ngram_overrides   # no-op unless -S/--spec-ngram; must run AFTER pick_model
 
 case "$PHASE" in
   setup)        phase_setup ;;

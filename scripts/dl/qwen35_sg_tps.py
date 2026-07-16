@@ -30,6 +30,9 @@ def main():
         context_length=int(os.environ.get("CONTEXT_LEN", "4096")),
         max_running_requests=int(os.environ.get("MAX_RUNNING_REQUESTS", "0")) or None,
     )
+    # DL: TP>1 on DLIN needs NCCL (custom allreduce kernel -> HC_CUK Error=28).
+    if TP > 1:
+        kw["disable_custom_all_reduce"] = True
     if CG and CG_MAX_BS:
         kw["cuda_graph_max_bs_decode"] = CG_MAX_BS
     # DL begin — NGRAM speculative decoding (run_sglang.sh -S). mamba_track_interval

@@ -3289,12 +3289,15 @@ class Scheduler(
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
-                            # DL: skip copy_to_cpu for non-logprob decode
-                            # (keeps tensors on GPU, saves ~1-2ms CPU overhead)
+                            # DL begin — skip copy_to_cpu for non-logprob non-spec decode
+                            # (keeps tensors on GPU, saves ~1-2ms CPU overhead).
+                            # Must NOT skip for spec decode — _resolve_spec_v2_tokens
+                            # asserts next_token_ids.is_cpu / accept_lens.is_cpu.
                             import os as _os
-                            if not batch.return_logprob:
+                            if not batch.return_logprob and batch.spec_algorithm.is_none():
                                 batch_result.copy_done = self.device_module.Event()
                                 batch_result.copy_done.record()
+                            # DL end
                             else:
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,

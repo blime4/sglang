@@ -21,9 +21,10 @@ import sglang
 MODEL = "/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
 PROMPT = os.environ.get("PROMPT", "Explain how neural networks learn from data.")
 MAX_NEW = int(os.environ.get("MAX_NEW_TOKENS", "128"))
-TP = int(os.environ.get("TP_SIZE", "2"))
+TP = int(os.environ.get("TP_SIZE", "4"))
 NUM_STEPS = int(os.environ.get("NUM_STEPS", "4"))
 NUM_DRAFT = int(os.environ.get("NUM_DRAFT", str(NUM_STEPS + 1)))
+MEM_FRAC = float(os.environ.get("MEM_FRAC", "0.60"))
 
 
 def log(m):
@@ -41,9 +42,10 @@ def main():
         tp_size=TP,
         attention_backend="fa3",
         page_size=16,
-        mem_fraction_static=0.60,
+        mem_fraction_static=MEM_FRAC,
         disable_cuda_graph=True,  # draft CG off on DLIN initially (per MTP report)
         context_length=4096,
+        disable_custom_all_reduce=True,  # DL: TP>1 on DLIN needs NCCL (HC_CUK Error=28)
         speculative_algorithm="FROZEN_KV_MTP",
         speculative_eagle_topk=1,
         speculative_num_steps=NUM_STEPS,
