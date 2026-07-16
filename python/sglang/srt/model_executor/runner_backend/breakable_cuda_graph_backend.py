@@ -232,6 +232,31 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        # DL begin — measure pure GPU time of the breakable replay (segments +
+        # eager breaks). SGLANG_DL_TIME_REPLAY=1. See docs/dl §7.38.
+        import os as _dl_os
+        if _dl_os.environ.get("SGLANG_DL_TIME_REPLAY") == "1":
+            if not hasattr(self, "_dl_replay_times"):
+                self._dl_replay_times = []
+                self._dl_s = torch.cuda.Event(enable_timing=True)
+                self._dl_e = torch.cuda.Event(enable_timing=True)
+            self._dl_s.record()
+            self._graphs[shape_key].replay()
+            self._dl_e.record()
+            self._dl_e.synchronize()
+            self._dl_replay_times.append(self._dl_s.elapsed_time(self._dl_e))
+            if len(self._dl_replay_times) % 8 == 0:
+                ts = self._dl_replay_times[-8:]
+                ts_sorted = sorted(ts)
+                med = ts_sorted[len(ts_sorted) // 2]
+                print(
+                    f"[DL breakable GPU] step={len(self._dl_replay_times)} "
+                    f"median8={med:.2f}ms mean8={sum(ts)/len(ts):.2f}ms "
+                    f"segs={len(self._graphs[shape_key]._segments)}",
+                    flush=True,
+                )
+            return self._outputs[shape_key]
+        # DL end
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 

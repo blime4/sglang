@@ -2113,6 +2113,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     return StandardCombineInput(hidden_states=out)
                 # DL end (vLLM-exact MoE)
                 # DL begin — use_moe_cu: trivial dispatch tensors, skip moe_align_block_size
+                # DL: SKIP_MOE for profiling — measures non-MoE GPU time
+                if _os.environ.get("SGLANG_DL_SKIP_MOE") == "1":
+                    return StandardCombineInput(hidden_states=torch.zeros_like(x))
                 c13 = torch.empty(M, topk, 2 * inter, dtype=x.dtype, device=x.device)
                 if not hasattr(layer, "_dl_moecu_srt"):
                     _PAD = 4096

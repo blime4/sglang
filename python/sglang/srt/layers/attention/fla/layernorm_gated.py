@@ -253,7 +253,8 @@ def _layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # DL: explicit USE_GDC constexpr (not **pdl_kwargs) for torch.compile compat.
+    _dl_supports_pdl = is_arch_support_pdl()  # DL:
     with device_context(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
@@ -277,7 +278,8 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
-            **pdl_kwargs,
+            USE_GDC=_dl_supports_pdl,  # DL:
+            **({"launch_pdl": True} if _dl_supports_pdl else {}),  # DL:
         )
     return out, mean, rstd
 

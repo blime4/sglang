@@ -514,6 +514,18 @@ def _ensure_dl_C():
             hasattr(torch.ops, "_dl_C")
             and hasattr(torch.ops._dl_C, "gptq_dlblas_gemmex")
         )
+        # DL begin — register FakeTensor (meta) impls so torch.compile keeps the
+        # _dl_C ops opaque (else inductor decomposes them → 82ms slow graph).
+        if _dl_C_loaded:
+            try:
+                from sglang.srt.layers.quantization.dl_compile_meta import (
+                    dl_register_meta as _dl_meta,
+                )
+
+                _dl_meta()
+            except Exception:
+                pass
+        # DL end
 
 
 def dlblas_w8a8_block_fp8_linear(

@@ -688,8 +688,20 @@ class SchedulerBatchResultProcessor:
 
             if not is_spec:
                 # Normal decode: a single sampled token.
-                req.output_ids.append(next_token_id)
-                new_accept_len = 1
+                # DL begin — multi-step: append ALL tokens from multi-step
+                # DL: batch the GPU->CPU transfer into ONE sync (was N .item()
+                # syncs, each stalling the GPU; cost ~N * forward_latency).
+                _dl_all = getattr(result, '_dl_all_token_ids', None)
+                if _dl_all is not None and i == 0:
+                    _dl_ids = torch.stack(
+                        [t[i] if t.dim() > 0 else t.unsqueeze(0) for t in _dl_all]
+                    ).tolist()
+                    req.output_ids.extend(_dl_ids)
+                    new_accept_len = len(_dl_all)
+                else:
+                    req.output_ids.append(next_token_id)
+                    new_accept_len = 1
+                # DL end
             else:
                 # Spec: accept the whole verified run. For grammar requests the
                 # run was already truncated at the grammar-terminating token in

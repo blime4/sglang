@@ -1,5 +1,34 @@
 from __future__ import annotations
 
+# DL begin — shim triton Hopper-PDL primitives (tl.extra.cuda.gdc_wait /
+# gdc_launch_dependents) ABSENT in DLIN Triton. Must live in this module because
+# the FLA/conv/ssm kernels import is_arch_support_pdl from here — so the inductor
+# compile SUBPROCESS (which re-imports triton fresh, losing main-process
+# monkeypatches) picks the shim up when it imports the kernel module. The kernels
+# reference these inside `if USE_GDC:` branches; inductor generates TTIR for the
+# whole kernel (no dead-branch elimination), so gdc_wait gets called — provide
+# proper @triton.jit no-op device functions (valid to call from a Triton kernel,
+# lower to nothing). At runtime USE_GDC=False on DLIN so the branch is skipped.
+try:
+    import triton as _dl_triton
+    import triton.language.extra.cuda as _dl_tl_cuda_extra
+
+    @_dl_triton.jit
+    def _dl_gdc_wait():
+        pass
+
+    @_dl_triton.jit
+    def _dl_gdc_launch_dependents():
+        pass
+
+    if not hasattr(_dl_tl_cuda_extra, "gdc_wait"):
+        _dl_tl_cuda_extra.gdc_wait = _dl_gdc_wait
+    if not hasattr(_dl_tl_cuda_extra, "gdc_launch_dependents"):
+        _dl_tl_cuda_extra.gdc_launch_dependents = _dl_gdc_launch_dependents
+except Exception:
+    pass
+# DL end
+
 import functools
 import hashlib
 import importlib.util

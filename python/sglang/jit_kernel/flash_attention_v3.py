@@ -41,8 +41,14 @@ def _load_fa3_kernels():
 
     if is_dlin():
         try:
-            from flash_attn import (
+            # DL: import from submodule directly — flash_attn.__init__.py eagerly
+            # imports flash_attn_with_kvcache which crashes DLEOL LLVM JIT.
+            from flash_attn.flash_attn_interface import (
                 flash_attn_varlen_func as _fa2_varlen,
+            )
+            # DO NOT import flash_attn_with_kvcache — crashes DLEOL.
+            # Route through dl_flash_attn.flash_attn_with_kvcache (varlen fallback).
+            from sglang.srt.layers.attention.dl_flash_attn import (
                 flash_attn_with_kvcache as _fa2_kvcache,
             )
 
@@ -276,7 +282,7 @@ def flash_attn_varlen_func(
         # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
         # (e.g. ROCm, or CUDA < sm90)
         if cu_seqlens_q is not None:
-            from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func as fa2_flash_attn_varlen_func  # DL: FA2 fallback on non-FA3 targets
 
             return fa2_flash_attn_varlen_func(
                 q,
@@ -294,7 +300,7 @@ def flash_attn_varlen_func(
             )
         else:
             # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
-            from flash_attn import flash_attn_func as fa2_flash_attn_func
+            from flash_attn.flash_attn_interface import flash_attn_func as fa2_flash_attn_func  # DL: FA2 fallback on non-FA3 targets
 
             return fa2_flash_attn_func(
                 q,

@@ -55,8 +55,13 @@ class DLinGDNKernel(LinearAttnKernelBase):
         # load_library registers ALL ops in the .so, including the FLA ones. This
         # call is a cheap idempotent guard that also raises clearly if absent.
         from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
+        import os as _dl_os
 
         _ensure_dl_C()
+
+        # DL: SKIP_GDN for profiling — measures non-GDN GPU time
+        if _dl_os.environ.get("SGLANG_DL_SKIP_GDN") == "1":
+            return torch.zeros_like(v)
 
         # Precompute gates exactly like vLLM's dl_fused_sigmoid_gating_delta_rule_update:
         #   g = -exp(A_log) * softplus(a + dt_bias);  beta = sigmoid(b)

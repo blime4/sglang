@@ -409,6 +409,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, apply_gate: bool = True
     ):
         shared_output = None
+        # DL begin — skip-shared-expert differential (SGLANG_DL_SKIP_SHARED=1):
+        # return None so the separate shared-expert MLP is dropped from the graph;
+        # the GPU-time delta (SGLANG_DL_TIME_REPLAY) measures its per-step cost.
+        import os as _dl_os
+        if _dl_os.environ.get("SGLANG_DL_SKIP_SHARED") == "1":
+            return None
+        # DL end
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:

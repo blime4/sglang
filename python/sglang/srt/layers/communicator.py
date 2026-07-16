@@ -851,8 +851,18 @@ class LayerCommunicator:
         # next layer's prepare_attn) is sglang-internal; it halves the
         # allreduce count (2/layer → 1/layer). kprof showed NCCL allreduce =
         # 48.5% of decode GPU time; halving calls targets ~24%.
+        # NOTE: gated by SGLANG_DL_NO_AR_FUSION=1 to disable for A/B — suspected
+        # of inserting a captured sync that makes cudaGraphLaunch block
+        # synchronously (22ms vs async 0.1ms baseline).
+        import os as _dl_ar_os
         from sglang.srt.utils.common import is_dlin as _is_dlin
-        if not result and _is_dlin() and (not self.is_last_layer) and (self._context.tp_size > 1):
+        if (
+            not result
+            and _is_dlin()
+            and (not self.is_last_layer)
+            and (self._context.tp_size > 1)
+            and _dl_ar_os.environ.get("SGLANG_DL_NO_AR_FUSION") != "1"
+        ):
             result = True
         # DL end
 

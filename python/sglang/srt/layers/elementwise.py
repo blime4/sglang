@@ -689,7 +689,8 @@ def fused_gate_sigmoid_mul_add(
     if num_tokens >= 1024:
         config["num_warps"] = min(config["num_warps"], 8)
 
-    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # DL: explicit USE_PDL constexpr (not **pdl_kwargs) for torch.compile compat.
+    _dl_supports_pdl = is_arch_support_pdl()  # DL:
 
     _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
         hidden_states,
@@ -698,5 +699,6 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         hidden_dim=hidden_dim,
         **config,
-        **pdl_kwargs,
+        USE_PDL=_dl_supports_pdl,  # DL:
+        **({"launch_pdl": True} if _dl_supports_pdl else {}),  # DL:
     )

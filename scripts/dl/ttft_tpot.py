@@ -30,6 +30,16 @@ def main():
         disable_cuda_graph=os.environ.get("USE_CUDA_GRAPH", "0") != "1",
         cuda_graph_max_bs_decode=int(os.environ.get("CG_MAX_BS", "2")),
         context_length=4096,
+        # DL: custom all-reduce (cross_device_reduce_1stage<bfloat16,2>) can't
+        # JIT on DLIN (HC_CUK Error=28) under TP>1 + CG → use NCCL. See docs §7.x.
+        disable_custom_all_reduce=os.environ.get("DL_DISABLE_CUSTOM_AR", "1") == "1",
+        # DL: torch.compile the model before CG capture (vLLM uses inductor-driven
+        # CG; tests whether compile makes invoke_fused_moe_opt's use_moe_cu kernel
+        # capturable — see docs §7.31). Opt-in via DL_TORCH_COMPILE=1.
+        enable_torch_compile=os.environ.get("DL_TORCH_COMPILE", "0") == "1",
+        # DL: tc_piecewise decode backend (MoE as split-op → eager, may avoid
+        # use_moe_cu CG crash). Opt-in via DL_CG_BACKEND_DECODE=tc_piecewise.
+        cuda_graph_backend_decode=os.environ.get("DL_CG_BACKEND_DECODE") or None,
     )
     if USE_NGRAM:
         sa.speculative_algorithm = "NGRAM"

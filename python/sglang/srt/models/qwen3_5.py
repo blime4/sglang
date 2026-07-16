@@ -603,6 +603,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 alt_stream=(
                     alt_stream
                     if (_is_cuda or _disable_shared_experts_fusion())
+                    and _dl_os.environ.get("SGLANG_DL_NO_ALT_STREAM") != "1"  # DL:
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
@@ -668,14 +669,22 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         if not forward_batch.forward_mode.is_idle():
             # DL begin — time GDN-attn (linear_attn) for decode-breakdown profiling
             _dl_prof = _dl_os.environ.get("SGLANG_DL_LAYER_TIMING")
-            if _dl_prof:
+            # DL: skip-attn differential (SGLANG_DL_SKIP_ATTN=1) — replace attn
+            # output with zeros to measure GPU time WITHOUT attn compute.
+            if _dl_os.environ.get("SGLANG_DL_SKIP_ATTN") == "1":
+                hidden_states = torch.zeros_like(hidden_states)
+            elif _dl_prof:
                 torch.cuda.synchronize(); _t0 = _dl_time.time()
-            hidden_states = self.linear_attn(
-                hidden_states,
-                forward_batch,
-            )
-            if _dl_prof:
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    forward_batch,
+                )
                 torch.cuda.synchronize(); _DL_LT["gdn_attn"] += _dl_time.time() - _t0
+            else:
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    forward_batch,
+                )
             # DL end
 
         # Fully Connected
@@ -694,20 +703,23 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         )
         # DL begin — time MoE (mlp) for decode-breakdown profiling
         _dl_p2 = _dl_os.environ.get("SGLANG_DL_LAYER_TIMING")
-        if _dl_p2:
+        # DL: skip-MoE differential (SGLANG_DL_SKIP_MOE=1) — leave hidden_states
+        # unchanged to measure GPU time WITHOUT MoE compute.
+        if _dl_os.environ.get("SGLANG_DL_SKIP_MOE") == "1":
+            pass
+        elif _dl_p2:
             torch.cuda.synchronize(); _t1 = _dl_time.time()
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if _dl_p2:
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
             torch.cuda.synchronize(); _DL_LT["moe"] += _dl_time.time() - _t1
             _DL_LT["n_layers"] += 1
             if _DL_LT["n_layers"] % 40 == 0:
@@ -719,6 +731,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     f"({_DL_LT['moe']/tot*100:.0f}%) /step\n"
                 )
                 _dl_sys.stderr.flush()
+        else:
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
         # DL end
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -847,6 +871,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 alt_stream=(
                     alt_stream
                     if (_is_cuda or _disable_shared_experts_fusion())
+                    and _dl_os.environ.get("SGLANG_DL_NO_ALT_STREAM") != "1"  # DL:
                     else None
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
@@ -1053,11 +1078,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
+            # DL begin — skip-attn differential (SGLANG_DL_SKIP_ATTN=1)
+            if _dl_os.environ.get("SGLANG_DL_SKIP_ATTN") == "1":
+                hidden_states = torch.zeros_like(hidden_states)
+            else:
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+            # DL end
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -1074,20 +1104,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
         # DL begin — time MoE (mlp) for decode-breakdown profiling
         _dl_p2 = _dl_os.environ.get("SGLANG_DL_LAYER_TIMING")
-        if _dl_p2:
+        # DL: skip-MoE differential (SGLANG_DL_SKIP_MOE=1) — leave hidden_states
+        # unchanged to measure GPU time WITHOUT MoE compute.
+        if _dl_os.environ.get("SGLANG_DL_SKIP_MOE") == "1":
+            pass
+        elif _dl_p2:
             torch.cuda.synchronize(); _t1 = _dl_time.time()
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                use_reduce_scatter,
-                should_allreduce_fusion,
-            )
-        else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
-            )
-        if _dl_p2:
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
             torch.cuda.synchronize(); _DL_LT["moe"] += _dl_time.time() - _t1
             _DL_LT["n_layers"] += 1
             if _DL_LT["n_layers"] % 40 == 0:
@@ -1099,6 +1132,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     f"({_DL_LT['moe']/tot*100:.0f}%) /step\n"
                 )
                 _dl_sys.stderr.flush()
+        else:
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
         # DL end
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True

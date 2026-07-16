@@ -506,10 +506,15 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
+            # DL begin — always delay sampling when overlap is enabled.
+            import os as _os
             if (
                 self.enable_overlap
                 and not self.enable_spec
-                and forward_batch.sampling_info.grammars is not None
+                and (
+                    forward_batch.sampling_info.grammars is not None
+                    or _os.environ.get("SGLANG_DL_DELAY_SAMPLE") == "1"
+                )
             ):
 
                 def sample_batch_func():
@@ -520,12 +525,51 @@ class TpModelWorker(BaseTpWorker):
 
                 batch_result.delay_sample_func = sample_batch_func
                 return batch_result
+            # DL end
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                # DL begin — multi-step decode: loop N steps internally
+                # to bypass scheduler round-trip overhead per token.
+                import os as _dl_os
+                _dl_n_steps = int(_dl_os.environ.get("SGLANG_DL_MULTI_STEP", "1"))
+                if _dl_n_steps > 1 and _dl_os.environ.get("SGLANG_DL_MULTI_STEP_DBG") == "1":
+                    if not hasattr(self, '_dl_ms_dbg_ct'):
+                        self._dl_ms_dbg_ct = 0
+                    self._dl_ms_dbg_ct += 1
+                    if self._dl_ms_dbg_ct <= 3:
+                        print(f"[DL ms-check] n={_dl_n_steps} cg={can_run_cuda_graph} "
+                              f"decode={forward_batch.forward_mode.is_decode()} "
+                              f"bs={forward_batch.batch_size} spec={self.enable_spec} "
+                              f"logprob={forward_batch.return_logprob}", flush=True)
+                if (
+                    _dl_n_steps > 1
+                    and can_run_cuda_graph
+                    and forward_batch.forward_mode.is_decode()
+                    and forward_batch.batch_size == 1
+                    and not self.enable_spec
+                    and not forward_batch.return_logprob
+                ):
+                    extra = self._dl_multi_step_decode(
+                        forward_batch, logits_output, batch_result, _dl_n_steps - 1
+                    )
+                    if extra is not None:
+                        # extra is list of token tensors [first, second, ...]
+                        # next_token_ids = LAST token (scheduler advances by 1)
+                        # _dl_all_token_ids = ALL tokens for output_ids append
+                        batch_result.next_token_ids = extra[-1]
+                        batch_result._dl_extra_steps = len(extra) - 1
+                        batch_result._dl_all_token_ids = extra
+                    elif _dl_os.environ.get("SGLANG_DL_MULTI_STEP_DBG") == "1":
+                        if not hasattr(self, '_dl_ms_fail_ct'):
+                            self._dl_ms_fail_ct = 0
+                        self._dl_ms_fail_ct += 1
+                        if self._dl_ms_fail_ct <= 3:
+                            print(f"[DL ms-fail] returned None", flush=True)
+                # DL end
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -555,6 +599,120 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+
+    # DL begin — multi-step decode: run extra decode steps inside tp_worker
+    # without returning to scheduler, eliminating ~5ms overhead per extra step.
+    def _dl_multi_step_decode(self, forward_batch, logits_output, batch_result, n_extra):
+        """Run n_extra additional decode steps using the CUDA graph directly.
+
+        Returns a tensor of ALL token IDs (first + extras) or None on failure.
+        """
+        import os as _dl_os
+        _dbg = _dl_os.environ.get("SGLANG_DL_MULTI_STEP_DBG") == "1"
+        runner = self.model_runner.decode_cuda_graph_runner
+        if runner is None or not hasattr(runner, 'backend'):
+            if _dbg:
+                print(f"[DL ms-dbg] no runner or no backend", flush=True)
+            return None
+
+        backend = runner.backend
+        buffers = runner.buffers
+        page_size = self.model_runner.server_args.page_size
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+
+        first_token = batch_result.next_token_ids
+        all_tokens = [first_token.clone()]
+
+        req_pool_idx = forward_batch.req_pool_indices[0].item()
+        cur_seq_len = forward_batch.seq_lens[0].item() + 1
+        cur_pos = forward_batch.positions[0].item() + 1
+
+        graph_key = runner._replay_graph_key
+        if graph_key not in backend._graphs:
+            if _dbg:
+                print(f"[DL ms-dbg] graph_key={graph_key} not in graphs (keys={list(backend._graphs.keys())[:5]})", flush=True)
+            return None
+
+        attn_backend = runner.attn_backend
+        # For hybrid models, the metadata lives on the inner full_attn_backend
+        if hasattr(attn_backend, 'full_attn_backend'):
+            attn_backend = attn_backend.full_attn_backend
+        decode_meta_dict = getattr(attn_backend, 'decode_cuda_graph_metadata', None)
+        if decode_meta_dict is None:
+            if _dbg:
+                print(f"[DL ms-dbg] no decode_cuda_graph_metadata on attn_backend={type(attn_backend).__name__}", flush=True)
+            return None
+        metadata = decode_meta_dict.get(1)
+        if metadata is None:
+            if _dbg:
+                print(f"[DL ms-dbg] no metadata for bs=1 (keys={[k for k in decode_meta_dict.keys() if isinstance(k, int)][:5]})", flush=True)
+            return None
+
+        strided_indices = decode_meta_dict.get("strided_indices")
+        if strided_indices is None:
+            if _dbg:
+                print(f"[DL ms-dbg] no strided_indices", flush=True)
+            return None
+
+        from sglang.srt.layers.attention.triton_ops.metadata import (
+            normal_decode_set_metadata,
+        )
+
+        try:
+            for step in range(n_extra):
+                # Slot was pre-allocated by prepare_for_decode and written to req_to_token.
+                # Read directly as GPU scalar — no .item() sync needed.
+                buffers.out_cache_loc[0] = req_to_token[req_pool_idx, cur_seq_len]
+
+                buffers.input_ids[0] = all_tokens[-1][0]
+                buffers.positions[0] = cur_pos
+                buffers.seq_lens[0] = cur_seq_len
+
+                seq_lens_1 = buffers.seq_lens[:1]
+                req_pool_indices_1 = forward_batch.req_pool_indices[:1]
+                max_seq_pages = (cur_seq_len + page_size - 1) // page_size
+
+                normal_decode_set_metadata(
+                    metadata.cache_seqlens_int32,
+                    metadata.cu_seqlens_k,
+                    metadata.page_table,
+                    req_to_token,
+                    req_pool_indices_1,
+                    strided_indices,
+                    max_seq_pages,
+                    seq_lens_1,
+                    0,
+                    page_size,
+                )
+
+                if _dbg and step == 0:
+                    print(f"[DL ms-dbg] replaying graph_key={graph_key} seq_len={cur_seq_len}", flush=True)
+                backend._graphs[graph_key].replay()
+                output = backend._outputs[graph_key]
+                next_id = output.next_token_logits[0].argmax(dim=-1, keepdim=True)
+                all_tokens.append(next_id)
+
+                cur_seq_len += 1
+                cur_pos += 1
+        except Exception as e:
+            if _dbg:
+                print(f"[DL ms-dbg] exception in loop: {e}", flush=True)
+            return None
+
+        if _dl_os.environ.get("SGLANG_DL_MULTI_STEP_DBG") == "1" and len(all_tokens) > 1:
+            toks = [t.item() for t in all_tokens]
+            print(f"[DL multi-step] {len(all_tokens)} tokens: {toks}", flush=True)
+
+        # Return list of [bs=1] tensors: [first_token, second_token, ...]
+        # The caller stores all of them for output_ids append.
+        result = []
+        for t in all_tokens:
+            if t.dim() == 0:
+                result.append(t.unsqueeze(0))
+            else:
+                result.append(t[:1])
+        return result
+    # DL end
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

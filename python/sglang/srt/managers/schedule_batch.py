@@ -2628,13 +2628,38 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        # DL begin — multi-step: pre-allocate N KV slots to avoid memory leak.
+        # seq_lens advances by 1 (correct for first forward step).
+        # kv_allocated advances by N (all slots allocated in pool).
+        # kv_committed advances by 1 here; extra committed after multi-step.
+        import os as _dl_os
+        _dl_n = int(_dl_os.environ.get("SGLANG_DL_MULTI_STEP", "1"))
+        if _dl_n > 1 and len(self.reqs) == 1 and not self.reqs[0].return_logprob:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+            _dl_extra_locs = []
+            for _dl_i in range(_dl_n - 1):
+                self.seq_lens.add_(1)
+                self.seq_lens_cpu.add_(1)
+                _dl_loc = alloc_for_decode(self, token_per_req=1)
+                _dl_extra_locs.append(_dl_loc)
+            self.seq_lens.add_(-(_dl_n - 1))
+            self.seq_lens_cpu.add_(-(_dl_n - 1))
+            self._dl_multi_step_locs = _dl_extra_locs
+        else:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+            self._dl_multi_step_locs = None
+        # DL end
 
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
-            req.kv_allocated_len += 1
+            # DL begin — pre-allocated extra slots count as allocated (freed on completion)
+            if self._dl_multi_step_locs:
+                req.kv_allocated_len += _dl_n
+            else:
+                req.kv_allocated_len += 1
+            # DL end
 
         if self.enable_overlap:
             # New-tensor avoids racing model_worker_batch refs queued for

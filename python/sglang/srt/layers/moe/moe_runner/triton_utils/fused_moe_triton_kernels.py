@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
+    _per_token_group_quant_8bit_raw,  # DL: DLIN raw per-token-group quant (no pad)
 )
 from sglang.srt.layers.quantization.int8_kernel import (
     per_token_group_quant_int8,
@@ -769,7 +770,20 @@ def invoke_fused_moe_kernel(
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             if _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                # DL begin — DLIN: sglang_per_token_group_quant_fp8 uses PDL
+                # (sgl_per_token_group_quant_8bit_jit_v2.cuh:396 .enable_pdl)
+                # which is NOT CUDA-graph-capturable → triton MoE crashes under
+                # full CG. _per_token_group_quant_8bit_raw is a plain triton
+                # kernel (no PDL) → CG-safe. This makes the FUSED triton MoE
+                # (no separate weight gather) capturable, eliminating the 22.6%
+                # vectorized_gather cost of GEMMEX=2 (docs/dl §7.37,7.41).
+                # Opt-in: SGLANG_DL_MOE_TRITON_NOPDL=1.
+                import os as _dl_os
+                if _dl_os.environ.get("SGLANG_DL_MOE_TRITON_NOPDL") == "1":
+                    A, A_scale = _per_token_group_quant_8bit_raw(A, block_k)
+                else:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                # DL end
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]

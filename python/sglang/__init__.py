@@ -26,6 +26,33 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 del _platform
 del _sys
 
+# DL begin — shim triton Hopper-PDL primitives (tl.extra.cuda.gdc_wait /
+# gdc_launch_dependents) that are ABSENT in DLIN Triton. sglang's FLA/conv/ssm
+# kernels reference them inside `if USE_GDC:` branches. torch.compile's inductor
+# generates TTIR for the whole kernel (the USE_GDC branch is NOT eliminated by
+# specialization), so gdc_wait/gdc_launch_dependents get compiled + called.
+# Provide proper @triton.jit no-op device functions so the call is valid (and
+# lowers to nothing). At runtime USE_GDC=False on DLIN so the branch is skipped.
+try:
+    import triton as _dl_triton
+    import triton.language.extra.cuda as _dl_tl_cuda_extra
+
+    @_dl_triton.jit
+    def _dl_gdc_wait():
+        pass
+
+    @_dl_triton.jit
+    def _dl_gdc_launch_dependents():
+        pass
+
+    if not hasattr(_dl_tl_cuda_extra, "gdc_wait"):
+        _dl_tl_cuda_extra.gdc_wait = _dl_gdc_wait
+    if not hasattr(_dl_tl_cuda_extra, "gdc_launch_dependents"):
+        _dl_tl_cuda_extra.gdc_launch_dependents = _dl_gdc_launch_dependents
+except Exception:
+    pass
+# DL end
+
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
 _apply_hf_patches()
