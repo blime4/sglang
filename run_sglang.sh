@@ -71,17 +71,26 @@ set -eo pipefail
 # Config
 #-------------------------------------------------------------------------------
 SGLANG_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-# SDK_DIR: prefer a repo-local sdk-dlop-* snapshot (newest) over the sibling
-# ../debug/sdk. The .venv is built + validated against a specific DLIN SDK
-# build; ../debug/sdk can lag it (older libhcrt -> sglang scheduler segfaults
-# at model load, exit -11). Override explicitly with SDK_DIR=... if needed.
-if [ -z "${SDK_DIR:-}" ]; then
-  SDK_DIR="/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sdk"
+# SDK_DIR resolution. The .venv is built against a specific DLIN SDK build; a
+# stale SDK (older libhcrt/libLLVM) segfaults the sglang scheduler at model
+# load (exit -11) or hangs in JIT. So prefer the SDK co-located with the .venv
+# over a globally-exported SDK_DIR (e.g. a stale sdk-0401 in ~/.bashrc):
+#   1. SGSDK_DIR (run_sglang-specific override)            -> use verbatim
+#   2. newest SGLANG_DIR/sdk-dlop-*/ (next to the .venv)   -> authoritative
+#   3. inherited SDK_DIR (e.g. from profile)               -> fallback
+#   4. hardcoded ../debug/sdk                              -> last resort
+if [ -n "${SGSDK_DIR:-}" ]; then
+  SDK_DIR="$SGSDK_DIR"
+else
   __latest=""
   for __cand in "$SGLANG_DIR"/sdk-dlop-*; do
-    if [ -d "$__cand" ] && [ -f "$__cand/env.sh" ]; then __latest="$__cand"; fi
+    [ -d "$__cand" ] && [ -f "$__cand/env.sh" ] && __latest="$__cand"
   done
-  [ -n "$__latest" ] && SDK_DIR="$__latest"
+  if [ -n "$__latest" ]; then
+    SDK_DIR="$__latest"
+  else
+    SDK_DIR="${SDK_DIR:-/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sdk}"
+  fi
   unset __cand __latest
 fi
 ARTIFACTORY_DIR="${ARTIFACTORY_DIR:-/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/flash-attention/artifactory}"
@@ -154,6 +163,7 @@ BENCHRUN_TP="${DLIN_TP_SIZE:-1}"                 # tensor-parallel size (set by 
 # sglang-vs-vllm-showcase-dlin.md.
 COMPARE_SCENARIOS="${COMPARE_SCENARIOS:-SC1,SC2,SC3}"
 COMPARE_ONLY="${COMPARE_ONLY:-}"                # --only sglang|vllm
+COMPARE_SHOW="${COMPARE_SHOW:-0}"               # --show: re-render table from cache, no GPU run
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
 COMPARE_METRICS_DIR="${COMPARE_METRICS_DIR:-/tmp/sglang_compare}"
 
@@ -171,7 +181,11 @@ pick_model() {
       MODEL_PATH="/opt/dataset/Qwen3-1.7B"
       ;;
     qwen35-35b)
-      MODEL_PATH="/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
+      # Local copy of the Qwen3.5/3.6-35B-A3B hybrid-Mamba MoE FP8 model
+      # (qwen3_5_moe, 256 experts, top-8). Local storage loads far faster than
+      # the /mars network copy. Override with -m /mars/.../Qwen3.5-35B-A3B-FP8/
+      # if you need the original.
+      MODEL_PATH="/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/models/Qwen3.6-35B-A3B-FP8"
       DLIN_TP_SIZE=4; USE_CUDA_GRAPH=1; DLIN_CG_MAX_BS=2
       # mem_fraction=0.60 (not 0.85): the stable bf16-bmm prefill path (M>16) dequants
       # expert weights and needs several GB headroom, else OOM (docs §7.14). 0.85 OOMs.
@@ -480,6 +494,7 @@ sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
   ./run_sglang.sh compare                       # SC1+SC2+SC3, both engines, prints gap table
   ./run_sglang.sh compare --scenarios SC2,SC3   # skip the ~90s SC1 cold prefill
   ./run_sglang.sh compare --only sglang         # re-measure sglang only, diff vs cached vLLM
+  ./run_sglang.sh compare --show                 # re-print last gap table from cache (no GPU run)
   Runs both engines on the same GPUs (fresh process each), caches metrics to
   /tmp/sglang_compare. vLLM runs APC-OFF — its prefix cache can't be enabled on
   this hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'). See
@@ -563,6 +578,7 @@ parse_test_args() {
       # compare
       --scenarios)         COMPARE_SCENARIOS="$2"; shift 2;;
       --only)              COMPARE_ONLY="$2"; shift 2;;
+      --show)              COMPARE_SHOW=1; shift;;
       -h|--help)           usage; exit 0;;
       *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
@@ -903,13 +919,18 @@ phase_compare() {
     ok "$eng done ($(wc -l < "$COMPARE_METRICS_DIR/metrics_${eng}.txt") metrics cached)."
   }
 
-  # Decide which side(s) to (re)run.
-  case "$COMPARE_ONLY" in
-    sglang) _compare_run_one sglang || die "sglang run failed" ;;
-    vllm)   _compare_run_one vllm   || die "vllm run failed" ;;
-    "")     _compare_run_one sglang || die "sglang run failed"
-            _compare_run_one vllm   || die "vllm run failed" ;;
-  esac
+  # --show: skip the GPU runs, re-render the table from cached metrics.
+  if [ "$COMPARE_SHOW" = "1" ]; then
+    log "[compare] --show: re-rendering from cached metrics ($COMPARE_METRICS_DIR), no GPU run."
+  else
+    # Decide which side(s) to (re)run.
+    case "$COMPARE_ONLY" in
+      sglang) _compare_run_one sglang || die "sglang run failed" ;;
+      vllm)   _compare_run_one vllm   || die "vllm run failed" ;;
+      "")     _compare_run_one sglang || die "sglang run failed"
+              _compare_run_one vllm   || die "vllm run failed" ;;
+    esac
+  fi
 
   # ---- Side-by-side gap table ----
   local sf vf; sf="$COMPARE_METRICS_DIR/metrics_sglang.txt"; vf="$COMPARE_METRICS_DIR/metrics_vllm.txt"
@@ -920,8 +941,12 @@ phase_compare() {
   fi
   echo
   log "================ sglang vs vLLM — showcase gap ================"
+  # model_tag: pull from the engine's last full log (the cached metrics_*.txt
+  # strips the header line). `|| true` — grep returns 1 on no-match and under
+  # `set -eo pipefail` an unguarded failure here would abort before the table.
   local model_tag
-  model_tag=$(grep -m1 '^=== METRICS ' "$sf" 2>/dev/null | sed -n 's/.*model=\([^ ]*\).*/\1/p')
+  model_tag=$(grep -m1 -h '^=== METRICS ' "$COMPARE_METRICS_DIR/sglang_last.log" 2>/dev/null \
+              | sed -n 's/.*model=\([^ ]*\).*/\1/p' || true)
   [ -z "$model_tag" ] && model_tag=$(basename "${MODEL_PATH%/}")
   echo  "  model=$model_tag  tp=${DLIN_TP_SIZE:-4}  scenarios=$COMPARE_SCENARIOS"
   echo  "  (each side: same GPUs, FP8, fresh process; vLLM APC-OFF)"

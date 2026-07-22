@@ -33,7 +33,10 @@ os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
 os.environ.setdefault("DLEOL_USE_CU_MQA_TILEKV", "1")
 os.environ.setdefault("VLLM_MAX_MOE_CU_TOKENS", "128")
 
-MODEL = os.environ.get("MODEL_PATH", "/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/")
+MODEL = os.environ.get(
+    "MODEL_PATH",
+    "/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/models/Qwen3.6-35B-A3B-FP8",
+)
 TP = int(os.environ.get("TP_SIZE", "4"))
 
 # A long shared prefix (~2K tokens): system prompt + technical passage + few-shot examples
