@@ -29,7 +29,8 @@ os.environ.setdefault("DLEOL_FLA_UNROLL_COUNT", "8")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
+# NOTE: VLLM_USE_V2_MODEL_RUNNER is set explicitly at engine-launch time from
+# --vllm-runner (mrv2 -> "1", mrv1 -> "0"); do NOT setdefault it here.
 os.environ.setdefault("DLEOL_USE_CU_MQA_TILEKV", "1")
 os.environ.setdefault("VLLM_MAX_MOE_CU_TOKENS", "128")
 
@@ -273,18 +274,23 @@ def run_sc4(engine_name, raw, json_schema):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", default="sglang", choices=["sglang", "vllm"])
+    parser.add_argument("--vllm-runner", default="mrv2", choices=["mrv1", "mrv2"],
+                        help="vLLM model runner: mrv2 (V2, default) or mrv1 (V1). "
+                             "MRV1 enforces eager to avoid the DLIN torch.compile crash.")
     parser.add_argument("--mem-frac", type=float, default=0.55)
     parser.add_argument("--scenarios", default="SC1,SC2,SC3",
                         help="comma list of SC1/SC2/SC3/SC4 (default SC1,SC2,SC3; "
                              "SC4=JSON. SC1 cold is ~90s — skip it for a fast check.)")
     args = parser.parse_args()
     engine_name = args.engine
+    runner = args.vllm_runner if engine_name == "vllm" else "sglang"
     enabled = {s.strip().upper() for s in args.scenarios.split(",") if s.strip()}
     unknown = enabled - {"SC1", "SC2", "SC3", "SC4"}
     if unknown:
         raise SystemExit(f"unknown scenario(s): {unknown} (valid: SC1 SC2 SC3 SC4)")
 
-    print(f"[showcase] engine={engine_name} model={MODEL} tp={TP} scenarios={sorted(enabled)}", flush=True)
+    print(f"[showcase] engine={engine_name} runner={runner} model={MODEL} tp={TP} "
+          f"scenarios={sorted(enabled)}", flush=True)
 
     # ---- Launch engine ----
     raw = None  # the engine/llm object (sglang.Engine or vLLM LLM)
@@ -310,18 +316,28 @@ def main():
         # NOTE: enable_prefix_caching=True is UNSUPPORTED for this hybrid Mamba
         # model on DLIN. vLLM forces mamba_cache_mode='align' when APC is on,
         # which MRV2 hard-rejects ("Model Runner V2 has not yet supported
-        # mamba_cache_mode='align'"). MRV1 (the alternative runner) crashes on
-        # DLIN with ConstraintViolationError. So vLLM runs APC-OFF here — the
-        # only working config — meaning vLLM re-prefills the shared prefix every
-        # request (SC1 speedup = 1.0x). Contrast: sglang RadixAttention works
-        # on this model and gives 16.4x. See blog for the APC crash trace.
-        llm = LLM(
+        # mamba_cache_mode='align'"). So vLLM runs APC-OFF here — re-prefilling
+        # the shared prefix every request (SC1 speedup = 1.0x). Contrast: sglang
+        # RadixAttention works on this model and gives 16x+. See blog.
+        #
+        # MRV1 vs MRV2: MRV2 (VLLM_USE_V2_MODEL_RUNNER=1 + CG) is the only
+        # config that works on DLIN; MRV1 historically hits a torch.compile
+        # dynamic-shape ConstraintViolationError, so we enforce_eager for MRV1
+        # to give it a chance (still often fails — recorded as status=fail).
+        mrv2 = (runner == "mrv2")
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if mrv2 else "0"
+        llm_kwargs = dict(
             model=MODEL, tensor_parallel_size=TP, dtype="bfloat16",
             max_model_len=4096, gpu_memory_utilization=args.mem_frac,
-            trust_remote_code=True, enforce_eager=False, max_num_seqs=4,
-            disable_log_stats=True,
-            compilation_config={"cudagraph_capture_sizes":[1,2,4],"max_cudagraph_capture_size":4},
+            trust_remote_code=True, max_num_seqs=4, disable_log_stats=True,
         )
+        if mrv2:
+            llm_kwargs["enforce_eager"] = False
+            llm_kwargs["compilation_config"] = {"cudagraph_capture_sizes": [1, 2, 4],
+                                                "max_cudagraph_capture_size": 4}
+        else:  # MRV1: dodge the torch.compile crash with eager
+            llm_kwargs["enforce_eager"] = True
+        llm = LLM(**llm_kwargs)
         raw = llm
         def generate(prompt, max_new=32, temperature=0.0):
             sp = SamplingParams(temperature=temperature, max_tokens=max_new)
@@ -367,7 +383,7 @@ def main():
 
     # ---- Machine-readable metrics (parsed by run_sglang.sh `compare` phase) ----
     model_tag = os.path.basename(MODEL.rstrip("/"))
-    print(f"\n=== METRICS engine={engine_name} model={model_tag} tp={TP} ===", flush=True)
+    print(f"\n=== METRICS engine={engine_name} runner={runner} model={model_tag} tp={TP} ===", flush=True)
     for k in sorted(metrics):
         print(f"METRIC {k}={metrics[k]}", flush=True)
     print("=== END METRICS ===", flush=True)

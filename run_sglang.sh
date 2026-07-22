@@ -162,10 +162,14 @@ BENCHRUN_TP="${DLIN_TP_SIZE:-1}"                 # tensor-parallel size (set by 
 # hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'); see docs/dl/
 # sglang-vs-vllm-showcase-dlin.md.
 COMPARE_SCENARIOS="${COMPARE_SCENARIOS:-SC1,SC2,SC3}"
-COMPARE_ONLY="${COMPARE_ONLY:-}"                # --only sglang|vllm
+COMPARE_ONLY="${COMPARE_ONLY:-}"                # --only sglang|vllm-mrv2|vllm-mrv1
 COMPARE_SHOW="${COMPARE_SHOW:-0}"               # --show: re-render table from cache, no GPU run
+COMPARE_HISTORY="${COMPARE_HISTORY:-0}"         # --history: print the results log, no GPU run
+COMPARE_RECORD="${COMPARE_RECORD:-1}"           # --no-record: don't append to the JSON store
+COMPARE_BASELINE="${COMPARE_BASELINE:-}"        # --baseline <id|commit>: diff vs this (else previous run)
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
 COMPARE_METRICS_DIR="${COMPARE_METRICS_DIR:-/tmp/sglang_compare}"
+COMPARE_STORE="${COMPARE_STORE:-$SGLANG_DIR/docs/dl/compare_results.json}"
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -495,6 +499,9 @@ sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
   ./run_sglang.sh compare --scenarios SC2,SC3   # skip the ~90s SC1 cold prefill
   ./run_sglang.sh compare --only sglang         # re-measure sglang only, diff vs cached vLLM
   ./run_sglang.sh compare --show                 # re-print last gap table from cache (no GPU run)
+  ./run_sglang.sh compare --history              # print the commit-keyed results log (no GPU run)
+  ./run_sglang.sh compare --no-record            # run but don't append to the JSON store
+  ./run_sglang.sh compare --baseline r001        # diff the new run vs run r001 (else vs previous)
   Runs both engines on the same GPUs (fresh process each), caches metrics to
   /tmp/sglang_compare. vLLM runs APC-OFF — its prefix cache can't be enabled on
   this hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'). See
@@ -579,6 +586,9 @@ parse_test_args() {
       --scenarios)         COMPARE_SCENARIOS="$2"; shift 2;;
       --only)              COMPARE_ONLY="$2"; shift 2;;
       --show)              COMPARE_SHOW=1; shift;;
+      --history)           COMPARE_HISTORY=1; shift;;
+      --no-record)         COMPARE_RECORD=0; shift;;
+      --baseline)          COMPARE_BASELINE="$2"; shift 2;;
       -h|--help)           usage; exit 0;;
       *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
@@ -867,105 +877,154 @@ _metric_val() {  # $1=KEY $2=file -> echoes value (empty if absent)
   # SC1_* keys in an SC3-only run). Always return 0.
   grep "^METRIC $1=" "$2" 2>/dev/null | tail -1 | cut -d= -f2- || true
 }
-_compare_row() {  # $1=label  $2=KEY  $3=dir(lower|higher)
+_compare_row() {  # $1=label  $2=KEY  $3=dir(lower|higher) — 3 engines: sglang | MRV2 | MRV1
   local label="$1" key="$2" dir="$3"
-  local s v sf vf
-  sf="$COMPARE_METRICS_DIR/metrics_sglang.txt"; vf="$COMPARE_METRICS_DIR/metrics_vllm.txt"
-  s=$(_metric_val "$key" "$sf"); v=$(_metric_val "$key" "$vf")
-  [ -z "$s" ] && [ -z "$v" ] && return 0
-  if [ -z "$s" ]; then printf "  %-24s | %-10s | %-10s | (sglang not run)\n" "$label" "NA" "${v:-NA}"; return 0; fi
-  if [ -z "$v" ]; then printf "  %-24s | %-10s | %-10s | (vLLM not run)\n" "$label" "${s:-NA}" "NA"; return 0; fi
-  awk -v lbl="$label" -v s="$s" -v v="$v" -v dir="$dir" 'BEGIN{
-    # ratio > 1 means sglang wins. lower-better: v/s ; higher-better: s/v
-    r = (dir == "higher") ? (s/v) : (v/s);
-    if (r+0 >= 1.0) w = sprintf("sglang %.2fx", r); else w = sprintf("vLLM %.2fx", 1.0/r);
-    printf "  %-24s | %-10s | %-10s | %s\n", lbl, s, v, w;
-  }'
+  local s m2 m1
+  s=$(_metric_val  "$key" "$COMPARE_METRICS_DIR/metrics_sglang.txt")
+  m2=$(_metric_val "$key" "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt")
+  m1=$(_metric_val "$key" "$COMPARE_METRICS_DIR/metrics_vllm_mrv1.txt")
+  [ -z "$s" ] && [ -z "$m2" ] && [ -z "$m1" ] && return 0
+  local sd=$([ -n "$s" ] && echo "$s" || echo "NA")
+  local m2d=$([ -n "$m2" ] && echo "$m2" || echo "FAIL")
+  local m1d=$([ -n "$m1" ] && echo "$m1" || echo "FAIL")
+  local verdict="(need sglang+MRV2)"
+  if [ -n "$s" ] && [ -n "$m2" ]; then
+    verdict=$(awk -v s="$s" -v v="$m2" -v dir="$dir" 'BEGIN{
+      r=(dir=="higher")?(s/v):(v/s);
+      if (r+0>=1.0) printf "sglang %.2fx vs MRV2", r; else printf "MRV2 %.2fx", 1/r;
+    }')
+  fi
+  printf "  %-24s | %-10s | %-10s | %-10s | %s\n" "$label" "$sd" "$m2d" "$m1d" "$verdict"
 }
 
 phase_compare() {
-  log "Phase [compare]: sglang vs vLLM showcase ($COMPARE_SCENARIOS)"
+  log "Phase [compare]: sglang vs vLLM (MRV2 + MRV1) showcase ($COMPARE_SCENARIOS)"
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
-  # Source the SDK env.sh so the TP-worker subprocesses inherit PYTHONPATH
-  # (SDK python/nne/tvm/pycuda modules), DLICC_PATH, TOPHUB_LOCATION, etc. Without
-  # these the scheduler segfaults (-11) during model load / kernel JIT. Then lock
-  # a clean LD_LIBRARY_PATH via dlin_runtime_env (its overwrite runs after, wins).
+  # Source the SDK env.sh so TP-worker subprocesses inherit PYTHONPATH (SDK
+  # python/nne/tvm/pycuda), DLICC_PATH, etc. Without these the scheduler
+  # segfaults (-11) at model load. Then lock a clean LD_LIBRARY_PATH via
+  # dlin_runtime_env (its overwrite runs after, wins).
   [ -f "$SDK_DIR/env.sh" ] && { source "$SDK_DIR/env.sh" 2>/dev/null || warn "SDK env.sh sourced with warnings"; }
   dlin_runtime_env
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
   export MODEL_PATH
   export TP_SIZE="${DLIN_TP_SIZE:-4}"
   local script="$SGLANG_DIR/scripts/dl/showcase_prefix_sharing.py"
+  local cr="$SGLANG_DIR/scripts/dl/compare_results.py"
   [ -f "$script" ] || die "showcase script not found: $script"
+  [ -f "$cr" ] || die "compare_results.py not found: $cr"
   mkdir -p "$COMPARE_METRICS_DIR"
 
+  # --history: just print the results log, no GPU run.
+  if [ "$COMPARE_HISTORY" = "1" ]; then
+    python "$cr" history --store "$COMPARE_STORE" || warn "no results store yet ($COMPARE_STORE)"
+    return 0
+  fi
+
   # Validate --only.
-  case "$COMPARE_ONLY" in sglang|vllm|"") ;; *) die "COMPARE_ONLY='$COMPARE_ONLY' (want: sglang|vllm)";; esac
+  case "$COMPARE_ONLY" in sglang|vllm-mrv2|vllm-mrv1|"") ;; *) die "COMPARE_ONLY='$COMPARE_ONLY' (want: sglang|vllm-mrv2|vllm-mrv1)";; esac
 
   local stamp; stamp=$(date +%Y%m%d_%H%M%S)
-  _compare_run_one() {  # $1 = sglang|vllm
-    local eng="$1" logf
-    logf="$COMPARE_METRICS_DIR/${eng}_${stamp}.log"
-    log "[compare] running $eng (scenarios=$COMPARE_SCENARIOS, log: $logf) ..."
-    if ! python "$script" --engine "$eng" --mem-frac "$COMPARE_MEM_FRAC" \
+  COMPARE_FAIL_TAGS=""
+  # _compare_run_one ENGINE [RUNNER]. vLLM needs a runner (mrv1|mrv2). Caches
+  # metrics_{engine}[_{runner}].txt and {tag}_last.log. On failure: removes the
+  # stale metrics file (so status=fail is recorded) and returns 1 (non-fatal for vLLM).
+  _compare_run_one() {
+    local eng="$1" runner="${2:-}" tag mfile vllm_args="" logf
+    if [ "$eng" = "vllm" ]; then
+      tag="vllm-$runner"; mfile="metrics_vllm_${runner}.txt"; vllm_args="--vllm-runner $runner"
+    else
+      tag="$eng"; mfile="metrics_${eng}.txt"
+    fi
+    logf="$COMPARE_METRICS_DIR/${tag}_${stamp}.log"
+    log "[compare] running $tag (scenarios=$COMPARE_SCENARIOS, log: $logf) ..."
+    if ! python "$script" --engine "$eng" $vllm_args --mem-frac "$COMPARE_MEM_FRAC" \
            --scenarios "$COMPARE_SCENARIOS" > "$logf" 2>&1; then
-      warn "$eng run FAILED. Tail of $logf:"; tail -n 20 "$logf"
+      warn "$tag run FAILED. Tail of $logf:"; tail -n 18 "$logf" 2>/dev/null
+      rm -f "$COMPARE_METRICS_DIR/$mfile"
+      cp -f "$logf" "$COMPARE_METRICS_DIR/${tag}_last.log" 2>/dev/null || true
+      COMPARE_FAIL_TAGS="$COMPARE_FAIL_TAGS $tag"
       return 1
     fi
-    # Cache the machine-readable METRICS block + keep the latest full log.
     sed -n '/^=== METRICS /,/^=== END METRICS ===/p' "$logf" | grep '^METRIC ' \
-        > "$COMPARE_METRICS_DIR/metrics_${eng}.txt" || true
-    cp -f "$logf" "$COMPARE_METRICS_DIR/${eng}_last.log"
-    ok "$eng done ($(wc -l < "$COMPARE_METRICS_DIR/metrics_${eng}.txt") metrics cached)."
+        > "$COMPARE_METRICS_DIR/$mfile" || true
+    cp -f "$logf" "$COMPARE_METRICS_DIR/${tag}_last.log"
+    ok "$tag done ($(wc -l < "$COMPARE_METRICS_DIR/$mfile") metrics cached)."
   }
 
-  # --show: skip the GPU runs, re-render the table from cached metrics.
+  # Decide what to run.
   if [ "$COMPARE_SHOW" = "1" ]; then
     log "[compare] --show: re-rendering from cached metrics ($COMPARE_METRICS_DIR), no GPU run."
   else
-    # Decide which side(s) to (re)run.
     case "$COMPARE_ONLY" in
-      sglang) _compare_run_one sglang || die "sglang run failed" ;;
-      vllm)   _compare_run_one vllm   || die "vllm run failed" ;;
-      "")     _compare_run_one sglang || die "sglang run failed"
-              _compare_run_one vllm   || die "vllm run failed" ;;
+      sglang)      _compare_run_one sglang     || die "sglang run failed (cannot compare without it)" ;;
+      vllm-mrv2)   _compare_run_one vllm mrv2  || warn "vllm-mrv2 failed (will be recorded as fail)" ;;
+      vllm-mrv1)   _compare_run_one vllm mrv1  || warn "vllm-mrv1 failed (expected on DLIN; recorded)" ;;
+      "")
+        _compare_run_one sglang    || die "sglang run failed (cannot compare without it)"
+        _compare_run_one vllm mrv2 || warn "vllm-mrv2 failed (recorded as fail)"
+        _compare_run_one vllm mrv1 || warn "vllm-mrv1 failed (expected on DLIN; recorded as fail)"
+        ;;
     esac
   fi
 
-  # ---- Side-by-side gap table ----
-  local sf vf; sf="$COMPARE_METRICS_DIR/metrics_sglang.txt"; vf="$COMPARE_METRICS_DIR/metrics_vllm.txt"
-  if [ ! -f "$sf" ] || [ ! -f "$vf" ]; then
-    warn "missing one side's metrics ($sf / $vf) — run without --only first."
-    warn "ran sides: $([ -f "$sf" ] && echo -n sglang) $([ -f "$vf" ] && echo -n vllm)"
-    return 0
+  # ---- Record to JSON store (skip for --show/--no-record) ----
+  if [ "$COMPARE_SHOW" != "1" ] && [ "$COMPARE_RECORD" = "1" ]; then
+    local _commit _branch _dirty _sdk_base
+    _commit=$(git -C "$SGLANG_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
+    _branch=$(git -C "$SGLANG_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if git -C "$SGLANG_DIR" diff --quiet 2>/dev/null; then _dirty=""; else _dirty="--dirty"; fi
+    _sdk_base=$(basename "${SDK_DIR:-}")
+    local cr_args=(append --store "$COMPARE_STORE" --commit "$_commit" --branch "$_branch"
+      ${_dirty} --model "$(basename "${MODEL_PATH%/}")" --tp "${DLIN_TP_SIZE:-4}"
+      --sdk "$_sdk_base" --mem-frac "$COMPARE_MEM_FRAC" --scenarios "$COMPARE_SCENARIOS")
+    # Per engine: --metrics if file non-empty, else --fail (tail of its last log).
+    if [ -s "$COMPARE_METRICS_DIR/metrics_sglang.txt" ]; then
+      cr_args+=(--metrics "sglang=$COMPARE_METRICS_DIR/metrics_sglang.txt")
+    else cr_args+=(--fail "sglang=$COMPARE_METRICS_DIR/sglang_last.log"); fi
+    if [ -s "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" ]; then
+      cr_args+=(--metrics "vllm_mrv2=$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt")
+    else cr_args+=(--fail "vllm_mrv2=$COMPARE_METRICS_DIR/vllm-mrv2_last.log"); fi
+    if [ -s "$COMPARE_METRICS_DIR/metrics_vllm_mrv1.txt" ]; then
+      cr_args+=(--metrics "vllm_mrv1=$COMPARE_METRICS_DIR/metrics_vllm_mrv1.txt")
+    else cr_args+=(--fail "vllm_mrv1=$COMPARE_METRICS_DIR/vllm-mrv1_last.log"); fi
+    python "$cr" "${cr_args[@]}" || warn "failed to append to results store"
   fi
+
+  # ---- 3-column side-by-side gap table (sglang | MRV2 | MRV1) ----
   echo
-  log "================ sglang vs vLLM — showcase gap ================"
-  # model_tag: pull from the engine's last full log (the cached metrics_*.txt
-  # strips the header line). `|| true` — grep returns 1 on no-match and under
-  # `set -eo pipefail` an unguarded failure here would abort before the table.
+  log "============= sglang vs vLLM (MRV2 + MRV1) — showcase gap ============="
   local model_tag
   model_tag=$(grep -m1 -h '^=== METRICS ' "$COMPARE_METRICS_DIR/sglang_last.log" 2>/dev/null \
               | sed -n 's/.*model=\([^ ]*\).*/\1/p' || true)
   [ -z "$model_tag" ] && model_tag=$(basename "${MODEL_PATH%/}")
   echo  "  model=$model_tag  tp=${DLIN_TP_SIZE:-4}  scenarios=$COMPARE_SCENARIOS"
-  echo  "  (each side: same GPUs, FP8, fresh process; vLLM APC-OFF)"
+  echo  "  (same GPUs, FP8, fresh process each; vLLM APC-OFF; MRV1 often FAIL on DLIN)"
   echo  "  $(date '+%Y-%m-%d %H:%M:%S')"
-  echo  "  -----------------------------------------------------------"
-  echo  "  metric                   | sglang    | vLLM      | winner"
-  echo  "  -------------------------+-----------+-----------+-----------"
+  echo  "  -----------------------------------------------------------------------"
+  echo  "  metric                   | sglang    | vLLM-MRV2 | vLLM-MRV1 | sglang vs MRV2"
+  echo  "  -------------------------+-----------+-----------+-----------+----------------"
   _compare_row "SC1 warm latency (ms)"   SC1_warm_ms        lower
   _compare_row "SC1 cold->warm speedup"  SC1_speedup_x      higher
   _compare_row "SC2 avg turn (ms)"       SC2_avg_ms         lower
   _compare_row "SC2 turn-5 (ms)"         SC2_turn5_ms       lower
   _compare_row "SC3 throughput (tok/s)"  SC3_throughput_tps higher
   _compare_row "SC3 per-req (ms)"        SC3_per_req_ms     lower
-  if grep -q '^METRIC SC4_' "$sf" 2>/dev/null || grep -q '^METRIC SC4_' "$vf" 2>/dev/null; then
+  if grep -q '^METRIC SC4_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC4_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
     _compare_row "SC4 JSON (tok/s)"      SC4_tps            higher
   fi
-  echo  "  ==========================================================="
-  log "metrics cached: $COMPARE_METRICS_DIR/metrics_{sglang,vllm}.txt"
-  log "full logs:      $COMPARE_METRICS_DIR/{sglang,vllm}_last.log"
+  echo  "  ======================================================================="
+  log "metrics cached: $COMPARE_METRICS_DIR/metrics_{sglang,vllm_mrv1,vllm_mrv2}.txt"
+  log "results store:  $COMPARE_STORE   (./run_sglang.sh compare --history to view)"
+
+  # ---- Diff vs previous run (skip for --show) ----
+  if [ "$COMPARE_SHOW" != "1" ] && [ "$COMPARE_RECORD" = "1" ]; then
+    echo
+    local diff_args=(diff --store "$COMPARE_STORE")
+    [ -n "$COMPARE_BASELINE" ] && diff_args+=(--baseline "$COMPARE_BASELINE")
+    python "$cr" "${diff_args[@]}" || true
+  fi
 }
 
 #-------------------------------------------------------------------------------
