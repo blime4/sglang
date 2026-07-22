@@ -416,3 +416,51 @@ accept：可预测 ~1.3%（len 1.07），新颖 ~6.7% greedy / ~7.5% sample0.6�
 - **deferred**：要彻底修需让 GDN verify kernel 的 batch 路径与 decode recurrent 路径数值等价（kernel 级研究工作），或逐 token 顺序化 verify（已试、反而更差）。超出本会话范围，列为后续深度项。
 
 **复现**：`scripts/dl/p0_verify.py`（PLAIN vs SPEC 对比，决定性）；模型页缓存后 weight-load 21.9s。
+
+---
+
+## §10.11 FROZEN_KV_MTP 首次跑通：crash 根因 = 配置校验缺失（非 hybrid KV），89% 前缀匹配，1.83× 更慢（2026-07-19）
+
+**Crash**：`RuntimeError: selected index k out of range` at `eagle_utils.py:153`
+`organize_draft_results` → `torch.topk(score_list, num_draft_token-1, dim=-1)`。
+
+**根因 = 配置校验缺失，非 hybrid GDN KV 结构**。`topk=1` 时 `draft_forward`
+循环 `num_steps` 次，每次 append 一列到 `score_list`，故 `organize_draft_results`
+要求 `num_draft_tokens-1 <= num_steps`，即 `num_draft_tokens == num_steps+1`
+（EAGLE 的 topk==1 不变量）。测试配置 `num_steps=1, num_draft_tokens=4` →
+`topk(score_list[1列], 3)` → crash。`_handle_eagle_family` 强制此不变量，但
+`_handle_frozen_kv_mtp` 没有 → 这是 code gap。
+
+**修复（全部 DL-marked）**：
+1. `_handle_frozen_kv_mtp`（`speculative_hook.py`）：topk==1 时强制
+   `num_draft_tokens=num_steps+1`。测试改为标准 MoE-MTP 默认 `(3,1,4)`。
+2. `qwen3_5_mtp.py`：加 `self.backbone_hidden_size = config.hidden_size`
+   （cuda-graph runner 读此属性 sizing recurrent hidden buffer；Qwen3.5 config
+   无此字段，Gemma4 专有）。
+3. `frozen_kv_mtp_cuda_graph_runner.py`：standard-NextN（`kv_context is None`）
+   时 cuda-graph capture 不再 swap 到 target pool（与 eager no-op 一致）。
+4. `FrozenKVMTPInputBuffers` 加 `out_cache_loc` 字段（full-attn 层 CG capture 需 KV store loc）。
+
+**验证（GPU 24-27 TP4；20-23 被早期 crash 迭代触发的 DLIN driver OOM-leak
+占用，D-state 进程不可恢复）**：
+
+| mode | TPOT | tps | 前 64 token vs plain |
+|---|---|---|---|
+| plain | 50.99ms | 19.6 | baseline |
+| MTP | 93.48ms | 10.7 | 57/64 (89%) — token 57 处发散 |
+
+- **正确性**：非逐 token 一致。前 57 token 完全匹配（coherent `<think>`），
+  token 57 发散（plain=`76802` vs MTP=`471`）。即 §10.10 的 GDN verify≠decode
+  架构问题——batch-verify（packed/parallel scan）与 sequential-decode（recurrent）
+  数值不等价，verify forward 偏离 plain decode。89% 前缀匹配说明 draft+verify
+  pipeline 功能正确（非灾难性 bug），残余发散是 GDN verify≠decode kernel gap。
+- **性能**：MTP **1.83× 更慢**（93.5 vs 51.0ms TPOT）。draft-forward tax
+  （每 draft step 额外一次 FP8 MoE+attn forward ~20ms）+ 低 accept rate（draft
+  token 多被拒）→ MTP 在此 hybrid MoE 模型上是 net loss。与 §10.10 预测一致。
+
+**结论**：FROZEN_KV_MTP 在 Qwen3.5-35B-A3B 上**可运行**（crash 已修），但
+**不可用**——既不逐 token 正确（GDN verify≠decode），也更慢（draft tax > accept
+收益）。要可用需先解决 GDN verify kernel 的 batch≡recurrent 数值等价（§10.10
+deferred 项）。详见 `docs/dl/torch-compile-phase2-debug-blog.md` §9。
+
+**复现**：`CUDA_VISIBLE_DEVICES=24,25,26,27 python scripts/dl/mtp_correctness.py {plain,mtp}`

@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 440" text-rendering="geometricPrecision" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title>Figure 3 — GPU forward optimization journey</title>
+  <desc>Horizontal bars showing GPU forward time shrinking from the GEMMEX baseline (27.5 ms) through the fused-MoE fix (20.7 ms, today) toward the torch.compile goal (~18 ms), converging on vLLM's current ~18 ms.</desc>
+  <style>
+    .r { color-scheme: light;
+      --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+      --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.12);
+      --b1:#6da7ec; --b2:#2a78d6; --b3:#184f95; --ref:#eb6834; --onseg:#ffffff; --good:#006300; }
+    @media (prefers-color-scheme: dark) {
+      .r { color-scheme: dark;
+        --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+        --grid:#2c2c2a; --base:#383835; --ring:rgba(255,255,255,0.14);
+        --b1:#7db0f0; --b2:#3987e5; --b3:#256abf; --ref:#d95926; --onseg:#ffffff; --good:#0ca30c; } }
+    .r .sf { fill: var(--surface); }
+    .r text { fill: var(--ink); }
+    .r .i2 { fill: var(--ink2); }
+    .r .mu { fill: var(--muted); }
+  </style>
+
+  <g class="r">
+    <rect class="sf" width="900" height="440"/>
+
+    <text x="40" y="40" font-size="21" font-weight="700">Figure 3 · The GPU-forward optimization journey</text>
+    <text x="40" y="64" font-size="13" class="i2">Each step shrank GPU forward time. The fused-MoE fix is landed (today); torch.compile fusions are the remaining lever to reach vLLM.</text>
+
+    <!-- legend: blue = SGLang trajectory, orange = vLLM reference -->
+    <g font-size="12">
+      <rect x="244" y="86" width="12" height="12" rx="2" fill="var(--b2)"/>
+      <text x="262" y="96">SGLang trajectory</text>
+      <rect x="396" y="86" width="12" height="12" rx="2" fill="var(--ref)"/>
+      <text x="414" y="96">vLLM reference</text>
+    </g>
+
+    <!-- axis -->
+    <g stroke="var(--base)" stroke-width="1">
+      <line x1="244" y1="392" x2="850" y2="392"/>
+    </g>
+    <g font-size="11" class="mu" text-anchor="middle">
+      <g stroke="var(--grid)" stroke-width="1">
+        <line x1="244" y1="392" x2="244" y2="398"/><line x1="354" y1="392" x2="354" y2="398"/>
+        <line x1="464" y1="392" x2="464" y2="398"/><line x1="574" y1="392" x2="574" y2="398"/>
+        <line x1="684" y1="392" x2="684" y2="398"/><line x1="794" y1="392" x2="794" y2="398"/>
+      </g>
+      <text x="244" y="412">0</text><text x="354" y="412">5</text><text x="464" y="412">10</text>
+      <text x="574" y="412">15</text><text x="684" y="412">20</text><text x="794" y="412">25</text>
+      <text x="540" y="432" font-size="12" class="i2">GPU forward time per token (ms)</text>
+    </g>
+
+    <!-- reference line at 18ms = x 244 + 18*22 = 640 -->
+    <line x1="640" y1="120" x2="640" y2="390" stroke="var(--ref)" stroke-width="1" stroke-dasharray="3 3" opacity="0.55"/>
+    <text x="644" y="116" font-size="10.5" class="mu">18 ms — vLLM / goal</text>
+
+    <!-- Bar 1: GEMMEX baseline 27.5 -> 605px ; start x=244 -->
+    <text x="234" y="161" font-size="12.5" font-weight="600" text-anchor="end">SGLang · GEMMEX baseline</text>
+    <rect x="244" y="140" width="605" height="32" rx="3" fill="var(--b1)"/>
+    <text x="856" y="161" font-size="13" font-weight="700">27.5</text>
+
+    <!-- Bar 2: fused MoE 20.7 -> 455px -->
+    <text x="234" y="229" font-size="12.5" font-weight="600" text-anchor="end">SGLang · fused MoE</text>
+    <rect x="244" y="208" width="455" height="32" rx="3" fill="var(--b2)"/>
+    <text x="706" y="229" font-size="13" font-weight="700">20.7</text>
+    <text x="744" y="229" font-size="10.5" class="mu">today</text>
+
+    <!-- Bar 3: +compile goal 18 -> 396px -->
+    <text x="234" y="297" font-size="12.5" font-weight="600" text-anchor="end">SGLang · + torch.compile</text>
+    <rect x="244" y="276" width="396" height="32" rx="3" fill="var(--b3)"/>
+    <text x="647" y="297" font-size="13" font-weight="700">~18</text>
+    <text x="678" y="297" font-size="10.5" class="mu">goal</text>
+
+    <!-- Bar 4: vLLM 18 -> 396px -->
+    <text x="234" y="365" font-size="12.5" font-weight="600" text-anchor="end" fill="var(--ref)">vLLM</text>
+    <rect x="244" y="344" width="396" height="32" rx="3" fill="var(--ref)" fill-opacity="0.85"/>
+    <text x="647" y="365" font-size="13" font-weight="700" fill="var(--ref)">~18</text>
+
+    <!-- delta brackets in the inter-row gaps (clear of value labels) -->
+    <!-- delta1: bar1 end 849 -> bar2 end 699, gap y 174..206 -->
+    <g stroke="var(--ink2)" stroke-width="1.1" fill="none">
+      <path d="M699 192 L 699 184 L 849 184 L 849 192"/>
+    </g>
+    <text x="774" y="178" font-size="11.5" font-weight="700" fill="var(--good)" text-anchor="middle">−6.8 ms · fused MoE (no gather)</text>
+
+    <!-- delta2: bar2 end 699 -> bar3 end 640, gap y 242..274 -->
+    <g stroke="var(--ink2)" stroke-width="1.1" fill="none">
+      <path d="M640 260 L 640 252 L 699 252 L 699 260"/>
+    </g>
+    <text x="669" y="246" font-size="11.5" font-weight="700" fill="var(--good)" text-anchor="middle">−2.7 ms · compile fusions</text>
+  </g>
+</svg>

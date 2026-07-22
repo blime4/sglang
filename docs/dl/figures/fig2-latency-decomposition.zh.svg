@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 490" text-rendering="geometricPrecision" font-family="'Noto Sans CJK SC', system-ui, sans-serif">
+  <title>图 2 — TP4 decode 延迟分解:SGLang vs vLLM</title>
+  <desc>堆叠水平条形图,把单步 decode 拆成 host 开销、GPU 非 MoE(注意力/GDN/norm/proj)和 GPU MoE。两引擎的 host 与 MoE 持平,3.3ms 差距完全落在 GPU 非 MoE 段。</desc>
+  <style>
+    .r { color-scheme: light;
+      --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+      --grid:#e1e0d9; --base:#c3c2b7; --ring:rgba(11,11,11,0.12);
+      --host:#cfcdba; --blue:#2a78d6; --orange:#eb6834; --onseg:#ffffff; --hostink:#3a3a36; }
+    @media (prefers-color-scheme: dark) {
+      .r { color-scheme: dark;
+        --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+        --grid:#2c2c2a; --base:#383835; --ring:rgba(255,255,255,0.14);
+        --host:#54534d; --blue:#3987e5; --orange:#d95926; --onseg:#ffffff; --hostink:#ffffff; } }
+    .r .sf { fill: var(--surface); }
+    .r text { fill: var(--ink); }
+    .r .i2 { fill: var(--ink2); }
+    .r .mu { fill: var(--muted); }
+  </style>
+
+  <g class="r">
+    <rect class="sf" width="900" height="470"/>
+
+    <text x="40" y="40" font-size="21" font-weight="700">图 2 · TP4 decode 3.3ms 差距究竟在哪</text>
+    <text x="40" y="64" font-size="13" class="i2">单步 decode 拆成 host 开销 + GPU 非 MoE + GPU MoE。host 与 MoE 持平——差距在 GPU 非 MoE。</text>
+
+    <!-- legend -->
+    <g font-size="12.5">
+      <rect x="160" y="92" width="14" height="14" rx="2" fill="var(--host)"/>
+      <text x="180" y="104">host 开销</text>
+      <rect x="270" y="92" width="14" height="14" rx="2" fill="var(--blue)"/>
+      <text x="290" y="104">GPU — 注意力 / GDN / norm / proj</text>
+      <rect x="560" y="92" width="14" height="14" rx="2" fill="var(--orange)"/>
+      <text x="580" y="104">GPU — MoE</text>
+    </g>
+
+    <!-- X axis -->
+    <g stroke="var(--base)" stroke-width="1"><line x1="160" y1="350" x2="800" y2="350"/></g>
+    <g font-size="11" class="mu" text-anchor="middle">
+      <g stroke="var(--grid)" stroke-width="1">
+        <line x1="160" y1="350" x2="160" y2="356"/><line x1="280" y1="350" x2="280" y2="356"/>
+        <line x1="400" y1="350" x2="400" y2="356"/><line x1="520" y1="350" x2="520" y2="356"/>
+        <line x1="640" y1="350" x2="640" y2="356"/><line x1="760" y1="350" x2="760" y2="356"/>
+      </g>
+      <text x="160" y="372">0</text><text x="280" y="372">5</text><text x="400" y="372">10</text>
+      <text x="520" y="372">15</text><text x="640" y="372">20</text><text x="760" y="372">25</text>
+      <text x="480" y="396" font-size="12" class="i2">每 token 耗时(ms)</text>
+    </g>
+
+    <text x="150" y="208" font-size="14" font-weight="700" text-anchor="end">SGLang</text>
+    <text x="150" y="298" font-size="14" font-weight="700" text-anchor="end">vLLM</text>
+
+    <!-- SGLang: host 6.0(144) | blue 13.5(324) | orange 7.8(187) -->
+    <g>
+      <rect x="160" y="184" width="144" height="42" rx="3" fill="var(--host)"/>
+      <rect x="306" y="184" width="324" height="42" fill="var(--blue)"/>
+      <rect x="632" y="184" width="187" height="42" rx="3" fill="var(--orange)"/>
+      <rect x="304" y="184" width="2" height="42" fill="var(--surface)"/>
+      <rect x="630" y="184" width="2" height="42" fill="var(--surface)"/>
+      <g font-size="12.5" text-anchor="middle">
+        <text x="232" y="210" fill="var(--hostink)">host 6.0</text>
+        <text x="468" y="210" fill="var(--onseg)">13.5</text>
+        <text x="725" y="210" fill="var(--onseg)">MoE 7.8</text>
+      </g>
+      <text x="825" y="210" font-size="14" font-weight="700">27.3 ms</text>
+    </g>
+
+    <!-- vLLM: host 6.0(144) | blue 9.4(226) | orange 8.6(206) -->
+    <g>
+      <rect x="160" y="274" width="144" height="42" rx="3" fill="var(--host)"/>
+      <rect x="306" y="274" width="226" height="42" fill="var(--blue)"/>
+      <rect x="534" y="274" width="206" height="42" rx="3" fill="var(--orange)"/>
+      <rect x="304" y="274" width="2" height="42" fill="var(--surface)"/>
+      <rect x="532" y="274" width="2" height="42" fill="var(--surface)"/>
+      <g font-size="12.5" text-anchor="middle">
+        <text x="232" y="300" fill="var(--hostink)">host 6.0</text>
+        <text x="419" y="300" fill="var(--onseg)">9.4</text>
+        <text x="637" y="300" fill="var(--onseg)">MoE 8.6</text>
+      </g>
+      <text x="748" y="300" font-size="14" font-weight="700">24.0 ms</text>
+    </g>
+
+    <!-- gap bracket: vLLM end 740 -> SGLang end 819 -->
+    <g stroke="var(--ink2)" stroke-width="1.25" fill="none">
+      <path d="M740 150 L 740 140 L 819 140 L 819 150"/>
+    </g>
+    <text x="779" y="132" font-size="12.5" font-weight="700" text-anchor="middle">3.3 ms 差距</text>
+    <text x="779" y="118" font-size="11" class="i2" text-anchor="middle">torch.compile 融合</text>
+
+    <g font-size="10.5" class="mu" text-anchor="middle">
+      <text x="232" y="338">持平</text>
+      <text x="681" y="338">≈ 同款 kernel</text>
+    </g>
+
+    <text x="40" y="450" font-size="11.5" class="mu">host 开销与 MoE kernel 在两个引擎间持平(同一份 _dl_C.so);3.3ms 差距全在 GPU 非 MoE 段——</text>
+    <text x="40" y="470" font-size="11.5" class="mu">即 vLLM 经 torch.compile(norm_quant / act_quant)融合、而 SGLang 暂缺的 RMSNorm + FP8 量化算子。</text>
+  </g>
+</svg>

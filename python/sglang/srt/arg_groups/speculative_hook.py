@@ -5,6 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+# DL begin — import current_platform for is_dlin() check (NGRAM topk bypass)
+from sglang.srt.platforms import current_platform
+# DL end
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -256,6 +260,31 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
             "Frozen-KV MTP speculative decoding."
         )
 
+    # DL begin — Frozen-KV MTP reuses the EAGLE draft_forward loop +
+    # organize_draft_results, so the same topk==1 invariant applies:
+    # num_draft_tokens MUST equal num_steps + 1 (organize_draft_results runs
+    # torch.topk(score_list, num_draft_tokens-1) over a score_list with exactly
+    # num_steps columns; a mismatch raises "selected index k out of range").
+    # EAGLE family enforces this in _handle_eagle_family; without it here, a
+    # mismatched FROZEN_KV_MTP config crashes on the first draft_forward.
+    # See docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.11.
+    if (
+        server_args.speculative_eagle_topk is not None
+        and server_args.speculative_num_steps is not None
+        and server_args.speculative_num_draft_tokens is not None
+        and server_args.speculative_eagle_topk == 1
+        and server_args.speculative_num_draft_tokens
+        != server_args.speculative_num_steps + 1
+    ):
+        logger.warning(
+            "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+            "when speculative_eagle_topk == 1 (FROZEN_KV_MTP)."
+        )
+        server_args.speculative_num_draft_tokens = (
+            server_args.speculative_num_steps + 1
+        )
+    # DL end
+
 
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     if (
@@ -456,6 +485,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         server_args.speculative_eagle_topk > 1
         and server_args.page_size > 1
         and server_args.attention_backend != "flashinfer"
+        and not current_platform.is_dlin()  # DL: allow NGRAM topk>1 on DLIN
     ):
         raise ValueError(
             f"speculative_eagle_topk({server_args.speculative_eagle_topk}) > 1 "

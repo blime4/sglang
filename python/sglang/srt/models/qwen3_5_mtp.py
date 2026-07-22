@@ -112,6 +112,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        # DL begin — Frozen-KV MTP cuda-graph runner reads `backbone_hidden_size`
+        # to size the recurrent hidden buffer (frozen_kv_mtp_worker_v2.py
+        # `_recurrent_hidden_size`). Qwen3.5 config has no `backbone_hidden_size`
+        # field (Gemma4-only), so expose the target hidden_size under that name;
+        # the draft consumes target hidden_states of this dimension (fc: 2*hidden).
+        self.backbone_hidden_size = config.hidden_size
+        # DL end
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm

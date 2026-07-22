@@ -51,8 +51,8 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     hidden_states: torch.Tensor
-    # Consumed by the captured seed iter; see `FrozenKVMTPDraftWorker.draft_forward`.
     bonus_tokens: torch.Tensor
+    out_cache_loc: torch.Tensor  # DL: KV cache locations for full-attn layers
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
@@ -141,6 +141,9 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 dtype=self.model_runner.dtype,
             )
             bonus_tokens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            # DL begin — dummy out_cache_loc for CG capture (full-attn layers need KV store)
+            out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int32)
+            # DL end
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -170,6 +173,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index=topk_index,
             hidden_states=hidden_states,
             bonus_tokens=bonus_tokens,
+            out_cache_loc=out_cache_loc,  # DL: KV cache locations for full-attn layers
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
@@ -311,9 +315,22 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         # for the capture; the single backend-attr swap is seen by both
         # get_token_to_kv_pool() (via get_attn_backend()) and the
         # backend's own reads.
-        target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
-        saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
-        self.draft_attn_backend.token_to_kv_pool = target_pool
+        # DL begin — kv_context is None when the draft uses its own KV (standard
+        # NextN: Qwen3.5 q_proj independently trained → frozen-KV accept ~0.04).
+        # Match the eager path (target_kv_pool_view is a no-op when kv_context
+        # is None): skip the pool swap so the captured graph uses the draft's
+        # OWN KV (layer 40), not the target's. Swapping to the target pool here
+        # would make the captured graph read target KV while eager reads draft
+        # KV — divergent outputs. See docs/dl/dlin-sglang-mtp-vs-ngram-report.md.
+        kv_ctx = self.frozen_kv_mtp_worker.kv_context
+        if kv_ctx is not None:
+            saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
+            self.draft_attn_backend.token_to_kv_pool = (
+                kv_ctx.target_token_to_kv_pool
+            )
+        else:
+            saved_backend_pool = None
+        # DL end
         try:
             with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
@@ -330,7 +347,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                     ),
                 )
         finally:
-            self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
+            # DL begin — only restore when we swapped (frozen-KV path)
+            if saved_backend_pool is not None:
+                self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
+            # DL end
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)

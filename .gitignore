@@ -291,3 +291,14 @@ artifacts/
 .humanize/
 *.fatbin
 *.fatbin.bak
+
+# DLIN auto-generated AOT compiler rule dumps — never commit (see scripts/run_*)
+*_aot_rules.r
+
+# DLIN local-only dev artifacts — never commit. These are environment / asset
+# files that must exist on disk for local runs (source .../env.sh, model weights,
+# vLLM comparison wheels) but are NOT build dependencies of sglang itself.
+/sdk-dlop-*/
+/vllm-new-overlay/
+/models-dl/
+/whl-for-compare/
