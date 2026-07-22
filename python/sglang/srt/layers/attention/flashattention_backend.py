@@ -31,7 +31,16 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import merge_state_v2
+# DL begin — merge_state_v2 Python wrapper exists but the underlying C++ op
+# (torch.ops.sgl_kernel.merge_state_v2) is absent from the DLIN build.
+# Check the runtime op, not just the import.
+import torch as _dl_torch
+if hasattr(_dl_torch.ops.sgl_kernel, 'merge_state_v2'):
+    from sgl_kernel import merge_state_v2
+else:
+    merge_state_v2 = None
+from sglang.srt.layers.attention.merge_state import merge_state as _dl_merge_state_fallback
+# DL end
 
 from sglang.jit_kernel.flash_attention import (
     flash_attn_varlen_func,
@@ -3081,4 +3090,8 @@ def cdiv(a: int, b: int) -> int:
 # TODO(hebiao064): remove this once we have a better way to handle the merge_state_v2 torch.compile issue
 @torch._dynamo.disable()
 def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
-    return merge_state_v2(o, s_a, o_exp, s_b)
+    # DL begin — use merge_state fallback (Triton) when merge_state_v2 is unavailable
+    if merge_state_v2 is not None:
+        return merge_state_v2(o, s_a, o_exp, s_b)
+    return _dl_merge_state_fallback(o, s_a, o_exp, s_b)
+    # DL end

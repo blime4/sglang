@@ -1476,10 +1476,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
+        # DL begin — OPTIONAL per-step draft/verify timing (SGLANG_DL_DFLASH_TIMING=1).
+        # Fully gated: when off, no sync and no timing, so production DFlash is unaffected.
+        import os as _dl_os, time as _dl_t
+        _dl_timing = _dl_os.environ.get("SGLANG_DL_DFLASH_TIMING", "0") == "1"
+        _dl_ts0 = _dl_t.perf_counter() if _dl_timing else 0.0
         with torch.inference_mode():
             draft_logits_output = self.draft_model_runner.forward(
                 forward_batch
             ).logits_output
+        if _dl_timing:
+            torch.cuda.synchronize()
+            _dl_draft_ms = (_dl_t.perf_counter() - _dl_ts0) * 1000
+        # DL end
 
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
@@ -1532,12 +1541,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
+        # DL begin — verify forward timing + emit per-step breakdown (gated)
+        _dl_vs0 = _dl_t.perf_counter() if _dl_timing else 0.0
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        if _dl_timing:
+            torch.cuda.synchronize()
+            _dl_verify_ms = (_dl_t.perf_counter() - _dl_vs0) * 1000
+            print(f"[dl-dflash-step] draft_ms={_dl_draft_ms:.1f} "
+                  f"verify_ms={_dl_verify_ms:.1f} cg={target_out.can_run_cuda_graph} "
+                  f"M={verify_forward_batch.extend_num_tokens}", flush=True)
+        # DL end
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
