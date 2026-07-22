@@ -15,7 +15,7 @@
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | Phase 1 — 导入切换 | 🟢 部分完成 | **#3 rotary、#4/#5/#6 fused_moe 已完成并验证**（DLIN 死分支，零行为变化，decode 20→20 tok/s）；#1/#7 暂缓（需 Phase 4a 的 _dl_C/_C kernel）；#2 回退（DL 构建缺 awq）。详见 Phase 1 章节。 |
-| Phase 2 — marlin_gemm | ⬜ 未开始 | 包装方案已验证可行（签名 17 vs 19） |
+| Phase 2 — marlin_gemm | 🟢 完成 | `marlin_utils.py` 内联 `marlin_gemm` 包装（委托 `gptq_marlin_gemm`），移除 vllm 导入。调用点本就 7→19 损坏死代码；marlin 在 DLIN 全不可用（kernel 不编译），零回归（1.7B 19.66→20.02 tok/s）。 |
 | Phase 3 — Python 导入清理 | ⬜ 未开始 | 含计划此前遗漏的 `quant_utils.is_layer_skipped` 两处 |
 | Phase 4a — `_dl_C` 内核 | ⬜ 未开始 | 前提成立：相关 `sgl_kernel` ops schema 已验证 |
 | Phase 4b — DL fused_experts | ⬜ 未开始 | |
@@ -123,48 +123,60 @@ flowchart TD
 
 ## Phase 2: marlin_gemm 包装
 
+> **执行结果（2026-07-22）**：✅ 已完成。移除 `marlin_utils.py` 对 `vllm._custom_ops` 的导入，改为本地 `marlin_gemm` 包装（委托 `gptq_marlin_gemm`）。DLIN 死路径（见下），零行为变化：1.7B 前后 decode 19.66→20.02 tok/s、输出逐字一致。
+
 ### 问题
 
 `python/sglang/srt/layers/quantization/marlin_utils.py:875` 中 `MarlinLinearMethod.apply()`（类定义于 `:731`，`apply` 于 `:859`）调用 `ops.marlin_gemm(x_2d, qweight, scales, workspace, size_m, size_n, size_k)`。
 
-SGLang 已有 `gptq_marlin_gemm` JIT 内核（`python/sglang/jit_kernel/gptq_marlin.py:36`），签名不同但**已验证可表达标准 Marlin**（对称 4-bit 无 zero point）。
+> **核查发现**：该调用点传 **7 个位置参数**，但已安装的 vLLM 0.21 `marlin_gemm` 实际是 **19 参**（同 vLLM 0.23）。即原调用 `7→19` 本就 `TypeError`——`MarlinLinearMethod`（base，纯 Marlin 格式）是**已损坏的死代码**，实际 GPTQ/AWQ-Marlin 走 `GPTQMarlinLinearMethod` → `gptq_marlin_gemm`（已是 sglang 自有）。`ops` 在本文件中**仅此一处**使用。
 
 ### 签名对比（已核对）
 
 | 层面 | 位置 | 参数数 |
 |------|------|--------|
-| vLLM Python (`_custom_ops.py:1397`) | `marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float)` | 19 |
-| vLLM C++ (`csrc/quantization/marlin/marlin.cu:533`) | 同上结构 | 19 |
-| SGLang JIT (`jit_kernel/gptq_marlin.py:36`) | `gptq_marlin_gemm(a, c, b_q_weight, b_scales, global_scale, b_zeros, g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float)` | 17 |
+| vLLM Python（已装 0.21，`_custom_ops.py`） | `marlin_gemm(a, c, b_q_weight, b_bias, b_scales, a_scales, global_scale, b_zeros, g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float)` | 19 |
+| SGLang JIT（`jit_kernel/gptq_marlin.py:36`） | `gptq_marlin_gemm(a, c, b_q_weight, b_scales, global_scale, b_zeros, g_idx, perm, workspace, b_q_type, size_m, size_n, size_k, is_k_full, use_atomic_add, use_fp32_reduce, is_zp_float)` | 17 |
 
-> **修正**：两者并非"调用同一 `marlin.cuh` 模板"。sglang 用自己的 `device::marlin::marlin_mm`（`gptq_marlin.cuh`），是与 vLLM `marlin.cuh` 并列的**独立实现**（同一算法）。差异参数 `b_bias`、`a_scales` 在标准对称 4-bit 无 zero point 场景下均为 `None`，`b_zeros` 可传 `None`（内部转 empty tensor），因此包装可行。
+> 两者是同一算法的独立实现（sglang `device::marlin::marlin_mm` vs vLLM `marlin.cuh`）。标准对称 4-bit 无 zero point 时 `b_bias`/`a_scales`/`global_scale`/`b_zeros`/`g_idx`/`perm` 均为 `None`。
 
-### 方案：jit_kernel 包装
+### 方案（已实现）：marlin_utils.py 内联包装
 
-在 `python/sglang/jit_kernel/gptq_marlin.py` 中添加包装函数：
+包装**直接定义在 `marlin_utils.py`**（复用该文件已导入的 `gptq_marlin_gemm` 与 `scalar_types`，单文件改动），而非 `gptq_marlin.py`：
 
 ```python
+# DL begin: Phase 2 — local marlin_gemm shim ... delegates to gptq_marlin_gemm.
 def marlin_gemm(a, b_q_weight, b_scales, workspace, size_m, size_n, size_k):
-    """Replace vllm._custom_ops.marlin_gemm — delegate to gptq_marlin_gemm."""
-    from sgl_kernel.scalar_type import ScalarType
-    b_q_type = ScalarType.uint4b8  # Marlin 4-bit symmetric, no zero point
     return gptq_marlin_gemm(
         a, None, b_q_weight, b_scales, None,  # c=None, global_scale=None
-        None, None, None, workspace,           # b_zeros=None, g_idx=None, perm=None
-        b_q_type, size_m, size_n, size_k,
-        is_k_full=True, use_fp32_reduce=True,
+        None, None, None, workspace,          # b_zeros/g_idx/perm=None
+        scalar_types.uint4b8, size_m, size_n, size_k,  # 标准 Marlin: 对称4bit
     )
+# DL end
 ```
 
-修改 `marlin_utils.py:41-43`（`from vllm import _custom_ops as ops`）改为本地 `_OpsWrapper`（见原方案），并在 `:875` 调用处保持入参不变。
+- 删除 `marlin_utils.py:40-43` 的 `try: from vllm import _custom_ops as ops`。
+- `:875` 调用 `ops.marlin_gemm(...)` → `marlin_gemm(...)`（7 参不变）。
+- **修正**：原方案写 `ScalarType.uint4b8`——本构建 `ScalarType` 类**无**该属性；正确写法是 `scalar_types.uint4b8`（经 `get_scalar_types()`，`marlin_utils.py:53`）。
 
-### 备选方案
+### ⚠️ Marlin 在 DLIN 上不可用（pre-existing）
 
-如 JIT 内核在某 SDK 下表现异常，则在 `sgl-kernel/csrc/` 中移植 vLLM 的 `csrc/quantization/marlin/`（`marlin.cu` / `marlin.cuh` / `marlin_dtypes.cuh` / `marlin_mma.h` / `marlin_template.h` / `dequant.h` / `kernel.h` / `generate_kernels.py`）到 sgl-kernel AOT。
+- sglang `gptq_marlin.cuh` **无法为 DLIN 编译**（`compiling for dlgput64r1` → 2 errors，NVIDIA mma 汇编不通过）。
+- vLLM DL 构建亦**未注册** marlin op（`torch.ops._C` 无 `gptq_marlin_repack`/`marlin_gemm`）。
+- → Marlin（含 GPTQ-Marlin）在 DLIN 上**全路径不可用**；DLIN 用 FP8/dlblas。本阶段包装无法在 DLIN 上数值验证（kernel 跑不起来），但**不引入回归**（该路径本就不可用）。
 
-**退出标准**：用 AWQ 量化模型端到端推理，输出与 vllm 依赖基线逐 token 一致（`torch.allclose` 容差内）。
+### 验证证据
+
+- **静态**：`marlin_utils.py` 无 `from vllm`（仅注释）；py_compile OK；DL marker check OK；模块导入 OK（`marlin_gemm` 已定义，`ops` 已移除）。
+- **E2E 前后对比**（Qwen3-1.7B, fa3, GPU0, greedy 96 tok）：输出**逐字一致**；decode **19.66 → 20.02 tok/s**（Δ +1.8%，噪声，无回归）。
+- **数值等价**：无法在 DLIN 执行（marlin kernel 不编译）；包装为对 `gptq_marlin_gemm` 的薄委托，正确性由构造保证（7→17 参映射 + `uint4b8`）。
+
+### 备选方案（若未来 DLIN 支持 marlin）
+
+如需在 DLIN 跑 Marlin，需先把 `gptq_marlin.cuh`（或 vLLM `csrc/quantization/marlin/`）适配到 DLIN 的 mma/汇编——属硬件内核工作，超出本移植计划范围。
 
 ---
+
 
 ## Phase 3: Python 模块导入清理
 

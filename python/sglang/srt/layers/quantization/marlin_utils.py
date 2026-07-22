@@ -37,12 +37,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
 )
 
-try:
-    from vllm import _custom_ops as ops
-except ImportError:
-    ops = None
-
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
@@ -51,6 +45,24 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 ScalarType, scalar_types = get_scalar_types()
+
+
+# DL begin: Phase 2 — local marlin_gemm shim for the base MarlinLinearMethod,
+# replacing vllm._custom_ops.marlin_gemm. Standard Marlin = symmetric 4-bit
+# (uint4b8), no bias/a_scale/global_scale/zero_point/g_idx/perm; delegates to
+# gptq_marlin_gemm (same kernel family already used by GPTQMarlinLinearMethod).
+def marlin_gemm(a, b_q_weight, b_scales, workspace, size_m, size_n, size_k):
+    return gptq_marlin_gemm(
+        a, None, b_q_weight, b_scales, None,  # c=None, global_scale=None
+        None, None, None, workspace,  # b_zeros=None, g_idx=None, perm=None
+        scalar_types.uint4b8,
+        size_m,
+        size_n,
+        size_k,
+    )
+
+
+# DL end
 
 GPTQ_MARLIN_TILE = 16
 GPTQ_MARLIN_MIN_THREAD_N = 64
@@ -872,7 +884,7 @@ class MarlinLinearMethod(LinearMethodBase):
         size_k = x_2d.shape[1]
         size_n = scales.shape[1]
 
-        output_2d = ops.marlin_gemm(
+        output_2d = marlin_gemm(  # DL: Phase 2 — local shim (was vllm._custom_ops.marlin_gemm)
             x_2d, qweight, scales, workspace, size_m, size_n, size_k
         )
 
