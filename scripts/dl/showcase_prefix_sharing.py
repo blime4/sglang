@@ -152,6 +152,14 @@ def main():
             engine.shutdown()
     else:
         from vllm import LLM, SamplingParams
+        # NOTE: enable_prefix_caching=True is UNSUPPORTED for this hybrid Mamba
+        # model on DLIN. vLLM forces mamba_cache_mode='align' when APC is on,
+        # which MRV2 hard-rejects ("Model Runner V2 has not yet supported
+        # mamba_cache_mode='align'"). MRV1 (the alternative runner) crashes on
+        # DLIN with ConstraintViolationError. So vLLM runs APC-OFF here — the
+        # only working config — meaning vLLM re-prefills the shared prefix every
+        # request (SC1 speedup = 1.0x). Contrast: sglang RadixAttention works
+        # on this model and gives 16.4x. See blog for the APC crash trace.
         llm = LLM(
             model=MODEL, tensor_parallel_size=TP, dtype="bfloat16",
             max_model_len=4096, gpu_memory_utilization=args.mem_frac,
@@ -286,7 +294,15 @@ def main():
     })
 
     if engine_name == "sglang":
-        # sglang with json_schema constraint
+        # sglang with json_schema constraint.
+        # Warm the schema compiler first (xgrammar FSM build is ~3s one-time per
+        # schema; without this warmup every request re-pays it and tok/s looks
+        # 3x worse than steady state). vLLM caches its schema in the backend.
+        for _ in range(2):
+            engine.generate(json_prompt, {
+                "max_new_tokens": 8, "temperature": 0, "ignore_eos": True,
+                "json_schema": json_schema,
+            })
         best_json = 999
         json_valid = False
         json_sample = ""
@@ -312,6 +328,11 @@ def main():
         from vllm.sampling_params import StructuredOutputsParams
         sp_json = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
         sp_json.structured_outputs = StructuredOutputsParams(json=json_schema)
+        # Warm the schema compiler (mirrors the sglang warmup above).
+        sp_warm = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
+        sp_warm.structured_outputs = StructuredOutputsParams(json=json_schema)
+        for _ in range(2):
+            llm.generate([json_prompt], sp_warm)
         best_json = 999
         json_valid = False
         json_sample = ""
