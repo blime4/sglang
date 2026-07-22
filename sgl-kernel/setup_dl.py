@@ -47,6 +47,8 @@ sources = [
     "csrc/elementwise/pos_enc.cu",
     # DL begin: standalone RMSNorm (no FlashInfer dep) — see rmsnorm_dl.cu header.
     "csrc/elementwise/rmsnorm_dl.cu",
+    # DL: Gemma RMSNorm (weight+1), replaces vllm._dl_C.gemma_rms_norm (plan 4a).
+    "csrc/elementwise/gemma_rmsnorm_dl.cu",
     # DL begin: graph-safe paged-decode attention (no packing) — see header.
     "csrc/elementwise/paged_decode_attn_dl.cu",
     # DL end

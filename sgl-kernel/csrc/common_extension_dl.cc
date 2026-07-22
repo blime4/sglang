@@ -25,6 +25,11 @@ void rmsnorm(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
              double eps, bool enable_pdl);
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual,
                        torch::Tensor weight, double eps, bool enable_pdl);
+// csrc/elementwise/gemma_rmsnorm_dl.cu — Gemma RMSNorm (weight+1).
+void gemma_rmsnorm(torch::Tensor out, torch::Tensor input, torch::Tensor weight,
+                   double eps);
+void gemma_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual,
+                             torch::Tensor weight, double eps);
 void paged_decode_attn(torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache,
                        torch::Tensor page_table, torch::Tensor seqlens,
                        torch::Tensor out, double softmax_scale);
@@ -75,6 +80,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, "
       "bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_kernel_dl::fused_add_rmsnorm);
+
+  // csrc/elementwise/gemma_rmsnorm_dl.cu — Gemma RMSNorm (weight+1); replaces
+  // vllm._dl_C.gemma_rms_norm / fused_add_gemma_rms_norm (plan Phase 4a).
+  m.def("gemma_rmsnorm(Tensor! out, Tensor input, Tensor weight, float eps) -> ()");
+  m.impl("gemma_rmsnorm", torch::kCUDA, &sgl_kernel_dl::gemma_rmsnorm);
+  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, "
+        "float eps) -> ()");
+  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &sgl_kernel_dl::gemma_fused_add_rmsnorm);
 
   // csrc/elementwise/paged_decode_attn_dl.cu — graph-safe paged-decode attention
   // (no gather/scatter/packing; reads paged KV directly; single kernel launch).

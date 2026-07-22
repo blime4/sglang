@@ -17,7 +17,7 @@
 | Phase 1 — 导入切换 | 🟢 部分完成 | **#3 rotary、#4/#5/#6 fused_moe 已完成并验证**（DLIN 死分支，零行为变化，decode 20→20 tok/s）；#1/#7 暂缓（需 Phase 4a 的 _dl_C/_C kernel）；#2 回退（DL 构建缺 awq）。详见 Phase 1 章节。 |
 | Phase 2 — marlin_gemm | 🟢 完成 | `marlin_utils.py` 内联 `marlin_gemm` 包装（委托 `gptq_marlin_gemm`），移除 vllm 导入。调用点本就 7→19 损坏死代码；marlin 在 DLIN 全不可用（kernel 不编译），零回归（1.7B 19.66→20.02 tok/s）。 |
 | Phase 3 — Python 导入清理 | 🟡 部分完成 | common.py logger ✅（完成）；parallel_state monkey-patch ⏸（gate Phase 4e，代码注释要求 quant 层去 vllm 后再删）；modelslim/w8a8_int8 的 is_layer_skipped 实为本地方法（Phase 1 误报，无需处理）。零回归。 |
-| Phase 4a — `_dl_C` 内核 | ⬜ 未开始 | 前提成立：相关 `sgl_kernel` ops schema 已验证 |
+| Phase 4a — `_dl_C` 内核 | 🟡 进行中 | **gemma_rms_norm 已移植**（独立 DL kernel，dlcc 构建通过，数值 ≈ vllm `_dl_C`：fp16 4.9e-4 / bf16 1.6e-2；慢 ~1.4× 待向量化优化）；GEMM/quant kernel 待按同模式推进。 |
 | Phase 4b — DL fused_experts | ⬜ 未开始 | |
 | Phase 4c — Flash Attention | 🟡 部分完成 | Python 层已切 `sgl_flash_attn`（`_sgl_fa2_C`）；**FA 编译并入 sgl-kernel 构建系统尚未做**（当前靠运行时 `load_library` 加载 `.venv` 里的独立 `.so`） |
 | Phase 4d — 其他 DLIN 内核 | ⬜ 未开始 | |
@@ -214,7 +214,26 @@ grep -rn "import vllm\|from vllm" python/sglang/srt/ | grep -v "multimodal_gen" 
 
 ### 4a: 移植 _dl_C / _C 内核
 
-`_dl_C.so` / `_C.so` 在 SGLang 中被两处加载：
+> **执行进度（2026-07-23）**：🟡 进行中。**首个 kernel `gemma_rms_norm` 已移植并验证**（见下"已完成"），建立可复用的移植工作流；其余 kernel（GEMM/quant）待按同模式推进。
+
+#### 移植工作流（已验证，gemma 为样板）
+
+1. **独立重写**（非照搬 vllm）：镜像 `sgl-kernel/csrc/elementwise/rmsnorm_dl.cu`——只用 `ATen/cuda` + `cuda_{bf16,fp16}` + `torch/all` + `"utils.h"`，手写 warp shuffle 规约（无 CUB），`FloatCvt` 处理 dlcc 的 fp16/bf16 转换怪癖。sgl-kernel **没有** vllm 的头文件树（`type_convert.cuh`/`dispatch_utils.h`/`cub_helpers.h`/`batch_invariant.hpp`/`vectorization_utils.cuh`），故不能直接 copy。
+2. **接线**：`setup_dl.py` 的 `sources` 加新 `.cu`；`common_extension_dl.cc` 加 `namespace sgl_kernel_dl` 前置声明 + `TORCH_LIBRARY_EXPAND` 的 `m.def`/`m.impl`（schema 匹配 vllm `_dl_C`）。
+3. **构建**：`CUDA_HOME=$SDK python setup_dl.py build_ext --inplace`（dlcc + `--cuda-gpu-arch=dlgput64`，ninja 增量）。
+4. **数值验证**：`torch.ops.sgl_kernel.<op>` vs `torch.ops._dl_C.<op>`（load_library vllm `_dl_C.so`）。
+5. **（4e）切换 sglang**：sglang python 改调 `torch.ops.sgl_kernel.<op>`，移除对应 `_dl_C` 加载。
+
+#### ✅ 已完成：gemma_rms_norm（首个 kernel，样板）
+
+- 新增 `sgl-kernel/csrc/elementwise/gemma_rmsnorm_dl.cu`（独立实现，`gemma = RMSNorm × (weight+1)`），注册 `gemma_rmsnorm` + `gemma_fused_add_rmsnorm`（匹配 vllm `_dl_C` 4 参签名）。
+- **构建**：dlcc 编译 + 链接成功（`.so` 14.70→14.87 MB，含 `gemma_rmsnorm_dl.o`）。
+- **数值验证**（vs vllm `_dl_C`，M=64 H=2048）：sgl-vs-vllm **fp16 4.88e-4**（sub-ULP）、**bf16 1.56e-2**（≈1-2 ULP）；且两者相对 PyTorch 参考的偏差**完全相同**（均 fp32 全程后 cast，参考是 cast-early）→ 移植忠实复现 vllm 行为。
+- **性能**（M=H=4096）：sgl 1454µs vs vllm 1071µs，**慢 ~1.4×**（标量 grid-stride 循环 vs vllm 向量化读 + CUB）。与已部署的 `rmsnorm_dl.cu`（同标量结构）一致；向量化优化为后续项。
+- **E2E build-health**（Qwen3-1.7B）：重建 `.so` 后 20.28 tok/s、输出不变（gemma 不在 Qwen 路径，标准 rmsnorm 未受影响）。
+- **未做 4e 切换**：layernorm.py 仍走 `_dl_C`（gemma 不在 Qwen DLIN 路径，无法 E2E 验证切换；切 layernorm 需 Gemma 模型回归）。
+
+
 
 | 文件 | 行 | 用途 |
 |------|-----|------|
@@ -240,8 +259,8 @@ grep -rn "import vllm\|from vllm" python/sglang/srt/ | grep -v "multimodal_gen" 
 
 | vLLM 命名空间 | SGLang 命名空间 | 现状 |
 |---------------|----------------|------|
-| `torch.ops._dl_C.gemma_rms_norm` | `torch.ops.sgl_kernel.gemma_rmsnorm` | 已有 schema（`rmsnorm`/`fused_add_rmsnorm` 已注册，需确认 gemma 变体） |
-| `torch.ops._dl_C.fused_add_gemma_rms_norm` | `torch.ops.sgl_kernel.gemma_fused_add_rmsnorm` | 需确认/新增 |
+| `torch.ops._dl_C.gemma_rms_norm` | `torch.ops.sgl_kernel.gemma_rmsnorm` | ✅ 已注册（DL 构建）+ 数值验证通过（sgl-vs-vllm fp16 4.9e-4 / bf16 1.6e-2） |
+| `torch.ops._dl_C.fused_add_gemma_rms_norm` | `torch.ops.sgl_kernel.gemma_fused_add_rmsnorm` | ✅ 已注册 + 数值验证通过 |
 | `torch.ops._dl_C.gptq_dlblas_gemmex` | `torch.ops.sgl_kernel.gptq_dlblas_gemmex` | 需新增 |
 | `torch.ops._C.rms_norm_dynamic_per_token_quant` | `torch.ops.sgl_kernel.rms_norm_dynamic_per_token_quant` | 需新增（来源主库 `_C`） |
 | `torch.ops._C.silu_and_mul_quant` / `silu_and_mul_per_block_quant` | `torch.ops.sgl_kernel.*` | 需新增（来源主库 `_C`） |
