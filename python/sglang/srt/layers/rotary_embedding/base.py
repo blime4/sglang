@@ -110,10 +110,11 @@ class RotaryEmbedding(MultiPlatformOp):
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
                 from sglang.jit_kernel.rope import rotary_embedding
-            elif _is_hip:
-                from sgl_kernel import rotary_embedding
             else:
-                from vllm._custom_ops import rotary_embedding
+                # DL begin: Phase 1 — use sgl_kernel (same 6-arg impl) instead of
+                # vllm._custom_ops.rotary_embedding on the non-CUDA fallback path.
+                # DL end
+                from sgl_kernel import rotary_embedding
 
             self.use_fallback_kernel = True
             self.fallback_rotary_embedding = rotary_embedding

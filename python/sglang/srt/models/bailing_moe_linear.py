@@ -102,6 +102,10 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
+    # DL begin: Phase 1 (deferred) — sgl_kernel.awq_dequantize is NOT in the DL
+    # build (absent from common_extension_dl.cc / setup_dl.py), so keep vllm here
+    # until awq_kernel.cu is added to the DL sgl-kernel build.
+    # DL end
     from vllm._custom_ops import awq_dequantize
 
 if _is_hip:
