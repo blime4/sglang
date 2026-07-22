@@ -1614,7 +1614,11 @@ class ServerArgs:
                 lambda: self.get_model_config().is_piecewise_cuda_graph_disabled_model,
             ),
             ("DP attention", lambda: self.enable_dp_attention),
-            ("full torch.compile mode", lambda: self.enable_torch_compile),
+            # DL begin — on DLIN, torch.compile (decode full) + tc_piecewise (prefill)
+            # coexist (verified for dual compile+CG; they wrap different forwards).
+            # Don't auto-disable prefill tc_piecewise just because decode compile is on.
+            ("full torch.compile mode", lambda: self.enable_torch_compile and not current_platform.is_dlin()),
+            # DL end
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),
             (
                 "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
@@ -1627,7 +1631,13 @@ class ServerArgs:
             ),
             ("MoE A2A backend", lambda: self.moe_a2a_backend != "none"),
             ("LoRA", lambda: bool(self.lora_paths) or self.enable_lora),
-            ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # DL begin — on DLIN, relax the multimodal tc_piecewise-disable ONLY when
+            # torch.compile is on (the verified dual-capture case). Plain (no-compile)
+            # multimodal runs keep eager prefill: tc_piecewise-compiling this MoE
+            # model hits a DLIN triton "too many resources" error in fused_experts, so
+            # it must NOT be the default for plain runs. Genuine VL input untested.
+            ("multimodal model", lambda: self.get_model_config().is_multimodal and not (current_platform.is_dlin() and self.enable_torch_compile)),
+            # DL end
             (
                 "GGUF quantization",
                 lambda: self.load_format == "gguf"

@@ -621,7 +621,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
+            seq_lens_sum=int(seq_lens_cpu.sum()) if seq_lens_cpu is not None else seq_lens.sum().item(),  # DL: host sum (no D2H sync) — matches tbo_backend.py:195 pattern; .item() was a per-step GPU sync
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=None,

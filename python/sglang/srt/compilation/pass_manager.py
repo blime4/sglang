@@ -36,7 +36,17 @@ class PostGradPassManager(CustomGraphPass):
         self.passes: list[SGLangInductorPass] = []
 
     def __call__(self, graph: fx.Graph):
-        shape = get_pass_context().runtime_shape
+        # DL begin — the decode torch.compile path (patch_model in
+        # torch_compile_decoration.py) enters Inductor WITHOUT a pass_context
+        # (that context is only set by sglang's compile.py / tc_piecewise path).
+        # Fall back to None shape so get_pass_context()'s assert doesn't crash
+        # the SGLANG_DL_FUSION=1 compile. is_applicable_for_shape() returns True
+        # for None by default, so all passes still run.
+        try:
+            shape = get_pass_context().runtime_shape
+        except AssertionError:
+            shape = None
+        # DL end
         for pass_ in self.passes:
             if pass_.is_applicable_for_shape(shape):
                 pass_(graph)

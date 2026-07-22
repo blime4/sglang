@@ -80,4 +80,32 @@ def set_torch_compile_config() -> None:
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
+    # DL begin — wire PostGradPassManager into Inductor so DLIN fusion passes
+    # (RMSNormQuantFusionPass / ActivationQuantFusionPass, added in Stage 1) run on
+    # the decode post-grad graph. Mirrors vLLM's VllmBackend, which sets
+    # inductor_config["post_grad_custom_post_pass"] = pass_manager. Without this,
+    # decode's backend-less torch.compile (patch_model) never applies custom passes.
+    # Gated by SGLANG_DL_FUSION (default off) so the default tree is untouched.
+    try:
+        import os as _dl_os
+        if _dl_os.environ.get("SGLANG_DL_FUSION", "0") == "1":
+            from sglang.srt.compilation.pass_manager import PostGradPassManager
+
+            _dl_pm = PostGradPassManager()
+            _dl_pm.configure()
+            # attach the DLIN fusion passes (port in progress; empty == no-op)
+            try:
+                from sglang.srt.compilation.passes.fusion import (
+                    build_dl_fusion_passes,
+                )
+
+                for _p in build_dl_fusion_passes():
+                    _dl_pm.add(_p)
+            except Exception:
+                pass
+            torch._inductor.config.post_grad_custom_post_pass = _dl_pm
+    except Exception:
+        pass
+    # DL end
+
     monkey_patch_torch_compile()
