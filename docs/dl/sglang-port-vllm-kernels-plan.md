@@ -16,7 +16,7 @@
 |------|------|------|
 | Phase 1 — 导入切换 | 🟢 部分完成 | **#3 rotary、#4/#5/#6 fused_moe 已完成并验证**（DLIN 死分支，零行为变化，decode 20→20 tok/s）；#1/#7 暂缓（需 Phase 4a 的 _dl_C/_C kernel）；#2 回退（DL 构建缺 awq）。详见 Phase 1 章节。 |
 | Phase 2 — marlin_gemm | 🟢 完成 | `marlin_utils.py` 内联 `marlin_gemm` 包装（委托 `gptq_marlin_gemm`），移除 vllm 导入。调用点本就 7→19 损坏死代码；marlin 在 DLIN 全不可用（kernel 不编译），零回归（1.7B 19.66→20.02 tok/s）。 |
-| Phase 3 — Python 导入清理 | ⬜ 未开始 | 含计划此前遗漏的 `quant_utils.is_layer_skipped` 两处 |
+| Phase 3 — Python 导入清理 | 🟡 部分完成 | common.py logger ✅（完成）；parallel_state monkey-patch ⏸（gate Phase 4e，代码注释要求 quant 层去 vllm 后再删）；modelslim/w8a8_int8 的 is_layer_skipped 实为本地方法（Phase 1 误报，无需处理）。零回归。 |
 | Phase 4a — `_dl_C` 内核 | ⬜ 未开始 | 前提成立：相关 `sgl_kernel` ops schema 已验证 |
 | Phase 4b — DL fused_experts | ⬜ 未开始 | |
 | Phase 4c — Flash Attention | 🟡 部分完成 | Python 层已切 `sgl_flash_attn`（`_sgl_fa2_C`）；**FA 编译并入 sgl-kernel 构建系统尚未做**（当前靠运行时 `load_library` 加载 `.venv` 里的独立 `.so`） |
@@ -180,19 +180,28 @@ def marlin_gemm(a, b_q_weight, b_scales, workspace, size_m, size_n, size_k):
 
 ## Phase 3: Python 模块导入清理
 
-| 文件（已核对路径） | 行 | 当前依赖 | 替换方案 |
-|------|-----|---------|---------|
-| `python/sglang/srt/utils/common.py` | 1176 | `from vllm.logger import logger as vllm_default_logger` | 直接用 `logging.getLogger("vllm")` 设级别，无需导入 vllm |
-| `python/sglang/srt/distributed/parallel_state.py` | 2506 | `import vllm.distributed.parallel_state`（`monkey_patch_vllm_parallel_state()` 内） | SGLang 已有自身 `parallel_state.py`；实现等价 `GroupCoordinator` 替代，移除 monkey-patch 层 |
-| `python/sglang/srt/layers/quantization/modelslim/modelslim.py` | — | `from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped` | **vendor** `is_layer_skipped` 到 sglang 内部 util（计划此前遗漏） |
-| `python/sglang/srt/layers/quantization/w8a8_int8.py` | — | 同上 `is_layer_skipped` | 同上 |
+> **执行结果（2026-07-22）**：🟡 部分完成。4 项中 **1 项完成**（common.py logger）、**1 项暂缓**（parallel_state，由代码注释明确 gate 在 Phase 4e）、**2 项无效**（modelslim/w8a8_int8 实为本地方法，无 vllm 导入——Phase 1 核查误报）。零回归：1.7B 前后 decode 20.33→20.22 tok/s、输出逐字一致。
 
-`parallel_state.py` 的 monkey-patch 用于 SGLang 与 vLLM 共存时的互操作；迁移后 SGLang 完全独立，不再需要此层。
+### 逐项结果
 
-**退出标准**：
+| 文件（已核对） | 处理 | 结果/原因 |
+|------|------|----------|
+| `python/sglang/srt/utils/common.py:1176` | **✅ 完成** | `suppress_other_loggers()` 中 `from vllm.logger import logger` → `logging.getLogger("vllm")`（等价：vllm.logger.logger 本就是 `logging.getLogger("vllm")`）。已验证不再 import vllm.logger 且正确设级别。 |
+| `python/sglang/srt/distributed/parallel_state.py:2506` | **⏸ 暂缓（gate Phase 4e）** | `monkey_patch_vllm_parallel_state()` 仅在 `load_model()` 期间施加（`model_runner.py:1426` 施加、`:1451` 反向），因 quant 层（linear.py，即 layernorm/fp8/fp8_utils 的顶层 `import vllm`）加载时触发 vllm 代码调用 `vllm.parallel_state.get_tp_group()`。**`model_runner.py:1425` 注释原文**："Remove monkey_patch when linear.py quant remove dependencies with vllm"。故须待 Phase 4e（移除 quant 层顶层 vllm 导入）后才能删；现在删会破坏模型加载。 |
+| `modelslim/modelslim.py:242` | **N/A（误报）** | 无 `from vllm`；`is_layer_skipped` 是本地方法，仅注释 `# adapted from vllm...`。Phase 1 核查 agent 误报为 vllm 导入。 |
+| `quantization/w8a8_int8.py:122` | **N/A（误报）** | 同上，本地方法。 |
+
+### 验证证据
+
+- **单元**：`suppress_other_loggers()` 不再 import vllm.logger；调用后 `logging.getLogger("vllm").level == WARN`、pynccl/shm_broadcast/config 均 WARN。PASS。
+- **静态**：py_compile OK；DL marker check OK；`common.py` 无 `from vllm.logger`。
+- **E2E 前后对比**（Qwen3-1.7B, fa3, GPU0, greedy 96 tok）：输出**逐字一致**；decode **20.33 → 20.22 tok/s**（Δ −0.5%，噪声，无回归）。
+
+### 退出标准（修正）
 ```bash
-grep -rn "import vllm\|from vllm" python/sglang/srt/ | grep -v "multimodal_gen" | grep -v "Adapted from\|adapted\|switched from\|#.*vllm" 
-# 仅剩 Phase 4 尚未处理的 _dl_C/_C/fused_moe 导入
+grep -rn "import vllm\|from vllm" python/sglang/srt/ | grep -v "multimodal_gen" | grep -v "Adapted from\|adapted\|switched from\|#.*vllm"
+# common.py 的 vllm.logger 已清除；parallel_state 的 import 在 monkey_patch 函数内（lazy+guarded），
+# 待 Phase 4e 移除 quant 层顶层 import vllm 后一并删除。
 ```
 
 ---

@@ -1172,12 +1172,10 @@ def suppress_noisy_warnings():
 def suppress_other_loggers():
     suppress_noisy_warnings()
 
-    try:
-        from vllm.logger import logger as vllm_default_logger
-    except ImportError:
-        return
-
-    vllm_default_logger.setLevel(logging.WARN)
+    # DL begin: Phase 3 — use stdlib logging instead of importing vllm.logger
+    # (vllm.logger.logger is itself logging.getLogger("vllm"), so this is
+    # equivalent and no longer hard-requires vllm at this call site).
+    logging.getLogger("vllm").setLevel(logging.WARN)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
@@ -1185,6 +1183,7 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
+    # DL end
 
 
 def assert_pkg_version(pkg: str, min_version: str, message: str):
