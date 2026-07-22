@@ -5,11 +5,16 @@
 #   Show Case 1: Multi-request prefix sharing — N requests sharing a LONG prefix
 #   Show Case 2: Multi-turn conversation — each turn extends the previous
 #   Show Case 3: Concurrent batch with shared prefix
+#   Show Case 4: JSON structured output
 #
 # Engine: offline (sglang.Engine / vLLM LLM), sequential + concurrent.
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python scripts/dl/showcase_prefix_sharing.py
-#   CUDA_VISIBLE_DEVICES=4,5,6,7 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine vllm
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine vllm
+#   # only some scenarios (SC1 cold is ~90s; skip it for a fast SC2/SC3 check):
+#   .venv/bin/python scripts/dl/showcase_prefix_sharing.py --scenarios SC2,SC3
+#
+# Or via run_sglang.sh:  ./run_sglang.sh compare [--scenarios SC1,SC2,SC3]
 import os, time, statistics, argparse
 
 # DLIN env defaults
@@ -28,8 +33,8 @@ os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
 os.environ.setdefault("DLEOL_USE_CU_MQA_TILEKV", "1")
 os.environ.setdefault("VLLM_MAX_MOE_CU_TOKENS", "128")
 
-MODEL = "/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/"
-TP = 4
+MODEL = os.environ.get("MODEL_PATH", "/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/")
+TP = int(os.environ.get("TP_SIZE", "4"))
 
 # A long shared prefix (~2K tokens): system prompt + technical passage + few-shot examples
 SHARED_PREFIX = """You are an expert data analyst. Answer questions about the following technical document precisely.
@@ -124,16 +129,162 @@ def build_multi_turn():
     return turns
 
 
+# ---------------------------------------------------------------------------
+# Individual showcase scenarios. Each returns a metrics dict (KEY=value, all
+# lower-level numbers are floats/ints) so run_sglang.sh's `compare` phase can
+# parse them via "^METRIC KEY=" lines and build a side-by-side table.
+# ---------------------------------------------------------------------------
+
+def run_sc1(engine_name, generate, questions):
+    """SC1: Multi-request prefix sharing. 8 reqs share a 2K prefix."""
+    print(f"\n[showcase] === SC1: Prefix Sharing (8 reqs, 2K shared prefix) ===", flush=True)
+    cold_prompt = SHARED_PREFIX + "\n" + questions[0]
+    t0 = time.perf_counter()
+    cold_out = generate(cold_prompt, max_new=32)
+    cold_time = time.perf_counter() - t0
+    if isinstance(cold_out, dict):
+        cold_out = cold_out.get("text", str(cold_out))
+
+    warm_times, warm_outs = [], []
+    for q in questions[1:]:
+        t0 = time.perf_counter()
+        out = generate(SHARED_PREFIX + "\n" + q, max_new=32)
+        warm_times.append(time.perf_counter() - t0)
+        if isinstance(out, dict):
+            out = out.get("text", str(out))
+        warm_outs.append(out)
+
+    warm_med = statistics.median(warm_times)
+    warm_min = min(warm_times)
+    speedup = cold_time / warm_med
+    print(f"[showcase] SC1 {engine_name}: cold={cold_time*1000:.0f}ms  "
+          f"warm_median={warm_med*1000:.0f}ms  warm_min={warm_min*1000:.0f}ms  "
+          f"speedup={speedup:.1f}x", flush=True)
+    if isinstance(cold_out, str):
+        print(f"[showcase] SC1 {engine_name} cold_sample: {cold_out[:80]!r}", flush=True)
+    if warm_outs and isinstance(warm_outs[0], str):
+        print(f"[showcase] SC1 {engine_name} warm_sample: {warm_outs[0][:80]!r}", flush=True)
+    return {"SC1_cold_ms": f"{cold_time*1000:.0f}",
+            "SC1_warm_ms": f"{warm_med*1000:.0f}",
+            "SC1_speedup_x": f"{speedup:.2f}"}
+
+
+def run_sc2(engine_name, generate, turns):
+    """SC2: Multi-turn conversation. 5 turns, each extends history."""
+    print(f"\n[showcase] === SC2: Multi-turn Conversation (5 turns) ===", flush=True)
+    conversation = SHARED_PREFIX
+    turn_times = []
+    for i, turn_q in enumerate(turns):
+        conversation += f"\n\nHuman: {turn_q}\nAssistant:"
+        t0 = time.perf_counter()
+        out = generate(conversation, max_new=32)
+        dt = time.perf_counter() - t0
+        turn_times.append(dt)
+        if isinstance(out, dict):
+            out = out.get("text", str(out))
+        conversation += f" {out}"
+        print(f"[showcase] SC2 {engine_name} turn{i+1}: {dt*1000:.0f}ms  "
+              f"prompt_len={len(conversation)}  out={str(out)[:50]!r}", flush=True)
+    avg_ms = statistics.mean(turn_times) * 1000
+    turn5_ms = turn_times[-1] * 1000
+    print(f"[showcase] SC2 {engine_name}: avg={avg_ms:.0f}ms turn5={turn5_ms:.0f}ms "
+          f"trend={[f'{t*1000:.0f}' for t in turn_times]} ms", flush=True)
+    return {"SC2_avg_ms": f"{avg_ms:.0f}", "SC2_turn5_ms": f"{turn5_ms:.0f}"}
+
+
+def run_sc3(engine_name, generate_batch, questions):
+    """SC3: Concurrent batch with shared prefix. 4 reqs as a batch."""
+    print(f"\n[showcase] === SC3: Concurrent Batch (4 reqs, shared prefix) ===", flush=True)
+    batch_prompts = [SHARED_PREFIX + "\n" + q for q in questions[:4]]
+    best_batch = 999
+    for _ in range(3):
+        t0 = time.perf_counter()
+        generate_batch(batch_prompts, max_new=32)
+        best_batch = min(best_batch, time.perf_counter() - t0)
+    total_tokens = 4 * 32
+    batch_tps = total_tokens / best_batch
+    per_req_ms = best_batch * 1000 / 4
+    print(f"[showcase] SC3 {engine_name}: batch_time={best_batch*1000:.0f}ms  "
+          f"total_tokens={total_tokens}  throughput={batch_tps:.1f} tok/s  "
+          f"per_req={per_req_ms:.0f}ms", flush=True)
+    return {"SC3_throughput_tps": f"{batch_tps:.1f}",
+            "SC3_per_req_ms": f"{per_req_ms:.0f}"}
+
+
+def run_sc4(engine_name, raw, json_schema):
+    """SC4: JSON structured output (warmed). raw = sglang.Engine or vLLM LLM."""
+    print(f"\n[showcase] === SC4: JSON Structured Output ===", flush=True)
+    json_prompt = ("Extract the person info as JSON: Dr. Ada Lovelace, 36, "
+                   "senior research scientist at DeepMind in London. "
+                   "Email: ada.l@deepmind.example\n\nJSON:")
+    import json as _json
+    best_json, json_valid, json_sample = 999, False, ""
+
+    if engine_name == "sglang":
+        # Warm the schema compiler first (xgrammar FSM build is ~3s one-time per
+        # schema; without this warmup every request re-pays it and tok/s looks
+        # 3x worse than steady state). vLLM caches its schema in the backend.
+        for _ in range(2):
+            raw.generate(json_prompt, {"max_new_tokens": 8, "temperature": 0,
+                                        "ignore_eos": True, "json_schema": json_schema})
+        for _ in range(3):
+            t0 = time.perf_counter()
+            out = raw.generate(json_prompt, {"max_new_tokens": 48, "temperature": 0,
+                                              "ignore_eos": True, "json_schema": json_schema})
+            best_json = min(best_json, time.perf_counter() - t0)
+            txt = out["text"] if isinstance(out, dict) else str(out)
+            json_sample = txt[:120]
+            try:
+                _json.loads(out["text"] if isinstance(out, dict) else out)
+                json_valid = True
+            except Exception:
+                pass
+    else:
+        from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+        sp_json = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
+        sp_json.structured_outputs = StructuredOutputsParams(json=json_schema)
+        sp_warm = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
+        sp_warm.structured_outputs = StructuredOutputsParams(json=json_schema)
+        for _ in range(2):
+            raw.generate([json_prompt], sp_warm)
+        for _ in range(3):
+            t0 = time.perf_counter()
+            out = raw.generate([json_prompt], sp_json)[0]
+            best_json = min(best_json, time.perf_counter() - t0)
+            txt = out.outputs[0].text
+            json_sample = txt[:120]
+            try:
+                _json.loads(txt)
+                json_valid = True
+            except Exception:
+                pass
+
+    json_tps = 48 / best_json
+    print(f"[showcase] SC4 {engine_name}: time={best_json*1000:.0f}ms  "
+          f"tok/s={json_tps:.1f}  valid={json_valid}", flush=True)
+    print(f"[showcase] SC4 {engine_name} sample: {json_sample!r}", flush=True)
+    return {"SC4_tps": f"{json_tps:.1f}", "SC4_valid": "1" if json_valid else "0"}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", default="sglang", choices=["sglang", "vllm"])
     parser.add_argument("--mem-frac", type=float, default=0.55)
+    parser.add_argument("--scenarios", default="SC1,SC2,SC3",
+                        help="comma list of SC1/SC2/SC3/SC4 (default SC1,SC2,SC3; "
+                             "SC4=JSON. SC1 cold is ~90s — skip it for a fast check.)")
     args = parser.parse_args()
     engine_name = args.engine
+    enabled = {s.strip().upper() for s in args.scenarios.split(",") if s.strip()}
+    unknown = enabled - {"SC1", "SC2", "SC3", "SC4"}
+    if unknown:
+        raise SystemExit(f"unknown scenario(s): {unknown} (valid: SC1 SC2 SC3 SC4)")
 
-    print(f"[showcase] engine={engine_name} model={MODEL} tp={TP}", flush=True)
+    print(f"[showcase] engine={engine_name} model={MODEL} tp={TP} scenarios={sorted(enabled)}", flush=True)
 
     # ---- Launch engine ----
+    raw = None  # the engine/llm object (sglang.Engine or vLLM LLM)
     if engine_name == "sglang":
         import sglang as sgl
         engine = sgl.Engine(
@@ -144,6 +295,7 @@ def main():
             disable_custom_all_reduce=True, trust_remote_code=True,
             chunked_prefill_size=512,
         )
+        raw = engine
         def generate(prompt, max_new=32, temperature=0.0):
             return engine.generate(prompt, {"max_new_tokens": max_new, "temperature": temperature})
         def generate_batch(prompts, max_new=32, temperature=0.0):
@@ -167,6 +319,7 @@ def main():
             disable_log_stats=True,
             compilation_config={"cudagraph_capture_sizes":[1,2,4],"max_cudagraph_capture_size":4},
         )
+        raw = llm
         def generate(prompt, max_new=32, temperature=0.0):
             sp = SamplingParams(temperature=temperature, max_tokens=max_new)
             out = llm.generate([prompt], sp)[0]
@@ -187,178 +340,38 @@ def main():
 
     questions = build_questions()
     turns = build_multi_turn()
+    metrics = {}
 
-    # ================================================================
-    # SHOW CASE 1: Multi-request prefix sharing
-    # 8 requests share a 2K-token prefix, each with different 10-token suffix.
-    # Sequential: req1=cold, req2-8=warm (prefix cached).
-    # Measure: cold time, warm time, speedup.
-    # ================================================================
-    print(f"\n[showcase] === SC1: Prefix Sharing (8 reqs, 2K shared prefix) ===", flush=True)
+    if "SC1" in enabled:
+        metrics.update(run_sc1(engine_name, generate, questions))
+    if "SC2" in enabled:
+        metrics.update(run_sc2(engine_name, generate, turns))
+    if "SC3" in enabled:
+        metrics.update(run_sc3(engine_name, generate_batch, questions))
+    if "SC4" in enabled:
+        import json as _json
+        json_schema = _json.dumps({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "occupation": {"type": "string"},
+                "city": {"type": "string"},
+            },
+            "required": ["name", "age", "occupation", "city"],
+        })
+        metrics.update(run_sc4(engine_name, raw, json_schema))
 
-    # Cold: first request with this prefix
-    cold_prompt = SHARED_PREFIX + "\n" + questions[0]
-    t0 = time.perf_counter()
-    cold_out = generate(cold_prompt, max_new=32)
-    cold_time = time.perf_counter() - t0
-    if isinstance(cold_out, dict):
-        cold_out = cold_out.get("text", str(cold_out))
+    # ---- Machine-readable metrics (parsed by run_sglang.sh `compare` phase) ----
+    model_tag = os.path.basename(MODEL.rstrip("/"))
+    print(f"\n=== METRICS engine={engine_name} model={model_tag} tp={TP} ===", flush=True)
+    for k in sorted(metrics):
+        print(f"METRIC {k}={metrics[k]}", flush=True)
+    print("=== END METRICS ===", flush=True)
 
-    # Warm: subsequent requests with SAME prefix + different suffix
-    warm_times = []
-    warm_outs = []
-    for q in questions[1:]:
-        warm_prompt = SHARED_PREFIX + "\n" + q
-        t0 = time.perf_counter()
-        out = generate(warm_prompt, max_new=32)
-        dt = time.perf_counter() - t0
-        warm_times.append(dt)
-        if isinstance(out, dict):
-            out = out.get("text", str(out))
-        warm_outs.append(out)
-
-    warm_med = statistics.median(warm_times)
-    warm_min = min(warm_times)
-    speedup = cold_time / warm_med
-
-    print(f"[showcase] SC1 {engine_name}: cold={cold_time*1000:.0f}ms  "
-          f"warm_median={warm_med*1000:.0f}ms  warm_min={warm_min*1000:.0f}ms  "
-          f"speedup={speedup:.1f}x", flush=True)
-    if isinstance(cold_out, str):
-        print(f"[showcase] SC1 {engine_name} cold_sample: {cold_out[:80]!r}", flush=True)
-    if warm_outs and isinstance(warm_outs[0], str):
-        print(f"[showcase] SC1 {engine_name} warm_sample: {warm_outs[0][:80]!r}", flush=True)
-
-    # ================================================================
-    # SHOW CASE 2: Multi-turn conversation TTFT
-    # 5 turns, each extends the conversation history.
-    # Measure: per-turn wall time (should decrease as more is cached).
-    # ================================================================
-    print(f"\n[showcase] === SC2: Multi-turn Conversation (5 turns) ===", flush=True)
-
-    conversation = SHARED_PREFIX  # Start with system prompt
-    turn_times = []
-    for i, turn_q in enumerate(turns):
-        conversation += f"\n\nHuman: {turn_q}\nAssistant:"
-        t0 = time.perf_counter()
-        out = generate(conversation, max_new=32)
-        dt = time.perf_counter() - t0
-        turn_times.append(dt)
-        if isinstance(out, dict):
-            out = out.get("text", str(out))
-        conversation += f" {out}"
-        print(f"[showcase] SC2 {engine_name} turn{i+1}: {dt*1000:.0f}ms  "
-              f"prompt_len={len(conversation)}  out={str(out)[:50]!r}", flush=True)
-
-    # ================================================================
-    # SHOW CASE 3: Concurrent batch with shared prefix
-    # 4 requests with SAME prefix, sent as a BATCH.
-    # Both engines should dedup the prefix internally.
-    # Measure: total batch time, per-request throughput.
-    # ================================================================
-    print(f"\n[showcase] === SC3: Concurrent Batch (4 reqs, shared prefix) ===", flush=True)
-
-    batch_prompts = [SHARED_PREFIX + "\n" + q for q in questions[:4]]
-    # Run 3 times, take best
-    best_batch = 999
-    for _ in range(3):
-        t0 = time.perf_counter()
-        batch_outs = generate_batch(batch_prompts, max_new=32)
-        dt = time.perf_counter() - t0
-        best_batch = min(best_batch, dt)
-
-    total_tokens = 4 * 32  # 4 reqs × 32 output tokens each
-    batch_tps = total_tokens / best_batch
-    print(f"[showcase] SC3 {engine_name}: batch_time={best_batch*1000:.0f}ms  "
-          f"total_tokens={total_tokens}  throughput={batch_tps:.1f} tok/s  "
-          f"per_req={best_batch*1000/4:.0f}ms", flush=True)
-
-    # ================================================================
-    # SHOW CASE 4: JSON structured output (both engines)
-    # ================================================================
-    print(f"\n[showcase] === SC4: JSON Structured Output ===", flush=True)
-
-    json_prompt = ("Extract the person info as JSON: Dr. Ada Lovelace, 36, "
-                   "senior research scientist at DeepMind in London. "
-                   "Email: ada.l@deepmind.example\n\nJSON:")
-    import json as _json
-    json_schema = _json.dumps({
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "age": {"type": "integer"},
-            "occupation": {"type": "string"},
-            "city": {"type": "string"},
-        },
-        "required": ["name", "age", "occupation", "city"],
-    })
-
-    if engine_name == "sglang":
-        # sglang with json_schema constraint.
-        # Warm the schema compiler first (xgrammar FSM build is ~3s one-time per
-        # schema; without this warmup every request re-pays it and tok/s looks
-        # 3x worse than steady state). vLLM caches its schema in the backend.
-        for _ in range(2):
-            engine.generate(json_prompt, {
-                "max_new_tokens": 8, "temperature": 0, "ignore_eos": True,
-                "json_schema": json_schema,
-            })
-        best_json = 999
-        json_valid = False
-        json_sample = ""
-        for _ in range(3):
-            t0 = time.perf_counter()
-            out = engine.generate(json_prompt, {
-                "max_new_tokens": 48, "temperature": 0, "ignore_eos": True,
-                "json_schema": json_schema,
-            })
-            dt = time.perf_counter() - t0
-            best_json = min(best_json, dt)
-            json_sample = out["text"][:120] if isinstance(out, dict) else str(out)[:120]
-            try:
-                _json.loads(out["text"] if isinstance(out, dict) else out)
-                json_valid = True
-            except Exception:
-                pass
-        json_tps = 48 / best_json
-        print(f"[showcase] SC4 {engine_name}: time={best_json*1000:.0f}ms  "
-              f"tok/s={json_tps:.1f}  valid={json_valid}", flush=True)
-        print(f"[showcase] SC4 {engine_name} sample: {json_sample!r}", flush=True)
-    else:
-        from vllm.sampling_params import StructuredOutputsParams
-        sp_json = SamplingParams(temperature=0, max_tokens=48, ignore_eos=True)
-        sp_json.structured_outputs = StructuredOutputsParams(json=json_schema)
-        # Warm the schema compiler (mirrors the sglang warmup above).
-        sp_warm = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
-        sp_warm.structured_outputs = StructuredOutputsParams(json=json_schema)
-        for _ in range(2):
-            llm.generate([json_prompt], sp_warm)
-        best_json = 999
-        json_valid = False
-        json_sample = ""
-        for _ in range(3):
-            t0 = time.perf_counter()
-            out = llm.generate([json_prompt], sp_json)[0]
-            dt = time.perf_counter() - t0
-            best_json = min(best_json, dt)
-            txt = out.outputs[0].text
-            json_sample = txt[:120]
-            try:
-                _json.loads(txt)
-                json_valid = True
-            except Exception:
-                pass
-        json_tps = 48 / best_json
-        print(f"[showcase] SC4 {engine_name}: time={best_json*1000:.0f}ms  "
-              f"tok/s={json_tps:.1f}  valid={json_valid}", flush=True)
-        print(f"[showcase] SC4 {engine_name} sample: {json_sample!r}", flush=True)
-
-    # ================================================================
     print(f"\n[showcase] === {engine_name} SUMMARY ===", flush=True)
-    print(f"  SC1 cold={cold_time*1000:.0f}ms warm={warm_med*1000:.0f}ms speedup={speedup:.1f}x", flush=True)
-    print(f"  SC2 turns={[f'{t*1000:.0f}' for t in turn_times]} ms", flush=True)
-    print(f"  SC3 batch={best_batch*1000:.0f}ms throughput={batch_tps:.1f} tok/s", flush=True)
-    print(f"  SC4 json={best_json*1000:.0f}ms tok/s={json_tps:.1f} valid={json_valid}", flush=True)
+    for k, v in sorted(metrics.items()):
+        print(f"  {k} = {v}", flush=True)
 
     shutdown()
 

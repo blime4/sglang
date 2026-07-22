@@ -22,6 +22,12 @@
 #   benchrun     vLLM-benchrun-format serving bench (wraps scripts/dl/
 #                benchrun_sglang.py). Same config schema + output as the
 #                team's `vllm bench run` -> sglang vs vLLM diff directly.
+#   compare      sglang vs vLLM showcase (wraps scripts/dl/
+#                showcase_prefix_sharing.py) — SC1 prefix-sharing / SC2
+#                multi-turn / SC3 concurrent-batch. Runs BOTH engines on the
+#                same GPUs (fresh process each), caches metrics, prints a
+#                side-by-side gap table. The one-click tracker: re-run after
+#                any sglang change to see if the gap moved.
 #   all          setup -> build-kernel -> install -> test  (default)
 #
 # Usage:
@@ -35,6 +41,9 @@
 #   ./run_sglang.sh bench --offline                  # per-batch latency, no server
 #   ./run_sglang.sh benchrun -M qwen35-35b --num-prompts 8   # vLLM-format bench (autostarts server)
 #   ./run_sglang.sh benchrun --template                      # write a config_serving.json to edit
+#   ./run_sglang.sh compare                                  # sglang vs vLLM showcase (SC1-3, gap table)
+#   ./run_sglang.sh compare --scenarios SC2,SC3              # skip the ~90s SC1 cold prefill
+#   ./run_sglang.sh compare --only sglang                    # re-measure sglang, diff vs cached vLLM
 #
 # gen / serve options (override the env vars below):
 #   -m, --model PATH         model path           (default $MODEL_PATH)
@@ -62,7 +71,19 @@ set -eo pipefail
 # Config
 #-------------------------------------------------------------------------------
 SGLANG_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-SDK_DIR="${SDK_DIR:-/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sdk}"
+# SDK_DIR: prefer a repo-local sdk-dlop-* snapshot (newest) over the sibling
+# ../debug/sdk. The .venv is built + validated against a specific DLIN SDK
+# build; ../debug/sdk can lag it (older libhcrt -> sglang scheduler segfaults
+# at model load, exit -11). Override explicitly with SDK_DIR=... if needed.
+if [ -z "${SDK_DIR:-}" ]; then
+  SDK_DIR="/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sdk"
+  __latest=""
+  for __cand in "$SGLANG_DIR"/sdk-dlop-*; do
+    if [ -d "$__cand" ] && [ -f "$__cand/env.sh" ]; then __latest="$__cand"; fi
+  done
+  [ -n "$__latest" ] && SDK_DIR="$__latest"
+  unset __cand __latest
+fi
 ARTIFACTORY_DIR="${ARTIFACTORY_DIR:-/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/flash-attention/artifactory}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 VENV_DIR="${VENV_DIR:-$SGLANG_DIR/.venv}"
@@ -121,6 +142,20 @@ BENCH_OFFLINE="${BENCH_OFFLINE:-0}"              # 1 -> bench_one_batch (no serv
 BENCHRUN_CONFIG="${BENCHRUN_CONFIG:-}"           # --config PATH (passthrough to the harness)
 BENCHRUN_TEMPLATE="${BENCHRUN_TEMPLATE:-0}"      # 1 -> write the config template, don't run
 BENCHRUN_TP="${DLIN_TP_SIZE:-1}"                 # tensor-parallel size (set by -M qwen35-35b)
+
+# compare options (wraps scripts/dl/showcase_prefix_sharing.py — sglang vs vLLM
+# RadixAttention/APC showcase; the one-click gap tracker).
+#   --scenarios SC1,SC2,SC3[,SC4]   which showcases to run (SC1 cold is ~90s).
+#   --only sglang|vllm              re-run just one side, diff vs cached other.
+# Both engines run on the SAME GPUs sequentially (fresh process each), metrics
+# cached per engine so `--only` re-measures one side cheaply against the last run
+# of the other. vLLM runs APC-OFF — its prefix cache can't be enabled on this
+# hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'); see docs/dl/
+# sglang-vs-vllm-showcase-dlin.md.
+COMPARE_SCENARIOS="${COMPARE_SCENARIOS:-SC1,SC2,SC3}"
+COMPARE_ONLY="${COMPARE_ONLY:-}"                # --only sglang|vllm
+COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
+COMPARE_METRICS_DIR="${COMPARE_METRICS_DIR:-/tmp/sglang_compare}"
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -441,6 +476,15 @@ One-click run Qwen3.5-35B-A3B-FP8 (TP4) — the DEFAULT model for gen/serve:
   ./run_sglang.sh benchrun --template                      # write a config_serving.json to hand-edit
   ./run_sglang.sh benchrun /path/config_serving.json       # run an existing vLLM-format config
 
+sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
+  ./run_sglang.sh compare                       # SC1+SC2+SC3, both engines, prints gap table
+  ./run_sglang.sh compare --scenarios SC2,SC3   # skip the ~90s SC1 cold prefill
+  ./run_sglang.sh compare --only sglang         # re-measure sglang only, diff vs cached vLLM
+  Runs both engines on the same GPUs (fresh process each), caches metrics to
+  /tmp/sglang_compare. vLLM runs APC-OFF — its prefix cache can't be enabled on
+  this hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'). See
+  docs/dl/sglang-vs-vllm-showcase-dlin.md.
+
 Optimized model presets (-M flag):
   -M qwen3-1.7b    Qwen3-1.7B (default, bf16)
   -M qwen35-35b    Qwen3.5-35B-A3B-FP8 (TP=4, fused MoE + multi-step, CG; ~27ms TPOT = ~vLLM) [gen/serve default]
@@ -516,6 +560,9 @@ parse_test_args() {
       # benchrun
       --config)            BENCHRUN_CONFIG="$2"; shift 2;;
       --template)          BENCHRUN_TEMPLATE=1; shift;;
+      # compare
+      --scenarios)         COMPARE_SCENARIOS="$2"; shift 2;;
+      --only)              COMPARE_ONLY="$2"; shift 2;;
       -h|--help)           usage; exit 0;;
       *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
@@ -782,16 +829,132 @@ EOF
 }
 
 #-------------------------------------------------------------------------------
+# Phase: compare -- sglang vs vLLM showcase (RadixAttention vs APC).
+#   Wraps scripts/dl/showcase_prefix_sharing.py. Runs BOTH engines on the same
+#   GPUs sequentially (fresh process each — required for clean cache state on
+#   DLIN), caches the per-engine METRICS block to $COMPARE_METRICS_DIR, and
+#   prints a side-by-side gap table. The "one-click" tracker: re-run after any
+#   sglang change to see if the gap moved.
+#
+#   --only sglang|vllm  re-measure just that side and diff vs the cached metrics
+#                       of the other (skip its ~90s load). Useful when iterating
+#                       on one engine.
+#   --scenarios SC1,SC2,SC3[,SC4]  default SC1,SC2,SC3 (SC4=JSON).
+#
+#   NOTE: the showcase script is Qwen3.5-35B-A3B-FP8 / TP4 specific (hardcoded
+#   prompts + the FP8 fused-MoE path). -M is accepted but only to set TP/mem env;
+#   the model path it passes must be the FP8 Qwen3.5-35B.
+#-------------------------------------------------------------------------------
+_metric_val() {  # $1=KEY $2=file -> echoes value (empty if absent)
+  # `|| true`: grep returns 1 on no-match; under `set -eo pipefail` an unguarded
+  # failure here would kill the whole compare run when a key is absent (e.g.
+  # SC1_* keys in an SC3-only run). Always return 0.
+  grep "^METRIC $1=" "$2" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+_compare_row() {  # $1=label  $2=KEY  $3=dir(lower|higher)
+  local label="$1" key="$2" dir="$3"
+  local s v sf vf
+  sf="$COMPARE_METRICS_DIR/metrics_sglang.txt"; vf="$COMPARE_METRICS_DIR/metrics_vllm.txt"
+  s=$(_metric_val "$key" "$sf"); v=$(_metric_val "$key" "$vf")
+  [ -z "$s" ] && [ -z "$v" ] && return 0
+  if [ -z "$s" ]; then printf "  %-24s | %-10s | %-10s | (sglang not run)\n" "$label" "NA" "${v:-NA}"; return 0; fi
+  if [ -z "$v" ]; then printf "  %-24s | %-10s | %-10s | (vLLM not run)\n" "$label" "${s:-NA}" "NA"; return 0; fi
+  awk -v lbl="$label" -v s="$s" -v v="$v" -v dir="$dir" 'BEGIN{
+    # ratio > 1 means sglang wins. lower-better: v/s ; higher-better: s/v
+    r = (dir == "higher") ? (s/v) : (v/s);
+    if (r+0 >= 1.0) w = sprintf("sglang %.2fx", r); else w = sprintf("vLLM %.2fx", 1.0/r);
+    printf "  %-24s | %-10s | %-10s | %s\n", lbl, s, v, w;
+  }'
+}
+
+phase_compare() {
+  log "Phase [compare]: sglang vs vLLM showcase ($COMPARE_SCENARIOS)"
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+  # Source the SDK env.sh so the TP-worker subprocesses inherit PYTHONPATH
+  # (SDK python/nne/tvm/pycuda modules), DLICC_PATH, TOPHUB_LOCATION, etc. Without
+  # these the scheduler segfaults (-11) during model load / kernel JIT. Then lock
+  # a clean LD_LIBRARY_PATH via dlin_runtime_env (its overwrite runs after, wins).
+  [ -f "$SDK_DIR/env.sh" ] && { source "$SDK_DIR/env.sh" 2>/dev/null || warn "SDK env.sh sourced with warnings"; }
+  dlin_runtime_env
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  export MODEL_PATH
+  export TP_SIZE="${DLIN_TP_SIZE:-4}"
+  local script="$SGLANG_DIR/scripts/dl/showcase_prefix_sharing.py"
+  [ -f "$script" ] || die "showcase script not found: $script"
+  mkdir -p "$COMPARE_METRICS_DIR"
+
+  # Validate --only.
+  case "$COMPARE_ONLY" in sglang|vllm|"") ;; *) die "COMPARE_ONLY='$COMPARE_ONLY' (want: sglang|vllm)";; esac
+
+  local stamp; stamp=$(date +%Y%m%d_%H%M%S)
+  _compare_run_one() {  # $1 = sglang|vllm
+    local eng="$1" logf
+    logf="$COMPARE_METRICS_DIR/${eng}_${stamp}.log"
+    log "[compare] running $eng (scenarios=$COMPARE_SCENARIOS, log: $logf) ..."
+    if ! python "$script" --engine "$eng" --mem-frac "$COMPARE_MEM_FRAC" \
+           --scenarios "$COMPARE_SCENARIOS" > "$logf" 2>&1; then
+      warn "$eng run FAILED. Tail of $logf:"; tail -n 20 "$logf"
+      return 1
+    fi
+    # Cache the machine-readable METRICS block + keep the latest full log.
+    sed -n '/^=== METRICS /,/^=== END METRICS ===/p' "$logf" | grep '^METRIC ' \
+        > "$COMPARE_METRICS_DIR/metrics_${eng}.txt" || true
+    cp -f "$logf" "$COMPARE_METRICS_DIR/${eng}_last.log"
+    ok "$eng done ($(wc -l < "$COMPARE_METRICS_DIR/metrics_${eng}.txt") metrics cached)."
+  }
+
+  # Decide which side(s) to (re)run.
+  case "$COMPARE_ONLY" in
+    sglang) _compare_run_one sglang || die "sglang run failed" ;;
+    vllm)   _compare_run_one vllm   || die "vllm run failed" ;;
+    "")     _compare_run_one sglang || die "sglang run failed"
+            _compare_run_one vllm   || die "vllm run failed" ;;
+  esac
+
+  # ---- Side-by-side gap table ----
+  local sf vf; sf="$COMPARE_METRICS_DIR/metrics_sglang.txt"; vf="$COMPARE_METRICS_DIR/metrics_vllm.txt"
+  if [ ! -f "$sf" ] || [ ! -f "$vf" ]; then
+    warn "missing one side's metrics ($sf / $vf) — run without --only first."
+    warn "ran sides: $([ -f "$sf" ] && echo -n sglang) $([ -f "$vf" ] && echo -n vllm)"
+    return 0
+  fi
+  echo
+  log "================ sglang vs vLLM — showcase gap ================"
+  local model_tag
+  model_tag=$(grep -m1 '^=== METRICS ' "$sf" 2>/dev/null | sed -n 's/.*model=\([^ ]*\).*/\1/p')
+  [ -z "$model_tag" ] && model_tag=$(basename "${MODEL_PATH%/}")
+  echo  "  model=$model_tag  tp=${DLIN_TP_SIZE:-4}  scenarios=$COMPARE_SCENARIOS"
+  echo  "  (each side: same GPUs, FP8, fresh process; vLLM APC-OFF)"
+  echo  "  $(date '+%Y-%m-%d %H:%M:%S')"
+  echo  "  -----------------------------------------------------------"
+  echo  "  metric                   | sglang    | vLLM      | winner"
+  echo  "  -------------------------+-----------+-----------+-----------"
+  _compare_row "SC1 warm latency (ms)"   SC1_warm_ms        lower
+  _compare_row "SC1 cold->warm speedup"  SC1_speedup_x      higher
+  _compare_row "SC2 avg turn (ms)"       SC2_avg_ms         lower
+  _compare_row "SC2 turn-5 (ms)"         SC2_turn5_ms       lower
+  _compare_row "SC3 throughput (tok/s)"  SC3_throughput_tps higher
+  _compare_row "SC3 per-req (ms)"        SC3_per_req_ms     lower
+  if grep -q '^METRIC SC4_' "$sf" 2>/dev/null || grep -q '^METRIC SC4_' "$vf" 2>/dev/null; then
+    _compare_row "SC4 JSON (tok/s)"      SC4_tps            higher
+  fi
+  echo  "  ==========================================================="
+  log "metrics cached: $COMPARE_METRICS_DIR/metrics_{sglang,vllm}.txt"
+  log "full logs:      $COMPARE_METRICS_DIR/{sglang,vllm}_last.log"
+}
+
+#-------------------------------------------------------------------------------
 # Dispatch. gen/serve parse their trailing flags first; everything else ignores
 # extra args (backward compatible with the original positional phases).
 #-------------------------------------------------------------------------------
 PHASE="${1:-all}"; shift || true
 case "$PHASE" in
   gen|serve|bench|benchrun) parse_test_args "$@" ;;
+  compare)                  parse_test_args "$@" ;;
 esac
 # One-click default: gen/serve with no -m/-M -> Qwen3.5-35B-A3B-FP8 (TP4 preset).
 if [ -z "${MODEL_EXPLICIT:-}" ]; then
-  case "$PHASE" in gen|serve) pick_model qwen35-35b ;; esac
+  case "$PHASE" in gen|serve|compare) pick_model qwen35-35b ;; esac
 fi
 apply_ngram_overrides   # no-op unless -S/--spec-ngram; must run AFTER pick_model
 
@@ -804,6 +967,7 @@ case "$PHASE" in
   serve)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_serve ;;
   bench)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_bench ;;
   benchrun)     source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_benchrun ;;
+  compare)      source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_compare ;;
   all)
     phase_setup
     phase_build_kernel || warn "build-kernel phase best-effort; continuing"
@@ -811,6 +975,6 @@ case "$PHASE" in
     phase_test
     ;;
   -h|--help|help) usage; exit 0 ;;
-  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|all)" ;;
+  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|compare|all)" ;;
 esac
 ok "Done ($PHASE)."
