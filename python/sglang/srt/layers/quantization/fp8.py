@@ -1923,6 +1923,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 and _os.environ.get("SGLANG_DL_MOE_FUSED", "0") == "1"
                 and x.shape[0] <= _DL_MOE_FUSED_MAX_M
             ):
+                # DL begin — one-shot diagnostic: confirm fast fused path fires during verify
+                if _os.environ.get("SGLANG_DL_MOE_TRACE", "0") == "1" and not hasattr(self, "_dl_traced"):
+                    self._dl_traced = True
+                    print(f"[dl-moe-trace] FAST-FUSED path taken, M={x.shape[0]} "
+                          f"FUSED_MAX_M={_DL_MOE_FUSED_MAX_M}", flush=True)
+                # DL end
                 from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
                 import torch.nn.functional as F
 
@@ -2083,14 +2089,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     # act-quant, use_moe_cu). sglang's manual invoke_fused_moe_opt
                     # call skips the custom op context → crash. vLLM's path works.
                     # See docs/dl §7.51.
-                    import sys as _dl_sys
-                    _vllm_lib = _os.path.join(
-                        _os.path.dirname(_os.path.dirname(_os.path.dirname(
-                            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-                        ))), "venv-vllm021", "lib", "python3.12", "site-packages"
-                    )
-                    if _vllm_lib not in _dl_sys.path:
-                        _dl_sys.path.insert(0, _vllm_lib)
+                    # DL FIX 2026-07-21: removed ../venv-vllm021 sys.path insertion —
+                    # it loaded a SECOND vllm (with its own _vllm_fa2_C flash-attn)
+                    # on top of .venv's already-loaded vllm → double TORCH_LIBRARY
+                    # registration of _vllm_fa2_C → SIGABRT at CG capture.
+                    # .venv has vllm 0.21.1.dev2 natively; import directly from it.
+                    # DL FIX 2: explicitly load _vllm_fa2_C.so (has varlen_fwd) —
+                    # the lazy namespace exists but ops aren't populated until the .so loads.
+                    # DL: load vLLM's _vllm_fa2_C ops if available (for fused_experts)
+                    import vllm as _dl_vllm_mod
+                    _fa2_so = _os.path.join(_os.path.dirname(_dl_vllm_mod.__file__),
+                                            "vllm_flash_attn", "_vllm_fa2_C.cpython-312-x86_64-linux-gnu.so")
+                    if _os.path.exists(_fa2_so):
+                        try:
+                            torch.ops.load_library(_fa2_so)
+                        except Exception:
+                            pass
                     from vllm.plugins.dl_platform_plugin.ops.dl_fused_moe import (
                         fused_experts as _dl_fe,
                     )

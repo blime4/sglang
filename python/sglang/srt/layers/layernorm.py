@@ -111,9 +111,19 @@ if _is_cuda or _is_xpu or _is_musa:
             if hasattr(torch.ops, "_dl_C") and hasattr(torch.ops._dl_C, "gemma_rms_norm"):
                 return True
             import os
-            for _p in [
-                "../venv-vllm021/lib/python3.12/site-packages/vllm/_dl_C.cpython-312-x86_64-linux-gnu.so",
-            ]:
+            # DL: prefer the _dl_C.so from the vllm actually importable in this env
+            # (matches fp8.py's `from vllm...` import). Loading a *different* _dl_C.so
+            # (e.g. the hardcoded ../venv-vllm021 one while .venv-vllm is also imported)
+            # double-registers the _dl_C TORCH_LIBRARY -> c10::Error SIGABRT at CG capture.
+            _paths = []
+            try:
+                import vllm as _vllm
+                _paths.append(os.path.join(os.path.dirname(_vllm.__file__),
+                              "_dl_C.cpython-312-x86_64-linux-gnu.so"))
+            except Exception:
+                pass
+            _paths.append("../venv-vllm021/lib/python3.12/site-packages/vllm/_dl_C.cpython-312-x86_64-linux-gnu.so")
+            for _p in _paths:
                 if os.path.exists(_p):
                     torch.ops.load_library(_p)
                     break

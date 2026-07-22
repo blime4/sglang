@@ -136,16 +136,16 @@ def flash_attn_with_kvcache(*args, **kwargs):
 
     _Pg = k_cache.shape[1]
 
-    # Fast path: vllm_flash_attn paged decode (native block_table, no gather)
-    # DL: re-enabled after fixing invoke_fused_moe_opt w2 routing bug (topk=1).
-    # Prior "garbage" was from MoE, not attention. CG-compatible (no .item() sync).
+    # Fast path: sglang-native flash-attn paged decode (native block_table, no gather)
+    # DL: switched from vllm_flash_attn to sgl_flash_attn (sglang's own _sgl_fa2_C namespace,
+    # eliminates _vllm_fa2_C coexistence conflict with vLLM). CG-compatible (no .item() sync).
     if page_table is not None and _Pg >= 16:
-        import vllm_flash_attn as _vfa
+        from sglang.srt.layers.attention.sgl_flash_attn import flash_attn_varlen_func as _sgl_fa2_varlen
         _cu_q = cu_seqlens_q_arg
         if _cu_q is None:
             _cu_q = torch.arange(0, _batch + 1, dtype=torch.int32, device=q.device) * _seqq
         _max_k_ub = page_table.shape[1] * _Pg
-        _o = _vfa.flash_attn_varlen_func(
+        _o = _sgl_fa2_varlen(
             q=q,
             k=k_cache,
             v=v_cache,

@@ -504,11 +504,28 @@ def _ensure_dl_C():
     global _dl_C_loaded
     if not _dl_C_loaded:
         import os
-        for p in [
-            "../venv-vllm021/lib/python3.12/site-packages/vllm/_dl_C.cpython-312-x86_64-linux-gnu.so",
-        ]:
-            if os.path.exists(p):
-                torch.ops.load_library(p)
+        # DL: prefer the _dl_C/_C .so from the vllm actually importable in this env
+        # (matches fp8.py's `from vllm...` import). A hardcoded ../venv-vllm021 path
+        # while .venv-vllm is also imported double-registers _dl_C TORCH_LIBRARY -> SIGABRT.
+        _so_names = [
+            "_dl_C.cpython-312-x86_64-linux-gnu.so",
+            # also load vLLM _C.so — provides the fused norm/act+quant kernels
+            # (rms_norm_dynamic_per_token_quant, silu_and_mul_*_quant) and the
+            # standalone dynamic_per_token_scaled_fp8_quant used by the C-5 path.
+            "_C.cpython-312-x86_64-linux-gnu.so",
+        ]
+        _dirs = []
+        try:
+            import vllm as _vllm
+            _dirs.append(os.path.dirname(_vllm.__file__))
+        except Exception:
+            pass
+        _dirs.append("../venv-vllm021/lib/python3.12/site-packages/vllm")
+        for _d in _dirs:
+            for p in [os.path.join(_d, n) for n in _so_names]:
+                if os.path.exists(p):
+                    torch.ops.load_library(p)
+            if hasattr(torch.ops, "_dl_C") and hasattr(torch.ops._dl_C, "gptq_dlblas_gemmex"):
                 break
         _dl_C_loaded = (
             hasattr(torch.ops, "_dl_C")
@@ -572,6 +589,37 @@ def dlblas_w8a8_block_fp8_linear(
             cached = (w_pc.t().contiguous(), pc.to(torch.float32).view(N, 1).contiguous())
             _dl_pc_cache[key] = cached
         w_pc_t, pc_scale = cached
+        # DL begin — C-5 INVESTIGATION (NON-VIABLE, gated off). Attempted to expose
+        # a discrete per-token FP8 quant -> w8a8_matmul(pre-quantized FP8) so
+        # RMSNormQuantFusionPass could fuse norm+quant. Verified NON-VIABLE:
+        # w8a8_matmul is INT8 ("Activation must be ... int8 if a_is_quantized"),
+        # NOT FP8; and gptq_dlblas_gemmex (the only FP8 dense GEMM on DLIN)
+        # internal-quants its bf16 activation. There is NO FP8 GEMM on DLIN that
+        # accepts a pre-quantized FP8 activation -> norm_quant fusion has nowhere to
+        # land on the dense FP8 linear. See scripts/dl/c5_w8a8_microbench.py and
+        # memory dlin-sglang-torch-compile-phase2-plan.md. Kept (default off) to
+        # document the finding; the gemmex path remains the default.
+        if _os.environ.get("SGLANG_DL_FP8_W8A8") == "1":
+            # DL: per-token FP8 quant via vLLM _C op (sglang's scaled_fp8_quant
+            # falls back to a missing sgl_kernel op on DLIN). In-place into
+            # pre-allocated [M,K] fp8 + [M,1] fp32 scale. This discrete quant op
+            # is what RMSNormQuantFusionPass fuses with the preceding norm.
+            a_fp8 = torch.empty(
+                input_2d.shape, dtype=torch.float8_e4m3fn, device=input_2d.device
+            )
+            a_scale = torch.empty(
+                (input_2d.shape[0], 1), dtype=torch.float32, device=input_2d.device
+            )
+            torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                a_fp8, input_2d.contiguous(), a_scale, None
+            )
+            w8a8_out = torch.ops._dl_C.w8a8_matmul(
+                a_fp8, w_pc_t, a_scale, pc_scale, True
+            )
+            if bias is not None:
+                w8a8_out = w8a8_out + bias
+            return w8a8_out.to(dtype=input.dtype).view(*input.shape[:-1], N)
+        # DL end
         out = torch.ops._dl_C.gptq_dlblas_gemmex(
             input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
         )
