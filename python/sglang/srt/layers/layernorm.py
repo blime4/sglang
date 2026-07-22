@@ -153,12 +153,14 @@ if _is_cuda or _is_xpu or _is_musa:
         # These write IN-PLACE to `out` and return None, so wrap to return the tensor.
         def _dl_gemma_rmsnorm(i, w, eps=1e-6, out=None, enable_pdl=None):
             o = out if out is not None else torch.empty_like(i)
-            torch.ops._dl_C.gemma_rms_norm(o, i, w, eps)
+            # Phase 4e: use the ported sgl_kernel gemma kernel (4a) instead of vllm._dl_C.
+            torch.ops.sgl_kernel.gemma_rmsnorm(o, i, w, eps)
             return o
 
         def _dl_gemma_fused_add_rmsnorm(i, r, w, eps=1e-6, enable_pdl=None):
             # modifies i (=norm(r+i)) and r (+=i) in place, like _dl_fused
-            torch.ops._dl_C.fused_add_gemma_rms_norm(i, r, w, eps)
+            # Phase 4e: use the ported sgl_kernel gemma kernel (4a) instead of vllm._dl_C.
+            torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(i, r, w, eps)
             return i, r
 
         gemma_rmsnorm = _dl_gemma_rmsnorm

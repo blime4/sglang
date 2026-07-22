@@ -18,9 +18,10 @@
 | Phase 2 — marlin_gemm | 🟢 完成 | `marlin_utils.py` 内联 `marlin_gemm` 包装（委托 `gptq_marlin_gemm`），移除 vllm 导入。调用点本就 7→19 损坏死代码；marlin 在 DLIN 全不可用（kernel 不编译），零回归（1.7B 19.66→20.02 tok/s）。 |
 | Phase 3 — Python 导入清理 | 🟡 部分完成 | common.py logger ✅（完成）；parallel_state monkey-patch ⏸（gate Phase 4e，代码注释要求 quant 层去 vllm 后再删）；modelslim/w8a8_int8 的 is_layer_skipped 实为本地方法（Phase 1 误报，无需处理）。零回归。 |
 | Phase 4a — `_dl_C` 内核 | 🟡 进行中 | **gemma_rms_norm 已移植**（独立 DL kernel，dlcc 构建通过，数值 ≈ vllm `_dl_C`：fp16 4.9e-4 / bf16 1.6e-2；慢 ~1.4× 待向量化优化）；GEMM/quant kernel 待按同模式推进。 |
-| Phase 4b — DL fused_experts | ⬜ 未开始 | |
-| Phase 4c — Flash Attention | 🟡 部分完成 | Python 层已切 `sgl_flash_attn`（`_sgl_fa2_C`）；**FA 编译并入 sgl-kernel 构建系统尚未做**（当前靠运行时 `load_library` 加载 `.venv` 里的独立 `.so`） |
-| Phase 4d — 其他 DLIN 内核 | ⬜ 未开始 | |
+| Phase 4b — DL fused_experts | 🔴 阻塞 | 依赖 `dldnn_ext.h`（DL DNN 库，类 cuDNN）——**非代码移植，需先把 dldnn 接入构建**。 |
+| Phase 4c — Flash Attention | 🟡 部分完成 | Python 层已切 `sgl_flash_attn`（`_sgl_fa2_C`）；**FA 编译并入 sgl-kernel 构建系统尚未做**（大工程；当前靠运行时 `load_library` 加载 `.venv` 里的独立 `.so`） |
+| Phase 4d — 其他 DLIN 内核 | 🔴 多数阻塞 | `dl_lora` 阻塞于 dlblas；`dl_pos_encoding`(RoPE) 可独立但 DL 构建已有 rotary_embedding（冗余）；`flash_mla`/`deep_gemm_*` 复杂待评。 |
+| Phase 4e — SGLang 文件更新 | 🟡 部分 | **gemma 切换已完成**（layernorm.py → sgl_kernel，已验证路由）；fp8_utils/fp8/dl_compile_meta/flash_attention 受 gate（需先移植对应 kernel，多阻塞于 dlblas/dldnn/FA）。 |
 | Phase 5 — 验证与清理 | ⬜ 未开始 | 范围限定见下 |
 
 ---
@@ -210,6 +211,15 @@ grep -rn "import vllm\|from vllm" python/sglang/srt/ | grep -v "multimodal_gen" 
 
 将 `/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/vllm/csrc/dl/`（及少量 `csrc/libtorch_stable/`）中的 CUDA 内核移植到 `sgl-kernel/`。
 
+> **⚠️ 依赖闭包分类（2026-07-23 核查，决定各子阶段可行性）**：sgl-kernel 没有 vllm 头文件树，也不能直接用 DL 闭源库。按 `#include` 分三类：
+> - **🟢 可独立重写**（镜像 `rmsnorm_dl.cu`，本工作流可做）：`gemma_rms_norm`（✅已移植）、`per_token_group_quant_dl.cu`（自包含，但 sglang FP8 路径用 `sgl_per_token_group_quant_*` 另名，可能 orphan）、`fused_layernorm_dynamic_per_token_quant`/`fused_silu_mul_block_quant`（仅 vllm 头）、`dl_pos_encoding_kernels.cu`（RoPE，但 DL 构建已有 `rotary_embedding`，可能冗余）。
+> - **🔴 阻塞于 dlblas**（DL BLAS 库 `dlblas_ext.h`/`dlblasLt_ext.h`，需先把 dlblas 接入构建）：`w8a8_gemm_dlblas.cu`、`q_gemm_dlblas.cu`（4a GEMM）、`dl_lora.cu`（4d）。
+> - **🔴 阻塞于 dldnn**（DL DNN 库 `dldnn_ext.h`，类 cuDNN）：**整个 4b**（`fused_moe_opt.cu`、`dl_invoke_fused_moe_v3.cu`）。
+> - **🔴 4c Flash Attention**：需把 FA 源码编译并入 sgl-kernel 构建系统（大工程，非纯 Python）。
+> - **4e 受 gate**：移除 `_dl_C`/`_C` 加载前，对应 op 必须先移植到 sgl-kernel；否则模型缺算子崩溃。当前仅 gemma 已移植→仅 gemma 的 4e 切换可做。
+>
+> **结论**：4b/4c 与 GEMM 类 kernel **不是代码移植**，而是 DL 闭源库（dlblas/dldnn）/ FA 构建集成——需专门攻坚，非本计划可在短期内完成。
+
 > **构建落点**：sgl-kernel DL 扩展用 `sgl-kernel/setup_dl.py`（`torch.utils.cpp_extension.CUDAExtension`，自动识别 `dlcc`）。当前 `setup_dl.py` source 列表有 10 个文件、`csrc/common_extension_dl.cc` 已注册 ~16 个 op（`fast_topk/rotary_embedding/topk_softmax/rmsnorm/fused_add_rmsnorm/paged_decode_attn/allreduce 系列/...`）。新增 `.cu` 只需加入 `setup_dl.py` source 列表 + 在 `common_extension_dl.cc` 注册。**注意 `csrc/dl/` 子目录尚未创建**，需新建。
 
 ### 4a: 移植 _dl_C / _C 内核
@@ -327,19 +337,24 @@ from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_confi
 
 ### 4e: 移植后需要更新的 SGLang 文件
 
+> **执行进度（2026-07-23）**：🟡 进行中。**gemma 的 4e 切换已完成**（`layernorm.py` 的 `_dl_gemma_rmsnorm`/`_dl_gemma_fused_add_rmsnorm` 改调 `torch.ops.sgl_kernel.gemma_rmsnorm`/`gemma_fused_add_rmsnorm`，不再用 `_dl_C`）。其余文件受 gate（需先移植对应 kernel）。
+
 每个内核移植完成后，需同步更新（含**顶层** `import vllm` 的清除）：
 
-| 文件 | 改动内容 |
-|------|---------|
-| `sgl-kernel/setup_dl.py` | 添加新 `.cu`/`.cpp` 源文件到 source 列表 |
-| `sgl-kernel/csrc/common_extension_dl.cc` | `TORCH_LIBRARY_EXPAND(sgl_kernel, m)` 注册新 op |
-| `sgl-kernel/python/sgl_kernel/__init__.py` | 导出新函数 |
-| `sgl-kernel/python/sgl_kernel/elementwise.py`（或对应模块） | 添加 Python wrapper |
-| `python/sglang/srt/layers/layernorm.py` | 移除 `_dl_load_dl_C()`（109-134）**及顶层 `import vllm as _vllm`** |
-| `python/sglang/srt/layers/quantization/fp8_utils.py` | 移除 `_ensure_dl_C()`（503-533）**及顶层 `import vllm as _vllm`** |
-| `python/sglang/srt/layers/quantization/fp8.py` | 移除 `from vllm.plugins...`（2108-2126）**及顶层 `import vllm as _dl_vllm_mod`** |
-| `python/sglang/srt/layers/quantization/dl_compile_meta.py` | 移除 `import vllm_flash_attn` |
-| `python/sglang/jit_kernel/flash_attention.py` | 移除 `import vllm_flash_attn` |
+| 文件 | 改动内容 | 状态 |
+|------|---------|------|
+| `sgl-kernel/setup_dl.py` | 添加新 `.cu`/`.cpp` 源文件到 source 列表 | ✅ gemma 已加 |
+| `sgl-kernel/csrc/common_extension_dl.cc` | `TORCH_LIBRARY_EXPAND(sgl_kernel, m)` 注册新 op | ✅ gemma 已注册 |
+| `sgl-kernel/python/sgl_kernel/__init__.py` | 导出新函数 | ⏸ |
+| `sgl-kernel/python/sgl_kernel/elementwise.py`（或对应模块） | 添加 Python wrapper | ⏸（layernorm 直接调 op，未走 wrapper） |
+| `python/sglang/srt/layers/layernorm.py` | **gemma wrapper 已切 sgl_kernel**（4e✅）；`_dl_load_dl_C()`（109-134）+ 顶层 `import vllm` 待 fp8_utils 也去 _dl_C 后再删 | 🟡 部分 |
+| `python/sglang/srt/layers/quantization/fp8_utils.py` | 移除 `_ensure_dl_C()`（503-533）**及顶层 `import vllm as _vllm`** | 🔴 gate（需先移植 gptq_dlblas_gemmex / rms_norm_dynamic_per_token_quant / silu_and_mul_*_quant，后者部分阻塞于 dlblas） |
+| `python/sglang/srt/layers/quantization/fp8.py` | 移除 `from vllm.plugins...`（2108-2126）**及顶层 `import vllm`** | 🔴 gate（4b fused_experts 阻塞于 dldnn） |
+| `python/sglang/srt/layers/quantization/dl_compile_meta.py` | 移除 `import vllm_flash_attn` | 🔴 gate（4c FA 构建集成） |
+| `python/sglang/jit_kernel/flash_attention.py` | 移除 `import vllm_flash_attn` | 🔴 gate（4c） |
+
+**gemma 4e 验证**：`layernorm.gemma_rmsnorm` 输出 == 直接 `torch.ops.sgl_kernel.gemma_rmsnorm`（确认路由到移植 kernel）；E2E Qwen3-1.7B 19.79 tok/s、输出不变（gemma 不在 Qwen 路径，标准 rmsnorm 未受影响）。**未 E2E 验证 gemma 路径本身**（无 Gemma 模型）。
+
 
 ---
 
