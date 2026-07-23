@@ -127,35 +127,45 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
-# DL begin — DLIN prefill-shape warmup for the SGLANG_DL_MOE_FUSED fast path.
+# DL begin — DLIN capture-size-list warmup (vLLM-style) for SGLANG_DL_MOE_FUSED.
 # invoke_fused_moe_opt (fast fused FP8 MoE prefill kernel) is JIT-compiled by dlcc
-# PER prefill-M shape (~20s one-time each, cached at ~/.triton/cache). Without
-# warmup the first real request at each new M pays that ~20s spike (measured:
-# M=64 24.5s, M=256 20s first-hit; repeats 2s). This pre-compiles a configurable
-# set of M shapes at server start so common prompt sizes are fast from request #1.
-# NOTE: JIT is per-M, so this only covers the warmed shapes; unwarmed M still spike
-# on first hit. For continuous/variable prompt lengths the proper fix is an
-# M-agnostic kernel; this is a stopgap for predictable prompt sizes (e.g. a fixed
-# system prompt). Enable via `--warmups=dlin_prefill_shapes`. Shapes from
-# SGLANG_DL_MOE_WARMUP_SHAPES (csv), default covers small..large prefill.
-@warmup("dlin_prefill_shapes")
-async def dlin_prefill_shapes(
+# PER prefill-M shape (~20-85s one-time each, cached at ~/.triton/cache). Without
+# warmup the first real request at each new M pays that spike. DLIN vLLM warms by
+# iterating its capture-size lists (vllm/v1/worker/gpu_worker.py:575 builds
+# warmup_sizes = compile_sizes + cg_capture_sizes; cudagraph_utils.py:134 does
+# `for num_tokens in capture_sizes`). This mirrors that: read the engine's OWN
+# capture-size lists (server_args.cuda_graph_config.{prefill,decode}.bs — the same
+# sizes cuda-graph capture / compile uses) and JIT-warm each, so the sizes the
+# engine actually serves are pre-compiled. Decode-batch sizes are also covered by
+# cuda-graph capture at startup; this warmup reinforces them and covers the
+# prefill sizes (prefill CG is disabled on DLIN, so capture doesn't warm them).
+# Override the list with SGLANG_DL_WARMUP_SHAPES (csv) for a subset. Enable via
+# `--warmups=dlin_capture_sizes`. NOTE: warming the full capture list is one-time
+# but slow (~20-85s/shape); use the env override or cache-shipping for faster startup.
+@warmup("dlin_capture_sizes")
+async def dlin_capture_sizes(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
     import os
 
-    default_shapes = "64,256,512,1024,2048"
-    shapes = [
-        int(x)
-        for x in os.environ.get("SGLANG_DL_MOE_WARMUP_SHAPES", default_shapes).split(",")
-        if x.strip()
-    ]
+    sa = tokenizer_manager.server_args
+    cfg = getattr(sa, "cuda_graph_config", None)
+    prefill_bs = (
+        list(getattr(getattr(cfg, "prefill", None), "bs", []) or [])
+    )  # e.g. [4,8,...,2048]
+    decode_bs = list(getattr(getattr(cfg, "decode", None), "bs", []) or [])  # e.g. [1,2]
+    env_shapes = os.environ.get("SGLANG_DL_WARMUP_SHAPES")
+    if env_shapes:
+        sizes = [int(x) for x in env_shapes.split(",") if x.strip()]
+        logger.info("DL dlin_capture_sizes: env override SGLANG_DL_WARMUP_SHAPES=%s", sizes)
+    else:
+        sizes = sorted(set(prefill_bs + decode_bs))  # both capture lists, deduped
     logger.info(
-        "DL dlin_prefill_shapes warmup: sweeping M=%s "
-        "(~20s/shape first time; dlcc JIT cached after at ~/.triton/cache)",
-        shapes,
+        "DL dlin_capture_sizes warmup: capture lists prefill.bs=%s decode.bs=%s -> "
+        "sweeping %d sizes %s (~20-85s/shape first time; dlcc JIT cached at ~/.triton/cache)",
+        prefill_bs, decode_bs, len(sizes), sizes[:12] + (["..."] if len(sizes) > 12 else []),
     )
-    for size in tqdm.tqdm(shapes):
+    for size in tqdm.tqdm(sizes):
         generate_req_input = GenerateReqInput(
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
             # max_new_tokens=1: the prefill forward through the MoE is what triggers
@@ -166,5 +176,5 @@ async def dlin_prefill_shapes(
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
-    logger.info("DL dlin_prefill_shapes warmup done.")
+    logger.info("DL dlin_capture_sizes warmup done.")
     # DL end

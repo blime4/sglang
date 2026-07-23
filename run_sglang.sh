@@ -575,9 +575,10 @@ gen/serve options:
   -b, --backend NAME        attention backend (default fa3; do not use 'triton' on DLIN)
   -g, --cuda-graph          enable cuda graph (default off; safer on DLIN)
   -S, --spec-ngram          NGRAM spec-decode (qwen35-35b: num_draft=8; needs -M qwen35-35b)
-  -W, --dl-warmup           serve only: pre-compile fused-MoE prefill-M dlcc kernels at
-                            startup (~20s/shape one-time, cached). Shapes via
-                            $SGLANG_DL_MOE_WARMUP_SHAPES (default 64,256,512,1024,2048)
+  -W, --dl-warmup           serve only: pre-compile fused-MoE dlcc kernels at startup by
+                            iterating the engine's capture-size lists (vLLM-style).
+                            ~20-85s/shape one-time, cached. Subset via
+                            $SGLANG_DL_WARMUP_SHAPES (csv)
   --port N / --host H       serve only        (default 30000 / 127.0.0.1)
 # chat options:
 #   -q, --quick TEXT          single message (non-interactive)
@@ -730,12 +731,13 @@ phase_serve() {
   [ "$tp" -gt 1 ] && extra_flags="$extra_flags --disable-custom-all-reduce"
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
-  # DL: -W/--dl-warmup pre-compiles fused-MoE dlcc kernels for common prefill-M
-  # shapes at startup (one-time per shape, cached at ~/.triton/cache). Shapes via
-  # $SGLANG_DL_MOE_WARMUP_SHAPES (csv; default 64,256,512,1024,2048). ~20s/shape
-  # first time. See python/sglang/srt/entrypoints/warmup.py:dlin_prefill_shapes.
+  # DL: -W/--dl-warmup pre-compiles fused-MoE dlcc kernels at startup by iterating
+  # the engine's capture-size lists (server_args.cuda_graph_config.{prefill,decode}.bs)
+  # — same approach as DLIN vLLM (warmup_sizes = compile + cg_capture sizes). One-time
+  # per shape (~20-85s), cached at ~/.triton/cache. Subset via $SGLANG_DL_WARMUP_SHAPES
+  # (csv). See python/sglang/srt/entrypoints/warmup.py:dlin_capture_sizes.
   local warmup_flags=""
-  [ "$DL_WARMUP" = "1" ] && warmup_flags="--warmups dlin_prefill_shapes"
+  [ "$DL_WARMUP" = "1" ] && warmup_flags="--warmups dlin_capture_sizes"
   log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT | ngram=$USE_NGRAM | dl_warmup=${DL_WARMUP:-0}"
   exec python -m sglang.launch_server \
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
