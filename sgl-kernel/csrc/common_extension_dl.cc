@@ -15,6 +15,8 @@
 #include <torch/library.h>
 
 #include "sgl_kernel_ops.h"
+// DL begin: vendored vllm dl/ kernel declarations (Phase 4b/4d bulk port).
+#include "dl/ops.h"
 
 // DL begin
 // csrc/elementwise/rmsnorm_dl.cu — standalone RMSNorm (no FlashInfer dep).
@@ -88,6 +90,155 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, "
         "float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &sgl_kernel_dl::gemma_fused_add_rmsnorm);
+
+  // csrc/dl/q_gemm_dlblas.cu — dlblas GPTQ GEMM (vendored from vllm); replaces
+  // vllm._dl_C.gptq_dlblas_gemmex (plan 4a GEMM). Proves dlblas integration.
+  m.def("gptq_dlblas_gemmex(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, "
+        "Tensor b_gptq_scales, int quant_type, int bit=4) -> Tensor");
+  m.impl("gptq_dlblas_gemmex", torch::kCUDA, &gptq_dlblas_gemmex);
+
+  // DL begin: bulk-ported vllm _dl_C ops (Phase 4b/4d). Schemas match
+  // vllm csrc/dl/torch_bindings.cpp; implementations in csrc/dl/*.cu.
+  m.def(
+      "dl_chunk_gated_delta_rule(Tensor! output, Tensor q, Tensor k, Tensor v, "
+      "Tensor g, Tensor beta, Tensor initial_state, Tensor cu_seqlens, "
+      "float scale, bool use_qk_l2norm_in_kernel) -> ()");
+  m.impl("dl_chunk_gated_delta_rule", torch::kCUDA, &dl_chunk_gated_delta_rule);
+
+  m.def(
+      "dl_recurrent_gated_delta_rule(Tensor! output, Tensor q, Tensor k, Tensor v, "
+      "Tensor g, Tensor beta, Tensor ssm_state, Tensor ssm_state_indices, "
+      "Tensor? cu_seqlens, Tensor? num_accepted_tokens, "
+      "float scale, bool use_qk_l2norm_in_kernel) -> ()");
+  m.impl("dl_recurrent_gated_delta_rule", torch::kCUDA, &dl_recurrent_gated_delta_rule);
+
+  m.def(
+      "flash_mla_sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, "
+      "float sm_scale, int d_v, Tensor? attn_sink=None, Tensor? topk_length=None, "
+      "Tensor? out=None) -> Tensor[]");
+  m.impl("flash_mla_sparse_prefill_fwd", torch::kCUDA, &flash_mla_sparse_prefill_fwd);
+
+  m.def(
+      "flash_mla_with_kvcache(Tensor q, Tensor k_cache, "
+      "Tensor? block_table, Tensor? cache_seqlens, "
+      "int head_dim_v, float softmax_scale, bool causal, bool is_fp8_kvcache, "
+      "Tensor? indices=None, Tensor? attn_sink=None, "
+      "Tensor? extra_k_cache=None, Tensor? extra_indices_in_cache=None, "
+      "Tensor? topk_length=None, Tensor? extra_topk_length=None, "
+      "Tensor? out=None) -> Tensor[]");
+  m.impl("flash_mla_with_kvcache", torch::kCUDA, &flash_mla_with_kvcache);
+
+  m.def(
+      "fp8_fp4_mqa_logits(Tensor q_values, Tensor? q_scale, "
+      "Tensor kv_packed, Tensor kv_scales, "
+      "Tensor weights, Tensor cu_seqlen_ks, Tensor cu_seqlen_ke, "
+      "bool clean_logits=True, int max_seqlen_k=0, "
+      "ScalarType logits_type=float32) -> Tensor");
+  m.impl("fp8_fp4_mqa_logits", torch::kCUDA, &fp8_fp4_mqa_logits);
+
+  m.def(
+      "fp8_fp4_paged_mqa_logits(Tensor q_values, Tensor? q_scale, "
+      "Tensor kv_cache, Tensor weights, "
+      "Tensor context_lens, Tensor block_tables, "
+      "Tensor schedule_metadata, int max_model_len, "
+      "bool clean_logits=False, ScalarType logits_type=float, "
+      "Tensor? indices=None) -> Tensor");
+  m.impl("fp8_fp4_paged_mqa_logits", torch::kCUDA, &fp8_fp4_paged_mqa_logits);
+
+  m.def(
+      "fp8_einsum(Tensor a_values, Tensor a_scale, "
+      "Tensor b_values, Tensor b_scale, "
+      "Tensor! out, str equation, int[] recipe) -> ()");
+  m.impl("fp8_einsum", torch::kCUDA, &fp8_einsum);
+
+  m.def(
+      "tf32_hc_prenorm_gemm(Tensor a, Tensor b, Tensor! d, "
+      "Tensor! sqr_sum, int? num_splits=None) -> ()");
+  m.impl("tf32_hc_prenorm_gemm", torch::kCUDA, &tf32_hc_prenorm_gemm);
+
+  m.def(
+      "w8a8_matmul(Tensor a, Tensor b_q_weight, Tensor? a_scales, "
+      "Tensor b_scales, bool a_is_quantized) -> Tensor");
+  m.impl("w8a8_matmul", torch::kCUDA, &w8a8_matmul);
+
+  m.def(
+      "longrope_rotary_embedding(Tensor positions, Tensor! query,"
+      "                 Tensor! key, int head_size,"
+      "                 Tensor cos_sin_cache, int k) -> ()");
+  m.impl("longrope_rotary_embedding", torch::kCUDA, &longrope_rotary_embedding);
+
+  m.def(
+      "batched_longrope_rotary_embedding(Tensor positions, Tensor! query,"
+      "                         Tensor! key, int head_size,"
+      "                         Tensor cos_sin_cache,"
+      "                         int rot_dim,"
+      "                         Tensor cos_sin_cache_offsets, int k) -> ()");
+  m.impl("batched_longrope_rotary_embedding", torch::kCUDA, &batched_longrope_rotary_embedding);
+
+  m.def(
+      "deepseek_yarn_rotary_embedding("
+      "           Tensor positions, Tensor! query,"
+      "           Tensor! key, int head_size,"
+      "           Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("deepseek_yarn_rotary_embedding", torch::kCUDA, &deepseek_yarn_rotary_embedding);
+
+  m.def(
+      "batched_deepseek_yarn_rotary_embedding("
+      "       Tensor positions, Tensor! query,"
+      "       Tensor! key, int head_size,"
+      "       Tensor cos_sin_cache, bool is_neox,"
+      "       int rot_dim,"
+      "       Tensor cos_sin_cache_offsets) -> ()");
+  m.impl("batched_deepseek_yarn_rotary_embedding", torch::kCUDA, &batched_deepseek_yarn_rotary_embedding);
+
+  m.def(
+      "invoke_fused_moe_opt(Tensor! x, Tensor! w, Tensor! y,"
+      "  Tensor? w_bias, Tensor? w_scales, Tensor? w_zp, Tensor! topk_weights, Tensor! topk_ids,"
+      "  Tensor! sorted_token_ids, Tensor! expert_ids,"
+      "  Tensor! num_tokens_post_padded, bool mul_routed_weight,"
+      "  int top_k, int block_size_m, int block_size_n, int block_size_k,"
+      "  bool use_fp8_w8a8, bool use_int8_w8a16, bool use_int4_w4a16, bool use_mxfp4_w4a16,"
+      "  int[] block_size, int M) -> ()");
+  m.impl("invoke_fused_moe_opt", torch::kCUDA, &invoke_fused_moe_opt);
+
+  m.def(
+      "invoke_fused_moe_opt_v3(Tensor! x, Tensor! w, Tensor! y,"
+      " Tensor? w_bias, Tensor? w_scales, Tensor? w_zp, Tensor! topk_weights, Tensor! topk_ids,"
+      " Tensor! sorted_token_ids, Tensor! expert_ids,"
+      " Tensor! num_tokens_post_padded, bool mul_routed_weight,"
+      " int top_k, int block_size_m, int block_size_n, int block_size_k,"
+      " int weight_bits, int[] block_size, int M) -> ()");
+  m.impl("invoke_fused_moe_opt_v3", torch::kCUDA, &invoke_fused_moe_opt_v3);
+
+  m.def(
+      "moe_fused_grouped_topk(Tensor! gating, Tensor! bias,"
+      " Tensor! topk_ids, Tensor! topk_weights,"
+      " int topk, int num_expert_group, int topk_group) -> ()");
+  m.impl("moe_fused_grouped_topk", torch::kCUDA, &moe_fused_grouped_topk);
+
+  m.def(
+      "dl_lora_shrink(Tensor! inputs, Tensor! lora_ptr_tensor, Tensor! lora_ptr_cpu_tensor,"
+      "               int lora_strides_d0, int lora_strides_d1,"
+      "               int lora_strides_d2, Tensor output_tensor,"
+      "               Tensor! token_lora_mapping,"
+      "               Tensor! token_indices_sorted_by_lora_id,"
+      "               Tensor! num_tokens_per_lora, Tensor! lora_token_start_loc,"
+      "               Tensor! lora_ids, float scaling) -> ()");
+  m.impl("dl_lora_shrink", torch::kCUDA, &dl_lora_shrink);
+
+  m.def(
+      "dl_lora_expand(Tensor! inputs, Tensor! lora_ptr_tensor, Tensor! lora_ptr_cpu_tensor,"
+      "               Tensor! lora_strides_d0, Tensor! lora_strides_d1,"
+      "               Tensor! lora_strides_d2, Tensor output_tensor,"
+      "               Tensor! slice_start_tensor, Tensor! hidden_size_tensor,"
+      "               Tensor! hidden_size_cpu_tensor,"
+      "               int max_n, Tensor! token_lora_mapping,"
+      "               Tensor! token_indices_sorted_by_lora_id,"
+      "               Tensor! num_tokens_per_lora, Tensor! lora_token_start_loc,"
+      "               int offset_start, Tensor! lora_ids,"
+      "               bool add_inputs) -> ()");
+  m.impl("dl_lora_expand", torch::kCUDA, &dl_lora_expand);
+  // DL end
 
   // csrc/elementwise/paged_decode_attn_dl.cu — graph-safe paged-decode attention
   // (no gather/scatter/packing; reads paged KV directly; single kernel launch).

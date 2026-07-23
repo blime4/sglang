@@ -1,7 +1,7 @@
 # DL begin — DLIN compiled GDN decode kernel (vLLM _dl_C.dl_recurrent_gated_delta_rule)
 #
 # Routes sglang GDN single-token decode through vLLM's compiled CUDA op
-# torch.ops._dl_C.dl_recurrent_gated_delta_rule (the DLEOL-optimized recurrent
+# torch.ops.sgl_kernel.dl_recurrent_gated_delta_rule (the DLEOL-optimized recurrent
 # kernel; pingpong/unroll via DLEOL_FLA_ENABLE_PINGPONG / DLEOL_FLA_UNROLL_COUNT
 # env, read by libdleol.so at JIT time). This is the fast path vLLM uses to hit
 # ~38 tok/s decode on Qwen3.5/3.6-35B-A3B (sglang's triton GDN is ~1.5x slower).
@@ -84,7 +84,7 @@ class DLinGDNKernel(LinearAttnKernelBase):
 
         scale = k.shape[-1] ** -0.5
 
-        torch.ops._dl_C.dl_recurrent_gated_delta_rule(
+        torch.ops.sgl_kernel.dl_recurrent_gated_delta_rule(
             output,
             q,
             k,
@@ -131,7 +131,7 @@ class DLinGDNKernel(LinearAttnKernelBase):
         scale = k.shape[-1] ** -0.5
         output = torch.empty_like(v)
         cu_seqlens = query_start_loc.to(torch.int64)
-        torch.ops._dl_C.dl_chunk_gated_delta_rule(
+        torch.ops.sgl_kernel.dl_chunk_gated_delta_rule(
             output, q, k, v, g, beta, active, cu_seqlens, scale, False)  # False: l2norm done above
         ssm_states[cache_indices] = active.to(ssm_states.dtype)  # scatter back (pool dtype)
         return output, active, None

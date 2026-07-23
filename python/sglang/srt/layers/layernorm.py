@@ -94,11 +94,8 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
-    # DL begin — DLIN sgl_kernel build lacks the rmsnorm-family C++ ops.
-    # Prefer vLLM's _dl_C native kernels (gemma_rms_norm / fused_add_gemma_rms_norm)
-    # when available — they are ~8x faster than the torch fallback (1 fused kernel
-    # vs ~6 dispatches incl. a slow bf16->fp32 cast). Fall back to torch only if
-    # _dl_C is not loadable.
+    # DL begin — DLIN sgl_kernel has gemma_rmsnorm + standard rmsnorm since Phase 4a/4b.
+    # No need to load vLLM _dl_C.so anymore.
     def _dl_has_op(_n):
         try:
             getattr(torch.ops.sgl_kernel, _n)
@@ -106,34 +103,7 @@ if _is_cuda or _is_xpu or _is_musa:
         except Exception:
             return False
 
-    def _dl_load_dl_C():
-        try:
-            if hasattr(torch.ops, "_dl_C") and hasattr(torch.ops._dl_C, "gemma_rms_norm"):
-                return True
-            import os
-            # DL: prefer the _dl_C.so from the vllm actually importable in this env
-            # (matches fp8.py's `from vllm...` import). Loading a *different* _dl_C.so
-            # (e.g. the hardcoded ../venv-vllm021 one while .venv-vllm is also imported)
-            # double-registers the _dl_C TORCH_LIBRARY -> c10::Error SIGABRT at CG capture.
-            _paths = []
-            try:
-                import vllm as _vllm
-                _paths.append(os.path.join(os.path.dirname(_vllm.__file__),
-                              "_dl_C.cpython-312-x86_64-linux-gnu.so"))
-            except Exception:
-                pass
-            _paths.append("../venv-vllm021/lib/python3.12/site-packages/vllm/_dl_C.cpython-312-x86_64-linux-gnu.so")
-            for _p in _paths:
-                if os.path.exists(_p):
-                    torch.ops.load_library(_p)
-                    break
-            return hasattr(torch.ops, "_dl_C") and hasattr(
-                torch.ops._dl_C, "gemma_rms_norm"
-            )
-        except Exception:
-            return False
-
-    _dl_C_ok = _dl_load_dl_C()
+    _dl_C_ok = True  # Phase 4e: sgl_kernel always has the gemma ops
 
     def _dl_rms(input, weight, eps=1e-6, out=None, shift=0.0):
         o = torch.empty_like(input) if out is None else out
@@ -152,14 +122,14 @@ if _is_cuda or _is_xpu or _is_musa:
         # DLIN native fused kernels: gemma_rms_norm(out, input, weight, eps) [gemma=weight+1].
         # These write IN-PLACE to `out` and return None, so wrap to return the tensor.
         def _dl_gemma_rmsnorm(i, w, eps=1e-6, out=None, enable_pdl=None):
+            i = i.contiguous()
             o = out if out is not None else torch.empty_like(i)
-            # Phase 4e: use the ported sgl_kernel gemma kernel (4a) instead of vllm._dl_C.
             torch.ops.sgl_kernel.gemma_rmsnorm(o, i, w, eps)
             return o
 
         def _dl_gemma_fused_add_rmsnorm(i, r, w, eps=1e-6, enable_pdl=None):
-            # modifies i (=norm(r+i)) and r (+=i) in place, like _dl_fused
-            # Phase 4e: use the ported sgl_kernel gemma kernel (4a) instead of vllm._dl_C.
+            i = i.contiguous()
+            r = r.contiguous()
             torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(i, r, w, eps)
             return i, r
 

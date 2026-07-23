@@ -49,6 +49,19 @@ sources = [
     "csrc/elementwise/rmsnorm_dl.cu",
     # DL: Gemma RMSNorm (weight+1), replaces vllm._dl_C.gemma_rms_norm (plan 4a).
     "csrc/elementwise/gemma_rmsnorm_dl.cu",
+    # DL begin: vendored vllm csrc/dl/ kernels (Phase 4b/4d bulk port).
+    # All backed by DL closed-source libs (dlblas/dlblasLt/dldnn).
+    "csrc/dl/q_gemm_dlblas.cu",
+    "csrc/dl/w8a8_gemm_dlblas.cu",
+    "csrc/dl/chunk_gated_delta_rule.cu",
+    "csrc/dl/deep_gemm_mqa_logits.cu",
+    "csrc/dl/deep_gemm_tf32_hc_prenorm_gemm.cu",
+    "csrc/dl/flash_mla_interface.cu",
+    "csrc/dl/dl_pos_encoding_kernels.cu",
+    "csrc/dl/fused_moe_opt.cu",
+    "csrc/dl/dl_invoke_fused_moe_v3.cu",
+    "csrc/dl/dl_lora.cu",
+    # DL end
     # DL begin: graph-safe paged-decode attention (no packing) — see header.
     "csrc/elementwise/paged_decode_attn_dl.cu",
     # DL end
@@ -65,10 +78,26 @@ sources = [
 ]
 
 cxx_flags = ["-O3", "-std=c++17"]
-nvcc_flags = ["-O3", "-std=c++17"]
+# DL begin: torch's CUDAExtension adds -D__CUDA_NO_HALF_CONVERSIONS__ etc by
+# default, which breaks static_cast<float>(__half) in vendored vllm DL kernels.
+# vllm's CMake build doesn't pass these (it sets only -DENABLE_FP8). Undefine
+# them so dlcc allows half/bf16↔float conversions as vllm expects.
+nvcc_flags = [
+    "-O3", "-std=c++17", "-DENABLE_FP8",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "-U__CUDA_NO_HALF2_OPERATORS__",
+]
+# DL end
 # DLIN CUDA runtime + torch libs (torch's BuildExtension adds c10/torch/...;
 # curt is the DLIN libcuda equivalent, resolved via CUDA_HOME=$SDK/lib).
-libraries = ["curt"]
+# DL begin: link DL closed-source libs for dlblas-backed kernels (csrc/dl/).
+# Headers (dlblas_ext.h / dlblasLt_ext.h / dldnn_ext.h) live in $SDK/include
+# (auto-added via CUDA_HOME); libs in $SDK/lib. Mirrors vllm _dl_C's link of
+# libdlblasLt.so (CMakeLists:1416).
+libraries = ["curt", "dlblas", "dlblasLt", "dldnn"]
+# DL end
 arch = os.uname().machine
 extra_link_args = [f"-L{root}/../.venv/lib/python3.12/site-packages/torch/lib"]
 

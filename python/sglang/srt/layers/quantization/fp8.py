@@ -1949,7 +1949,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
                     moe_align_block_size as _mabs,
                 )
-                _G = torch.ops._dl_C.invoke_fused_moe_opt
+                _G = torch.ops.sgl_kernel.invoke_fused_moe_opt  # DL: ported from _dl_C
                 from sglang.jit_kernel.activation import silu_and_mul as _silu_and_mul
                 # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
                 # not every forward step — was 80 redundant copy kernels/step × ~0.04ms
@@ -1980,12 +1980,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     _s2_g = layer._dl_w2s[_ti1d]      # [topk, nb, kb]
                     out = torch.zeros(1, hidden, dtype=x.dtype, device=x.device)
                     for k in range(topk):
-                        _c1 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        _c1 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
                             x.view(-1, x.shape[-1]), _w13_g[k].t(),
                             _s13_g[k], _s13_g[k], quant_type=2, bit=8)
                         _gate, _up = _c1[:, :inter], _c1[:, inter:]
                         _he = F.silu(_gate) * _up  # [1, inter]
-                        _c2 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        _c2 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
                             _he.view(-1, _he.shape[-1]), _w2_g[k].t(),
                             _s2_g[k], _s2_g[k], quant_type=2, bit=8)
                         out += _c2 * _tw[0, k]
@@ -1999,7 +1999,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         topk * 2 * inter, hidden).contiguous()
                     _s13_cat = layer._dl_w13s[_ti1d].reshape(
                         topk * (2 * inter // 128), hidden // 128).contiguous()
-                    _c1 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                    _c1 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
                         x.view(-1, x.shape[-1]), _w13_cat.t(),
                         _s13_cat, _s13_cat, quant_type=2, bit=8)
                     _c1 = _c1.view(topk, 2 * inter)
@@ -2010,7 +2010,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     _s2_cat = layer._dl_w2s[_ti1d].reshape(
                         topk * (hidden // 128), inter // 128).contiguous()
                     _he_flat = _he.reshape(1, topk * inter).contiguous()
-                    _c2 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                    _c2 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
                         _he_flat.view(-1, _he_flat.shape[-1]), _w2_cat.t(),
                         _s2_cat, _s2_cat, quant_type=2, bit=8)
                     _c2 = _c2.view(topk, hidden).contiguous()
@@ -2026,7 +2026,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         topk * 2 * inter, hidden)
                     _s13_cat = layer._dl_w13s[_ti1d].reshape(
                         topk * (2 * inter // 128), hidden // 128)
-                    _c1 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                    _c1 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
                         x.view(-1, x.shape[-1]), _w13_cat.t(),
                         _s13_cat, _s13_cat, quant_type=2, bit=8)
                     _c1 = _c1.view(topk, 2 * inter)
@@ -2037,7 +2037,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     _s2_g = layer._dl_w2s[_ti1d]    # [topk, nb, kb]
                     out = torch.zeros(1, hidden, dtype=x.dtype, device=x.device)
                     for k in range(topk):
-                        _c2 = torch.ops._dl_C.gptq_dlblas_gemmex(
+                        _c2 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
                             _he[k:k + 1].view(-1, _he.shape[-1]), _w2_g[k].t(),
                             _s2_g[k], _s2_g[k], quant_type=2, bit=8)
                         out += _c2 * _tw[0, k]
@@ -2097,7 +2097,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     # DL FIX 2: explicitly load _vllm_fa2_C.so (has varlen_fwd) —
                     # the lazy namespace exists but ops aren't populated until the .so loads.
                     # DL: load vLLM's _vllm_fa2_C ops if available (for fused_experts)
-                    import vllm as _dl_vllm_mod
+                    try:
+                        import vllm as _dl_vllm_mod
+                    except ImportError:
+                        raise RuntimeError(
+                            "DL fused_moe requires vllm package for dl_fused_moe plugin"
+                        )
                     _fa2_so = _os.path.join(_os.path.dirname(_dl_vllm_mod.__file__),
                                             "vllm_flash_attn", "_vllm_fa2_C.cpython-312-x86_64-linux-gnu.so")
                     if _os.path.exists(_fa2_so):

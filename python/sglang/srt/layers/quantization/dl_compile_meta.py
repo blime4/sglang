@@ -18,7 +18,7 @@ def dl_register_meta():
         except ImportError:
             return
 
-    ns = "_dl_C"
+    ns = "sgl_kernel"
 
     def _try(name, fn):
         try:

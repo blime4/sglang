@@ -489,10 +489,9 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
-# DL begin — dlblas FP8 blockwise linear via vLLM's _dl_C binding (gptq_dlblas_gemmex).
-# The public dlblas APIs (dlblasGemmExV2/dlblasLtMatmul) fail from standalone C++ extensions
-# (descriptor setup requires DLIN-internal knowledge). vLLM's _dl_C.so (built by DLIN engineers)
-# has the correct binding. It's dl19-built but ABI-compatible with dl24 torch (same as vllm_flash_attn).
+# DL begin — dlblas FP8 blockwise linear via sgl_kernel (ported from vLLM _dl_C).
+# Phase 4e: all _dl_C ops are now registered in sgl_kernel (Phase 4b/4d bulk port).
+# _ensure_dl_C() is kept as a no-op for backward compat (callers throughout codebase).
 _dl_C_loaded = False
 # DL: cache for blockwise->per-channel FP8 weight conversion (keyed by weight
 # data_ptr; computed once per weight on first call, reused after). Lets the
@@ -501,48 +500,20 @@ _dl_pc_cache: dict = {}
 
 
 def _ensure_dl_C():
+    """No-op: Phase 4e — all _dl_C ops live in sgl_kernel now."""
     global _dl_C_loaded
     if not _dl_C_loaded:
-        import os
-        # DL: prefer the _dl_C/_C .so from the vllm actually importable in this env
-        # (matches fp8.py's `from vllm...` import). A hardcoded ../venv-vllm021 path
-        # while .venv-vllm is also imported double-registers _dl_C TORCH_LIBRARY -> SIGABRT.
-        _so_names = [
-            "_dl_C.cpython-312-x86_64-linux-gnu.so",
-            # also load vLLM _C.so — provides the fused norm/act+quant kernels
-            # (rms_norm_dynamic_per_token_quant, silu_and_mul_*_quant) and the
-            # standalone dynamic_per_token_scaled_fp8_quant used by the C-5 path.
-            "_C.cpython-312-x86_64-linux-gnu.so",
-        ]
-        _dirs = []
+        import sgl_kernel  # noqa: F401 — triggers op registration
+        _dl_C_loaded = True
+        # DL: register FakeTensor (meta) impls so torch.compile keeps the
+        # ops opaque (else inductor decomposes them → 82ms slow graph).
         try:
-            import vllm as _vllm
-            _dirs.append(os.path.dirname(_vllm.__file__))
+            from sglang.srt.layers.quantization.dl_compile_meta import (
+                dl_register_meta as _dl_meta,
+            )
+            _dl_meta()
         except Exception:
             pass
-        _dirs.append("../venv-vllm021/lib/python3.12/site-packages/vllm")
-        for _d in _dirs:
-            for p in [os.path.join(_d, n) for n in _so_names]:
-                if os.path.exists(p):
-                    torch.ops.load_library(p)
-            if hasattr(torch.ops, "_dl_C") and hasattr(torch.ops._dl_C, "gptq_dlblas_gemmex"):
-                break
-        _dl_C_loaded = (
-            hasattr(torch.ops, "_dl_C")
-            and hasattr(torch.ops._dl_C, "gptq_dlblas_gemmex")
-        )
-        # DL begin — register FakeTensor (meta) impls so torch.compile keeps the
-        # _dl_C ops opaque (else inductor decomposes them → 82ms slow graph).
-        if _dl_C_loaded:
-            try:
-                from sglang.srt.layers.quantization.dl_compile_meta import (
-                    dl_register_meta as _dl_meta,
-                )
-
-                _dl_meta()
-            except Exception:
-                pass
-        # DL end
 
 
 def dlblas_w8a8_block_fp8_linear(
@@ -573,7 +544,7 @@ def dlblas_w8a8_block_fp8_linear(
         # seen on .cpu() sync / CUDA_LAUNCH_BLOCKING is a spurious DLIN runtime
         # quirk (surfaces during init_model_parallel_group under blocking), NOT
         # a q2 op error. Wrong output ("a majorly") is upstream GDN extend bug.
-        out = torch.ops._dl_C.gptq_dlblas_gemmex(
+        out = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
             input.view(-1, input.shape[-1]), weight.t(),
             weight_scale, weight_scale, quant_type=2, bit=8
         )
@@ -613,14 +584,14 @@ def dlblas_w8a8_block_fp8_linear(
             torch.ops._C.dynamic_per_token_scaled_fp8_quant(
                 a_fp8, input_2d.contiguous(), a_scale, None
             )
-            w8a8_out = torch.ops._dl_C.w8a8_matmul(
+            w8a8_out = torch.ops.sgl_kernel.w8a8_matmul(
                 a_fp8, w_pc_t, a_scale, pc_scale, True
             )
             if bias is not None:
                 w8a8_out = w8a8_out + bias
             return w8a8_out.to(dtype=input.dtype).view(*input.shape[:-1], N)
         # DL end
-        out = torch.ops._dl_C.gptq_dlblas_gemmex(
+        out = torch.ops.sgl_kernel.gptq_dlblas_gemmex(  # DL: ported from _dl_C
             input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
         )
     if bias is not None:

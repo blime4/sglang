@@ -106,7 +106,12 @@ else:
     # build (absent from common_extension_dl.cc / setup_dl.py), so keep vllm here
     # until awq_kernel.cu is added to the DL sgl-kernel build.
     # DL end
-    from vllm._custom_ops import awq_dequantize
+    # DL begin — awq_dequantize fallback (not in sgl-kernel DL build yet)
+    try:
+        from vllm._custom_ops import awq_dequantize
+    except ImportError:
+        awq_dequantize = None
+    # DL end
 
 if _is_hip:
     pass

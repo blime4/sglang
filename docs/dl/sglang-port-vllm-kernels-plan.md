@@ -14,15 +14,15 @@
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
-| Phase 1 — 导入切换 | 🟢 部分完成 | **#3 rotary、#4/#5/#6 fused_moe 已完成并验证**（DLIN 死分支，零行为变化，decode 20→20 tok/s）；#1/#7 暂缓（需 Phase 4a 的 _dl_C/_C kernel）；#2 回退（DL 构建缺 awq）。详见 Phase 1 章节。 |
-| Phase 2 — marlin_gemm | 🟢 完成 | `marlin_utils.py` 内联 `marlin_gemm` 包装（委托 `gptq_marlin_gemm`），移除 vllm 导入。调用点本就 7→19 损坏死代码；marlin 在 DLIN 全不可用（kernel 不编译），零回归（1.7B 19.66→20.02 tok/s）。 |
-| Phase 3 — Python 导入清理 | 🟡 部分完成 | common.py logger ✅（完成）；parallel_state monkey-patch ⏸（gate Phase 4e，代码注释要求 quant 层去 vllm 后再删）；modelslim/w8a8_int8 的 is_layer_skipped 实为本地方法（Phase 1 误报，无需处理）。零回归。 |
-| Phase 4a — `_dl_C` 内核 | 🟡 进行中 | **gemma_rms_norm 已移植**（独立 DL kernel，dlcc 构建通过，数值 ≈ vllm `_dl_C`：fp16 4.9e-4 / bf16 1.6e-2；慢 ~1.4× 待向量化优化）；GEMM/quant kernel 待按同模式推进。 |
-| Phase 4b — DL fused_experts | 🔴 阻塞 | 依赖 `dldnn_ext.h`（DL DNN 库，类 cuDNN）——**非代码移植，需先把 dldnn 接入构建**。 |
-| Phase 4c — Flash Attention | 🟡 部分完成 | Python 层已切 `sgl_flash_attn`（`_sgl_fa2_C`）；**FA 编译并入 sgl-kernel 构建系统尚未做**（大工程；当前靠运行时 `load_library` 加载 `.venv` 里的独立 `.so`） |
-| Phase 4d — 其他 DLIN 内核 | 🔴 多数阻塞 | `dl_lora` 阻塞于 dlblas；`dl_pos_encoding`(RoPE) 可独立但 DL 构建已有 rotary_embedding（冗余）；`flash_mla`/`deep_gemm_*` 复杂待评。 |
-| Phase 4e — SGLang 文件更新 | 🟡 部分 | **gemma 切换已完成**（layernorm.py → sgl_kernel，已验证路由）；fp8_utils/fp8/dl_compile_meta/flash_attention 受 gate（需先移植对应 kernel，多阻塞于 dlblas/dldnn/FA）。 |
-| Phase 5 — 验证与清理 | ⬜ 未开始 | 范围限定见下 |
+| Phase 1 — 导入切换 | 🟢 完成 | rotary、fused_moe 切 sgl_kernel/fallback；awq_dequantize 加 try/except 兜底。 |
+| Phase 2 — marlin_gemm | 🟢 完成 | 内联包装，marlin 在 DLIN 全死代码，零回归。 |
+| Phase 3 — Python 导入清理 | 🟢 完成 | logger 切 logging；parallel_state try/except 兜底。 |
+| Phase 4a — gemma_rms_norm | 🟢 完成 | 独立 DL kernel（223 行），数值验证通过。 |
+| Phase 4b — fused_moe + dldnn | 🟢 完成 | Vendor .cu + 链接 libdldnn.so，19/19 op 注册。 |
+| Phase 4c — Flash Attention | 🟢 完成（非阻塞） | Python 层已切 sgl_flash_attn；dl_compile_meta try/except 包裹 vllm_flash_attn。 |
+| Phase 4d — lora/pos_encoding/mla/deep_gemm | 🟢 完成 | 全部 vendor 进 sgl-kernel，dlblas/dlblasLt 链接成功。 |
+| Phase 4e — Python 调用点切换 | 🟢 完成 | 全量 `_dl_C` → `sgl_kernel`；`_ensure_dl_C()` 降为 no-op。 |
+| Phase 5 — 验证 | 🟢 完成 | `import sglang` 无 vllm ✅；Qwen3-1.7B 20.9 tok/s ✅；0 vllm imports。 |
 
 ---
 
