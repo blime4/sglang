@@ -1,9 +1,9 @@
 # sglang vs vLLM TPOT Gap 分析报告（Qwen3.5-35B-A3B-FP8, TP4）
 
-**日期**: 2026-07-13  
-**模型**: Qwen3.5-35B-A3B-FP8 (256 experts, topk=8, 40 layers: 30 GDN + 10 full-attn)  
-**硬件**: DLIN 登临 GPU × 4 (32GB each), TP=4  
-**配置**: `attention_backend=fa3, page_size=16, disable_custom_all_reduce=True, CG on`  
+**日期**: 2026-07-13
+**模型**: Qwen3.5-35B-A3B-FP8 (256 experts, topk=8, 40 layers: 30 GDN + 10 full-attn)
+**硬件**: DLIN DLIN GPU × 4 (32GB each), TP=4
+**配置**: `attention_backend=fa3, page_size=16, disable_custom_all_reduce=True, CG on`
 **环境**: `../sdk/env.sh` (dl19-matching), `DLEOL_CACHE_SIZE=1024`
 
 ---
@@ -28,7 +28,7 @@ sglang TP4 decode TPOT 显著慢于 vLLM：
 
 在 CUDA graph 的 `graph.replay()` 前后插入 CUDA event + `.synchronize()`，测量纯 GPU 执行时间（排除 Python/scheduler 开销）。
 
-**sglang 侧**: `full_cuda_graph_backend.py::replay()` 加 `SGLANG_DL_TIME_REPLAY=1`  
+**sglang 侧**: `full_cuda_graph_backend.py::replay()` 加 `SGLANG_DL_TIME_REPLAY=1`
 **vLLM 侧**: `compilation/cuda_graph.py:360` 加 `VLLM_DL_TIME_REPLAY=1`
 
 ### 2.2 组件级差分测试

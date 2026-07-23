@@ -84,7 +84,7 @@
 
 ### 2.2 DLIN 算子覆盖差距
 
-| 算子类别 | vLLM（登临优化） | sglang（当前） | 估计性能损失 |
+| 算子类别 | vLLM（DLIN优化） | sglang（当前） | 估计性能损失 |
 |---|---|---|---|
 | **RMSNorm** | dleol kernel | dlcc kernel ✅（已接入） | ~0 |
 | **Attention decode** | dleol `cudnnMHAVarlenForward*` | dleol `cudnnMHAVarlenForward*`（vllm_flash_attn；.so 由 Route B 自编）✅ | ~0（旧 gather 路径曾损 ~6 tok/s，已消除） |
@@ -345,7 +345,7 @@ vllm-0.21.1.dev6+gac93bc0b3.sdk202606161052.cu117-cp312-cp312-manylinux_2_28_x86
 | **vLLM 0.21.0** | ✅ **跑通**，输出正确 ` Paris. The capital of France is Paris...` | DL platform **自动把 FP8 重映射为 `quantization=fp8_dlblas`**（DLIN 原生 dlblas FP8 GEMM） |
 | **sglang**（修 6 个 DLIN blocker 后） | ✅ **跑通**，输出与 vLLM **逐字一致** | FP8 走 sglang auto blockwise 路径（CUTLASS/Triton，DLIN 可跑）；修了 marlin/norm/gdc/bitcast |
 
-**核心差距**：vLLM 的 DL platform plugin 对 FP8 模型**自动选用 `fp8_dlblas`**（登临 dlblas FP8 GEMM）；
+**核心差距**：vLLM 的 DL platform plugin 对 FP8 模型**自动选用 `fp8_dlblas`**（DLIN dlblas FP8 GEMM）；
 sglang **没有这条 DLIN FP8 路由**，落到 NVIDIA Hopper 专用的 marlin/triton-fp8 路径，在 DLIN 上全线失败。
 **所以这不是 tok/s 性能差距，而是 sglang 能不能跑该模型的 enablement 差距。**
 
@@ -792,11 +792,11 @@ verify 路径已逐步排除锁定：GDN/Mamba2 state 正确（extend/verify 逐
 
 ### 7.15 OPT 落地：sglang 侧可做的优化（2026-07-10，重新框定后）
 
-> 重新框定：spec-decode 在 hybrid 状态模型上 verify≠decode 是架构级难修，**ROI 低**；真正杠杆是 **prefill（sglang 输 vLLM 处）+ graph（高 batch 吞吐）**。这两处恰好有**不依赖登临**的 sglang 侧解法。
+> 重新框定：spec-decode 在 hybrid 状态模型上 verify≠decode 是架构级难修，**ROI 低**；真正杠杆是 **prefill（sglang 输 vLLM 处）+ graph（高 batch 吞吐）**。这两处恰好有**不依赖DLIN**的 sglang 侧解法。
 
 #### ✅ OPT-1：prefill 分块到 16 绕 dleol —— 已验证 ~3.5–6.6× 长 prefill 提速
 
-**思路**：dleol 在 M≥~100 崩（P3），故 `FUSED_MAX_M=16` 把长 prefill 逼到慢 bf16-bmm。但若把 `chunked_prefill_size` 压到 16，每次 forward 的 MoE batch M≤16 ≤ `FUSED_MAX_M` → **永远走 fast fused，永不撞 dleol，永不回退 bf16-bmm**。纯 sglang 配置，不需登临修 dleol。
+**思路**：dleol 在 M≥~100 崩（P3），故 `FUSED_MAX_M=16` 把长 prefill 逼到慢 bf16-bmm。但若把 `chunked_prefill_size` 压到 16，每次 forward 的 MoE batch M≤16 ≤ `FUSED_MAX_M` → **永远走 fast fused，永不撞 dleol，永不回退 bf16-bmm**。纯 sglang 配置，不需DLIN修 dleol。
 
 **实测**（`scripts/dl/prefill_bench.py`，TP=2, fa3, eager, ~180-tok 长 prompt，max_new_tokens=1 = prefill 代理）：
 
@@ -807,7 +807,7 @@ verify 路径已逐步排除锁定：GDN/Mamba2 state 正确（extend/verify 逐
 
 - **长 prefill 冷 33s→9.5s（3.5×），暖 31s→5.0s（6.6×）**。SHORT 不变（本就 1 chunk fused）。
 - **输出连贯**（GDN 状态跨 ~12 个 prefill chunk 正确传递——sglang Mamba/hybrid chunked-prefill 核心特性），非 garbage。
-- **解 P3（稳定性：M=16 永不撞 dleol）+ P4（TTFT：长 prefill 大降）**，不需登临。
+- **解 P3（稳定性：M=16 永不撞 dleol）+ P4（TTFT：长 prefill 大降）**，不需DLIN。
 - **反转 §7.14 "真正可推进项 ②"**：长 prefill fast fused **不必等 DLIN 修 dleol**——分块即绕开。
 
 **推荐**：serving 配置加 `chunked_prefill_size=16`（与 `FUSED_MAX_M=16` 配套）。**sweet-spot follow-up**（未测，集群抢占中）：把 `FUSED_MAX_M` 提到 32/64 + chunk 同步，chunk 数减半，可能再快（dleol 阈值 ~100，32/64 仍安全）。复现：`CUDA_VISIBLE_DEVICES=<2 free> SGLANG_DL_MOE_FUSED=1 FUSED_MAX_M=16 MAX_BF16_M=2048 CHUNK=16 .venv/bin/python scripts/dl/prefill_bench.py`。
@@ -815,7 +815,7 @@ verify 路径已逐步排除锁定：GDN/Mamba2 state 正确（extend/verify 逐
 #### ❌ OPT-2：MoE/linear workspace 预分配 —— 前提不成立，非 sglang 侧可做
 
 调查后**推翻自己先前的假设**：
-- FP8 linear GEMM（`dlblas_w8a8_block_fp8_linear`，每层都用）调 `torch.ops._dl_C.gptq_dlblas_gemmex(input, w, scale, scale, quant_type, bit)`——**调用无 workspace 参数**，workspace 分配在 vLLM `_dl_C.so`（**登临编译的黑盒 op**）内部，sglang 侧**无法预分配/复用**。
+- FP8 linear GEMM（`dlblas_w8a8_block_fp8_linear`，每层都用）调 `torch.ops._dl_C.gptq_dlblas_gemmex(input, w, scale, scale, quant_type, bit)`——**调用无 workspace 参数**，workspace 分配在 vLLM `_dl_C.so`（**DLIN编译的黑盒 op**）内部，sglang 侧**无法预分配/复用**。
 - 且 §2.4 已证 sglang **能完整捕获 FULL graph**（输出干净逐字一致），只是 **net-negative（replay 慢于 eager）**。能捕获 ⟹ capture **没被 workspace 打断**（cudaMalloc-in-capture 会直接报错，非 net-negative）。⇒ graph 慢的根因是 **DLIN graph replay 内部**（非 workspace），属 P5 深度项。
 - **结论**：OPT-2 无 sglang 侧落地点（黑盒 op + replay 内部均 DLIN 侧）。修正先前"workspace 预分配可让 graph 翻正"的乐观框定。
 
@@ -833,7 +833,7 @@ verify 路径已逐步排除锁定：GDN/Mamba2 state 正确（extend/verify 逐
 | OPT-3 dl_recurrent | 🟡 DLIN-blocked | 低优先 |
 | OPT-4 GDN verify 等价 | 🟡 研究级/低 ROI | 建议暂缓 |
 
-**OPT-1 是本轮可落地的实质收益**：长 prompt prefill 从 ~33s → ~5s（暖），TTFT 大降，且不依赖登临。serving 配置加 `chunked_prefill_size=16` 即生效。其余 OPT 经调查均为 DLIN-blocked 或低 ROI——本身是有价值的结论（避免在死胡同投入）。
+**OPT-1 是本轮可落地的实质收益**：长 prompt prefill 从 ~33s → ~5s（暖），TTFT 大降，且不依赖DLIN。serving 配置加 `chunked_prefill_size=16` 即生效。其余 OPT 经调查均为 DLIN-blocked 或低 ROI——本身是有价值的结论（避免在死胡同投入）。
 
 ---
 
@@ -1541,7 +1541,7 @@ stream 实验（#1）未测——但 use_moe_cu 崩是 Device page fault（内�
 **所以 "compiled forward 是 vLLM 与 sglang 的差异" 这个假设也证伪**：sglang 加了 compiled forward 后，use_moe_cu 仍崩、real-moe_align 仍 41ms。vLLM 用 use_moe_cu 跑 18ms，sglang 同 op 同 binary 同 compiled forward 仍崩——**差异不在 compiled forward**。
 
 **最终穷尽（含 corrected compiled-forward 假设）**：
-| 路径 | GPU | 
+| 路径 | GPU |
 |---|---|
 | GEMMEX=2（baseline）| 27ms（最优 CG-safe）|
 | real-moe_align（relaxed）| 41ms |
@@ -1665,7 +1665,7 @@ dlPTI 显示非-MoE 已高效（AR 3.8%/norm <1%/GDN <2%），剩余空间小。
 如果 DLIN 侧不动，sglang 的 CG-safe 最优就是 GEMMEX=2（33ms GPU / ~37ms TPOT）。距离 vLLM 26.22ms 差 ~11ms，无法在 sglang 层关闭。
 
 #### 结论
-**关闭 11.5ms TPOT gap 的钥匙在 DLIN `_dl_C.so`**（让 use_moe_cu 的 act-quant 关 PDL 或可 CG 捕获）。sglang 侧已穷尽所有路径（输入一致已实证、gather/capture-state/compiled-forward/DLEOL-env 全测），唯一能做的就是优化 GEMMEX=2 的 gather（部分收益）。建议把 §7.46 的 kUsePDL 一行修复建议给 DLIN（段茗 ming.duan@denglin.ai，bug 18025 的 assignee）。
+**关闭 11.5ms TPOT gap 的钥匙在 DLIN `_dl_C.so`**（让 use_moe_cu 的 act-quant 关 PDL 或可 CG 捕获）。sglang 侧已穷尽所有路径（输入一致已实证、gather/capture-state/compiled-forward/DLEOL-env 全测），唯一能做的就是优化 GEMMEX=2 的 gather（部分收益）。建议把 §7.46 的 kUsePDL 一行修复建议给 DLIN（bug 18025 的 assignee）。
 
 ### 7.48 📊 apples-to-apples serving bench：sglang TPOT 36.37ms vs vLLM 26.22ms = 10.15ms gap（2026-07-14）
 

@@ -1,6 +1,6 @@
 [build-system]
 # DL begin
-# DLIN (登临) variant: no Rust grpc ext, no NVIDIA-only binary deps
+# DLIN (DLIN) variant: no Rust grpc ext, no NVIDIA-only binary deps
 # (flashinfer / flash-attn-4 / nvidia-cutlass-dsl / cuda-python are not on the
 # DLIN index). sgl-kernel is built from source (sgl-kernel/) with dlcc and is
 # NOT pinned here so `pip install -e` does not try to pull an NVIDIA wheel.
@@ -75,19 +75,18 @@ runtime_common = [
   "xgrammar==0.2.1",
 ]
 
-# DLIN (登临) runtime. torch is the DLIN-patched wheel exposing
+# DLIN (DLIN) runtime. torch is the DLIN-patched wheel exposing
 # torch.version.dl (installed via the dl-virtual index, see run_sglang.sh).
-# triton MUST be 3.1.0: Denglin pins this version (artifactory piplike/download)
-# because its bundled LLVM matches the SDK's libLLVM-15.so (LLVM 15), so the two
-# coexist. triton>=3.2 bundles a newer LLVM that collides with the SDK's via ELF
-# symbol interposition -> PassBuilder static-init segfault (see plan §6).
+# triton 3.3.0+dlgpu: DLIN-specific build with dlgpu backend that compiles
+# @triton.jit kernels to dlgput64 format. Installed from sw-triton artifactory
+# (see run_sglang.sh phase_setup). The >= allows both git4b604310 and git0f83b16e.
 # sgl-kernel is built from source separately with dlcc; if absent, sglang
 # degrades to torch fallbacks (import sgl_kernel is wrapped in try/except).
 # DL begin
 srt_dl = [
   "sglang[runtime_common]",
   "torch==2.9.1+dl24.sdk202606031721",
-  "triton==3.1.0",
+  "triton>=3.3.0",
   "flash-attn==2.8.4+torch291.sdk202606031721",  # DLIN Flash Attention (FA2)
 ]
 # DL end

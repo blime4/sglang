@@ -1,5 +1,5 @@
 # DL begin
-# Denglin (登临/DLIN) build for sgl-kernel's common_ops extension.
+# Denglin (DLIN/DLIN) build for sgl-kernel's common_ops extension.
 #
 # Mirrors setup_rocm.py (the per-backend setuptools entry), but for DLIN:
 # torch's dl-aware torch.utils.cpp_extension detects torch.version.dl and

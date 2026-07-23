@@ -1,9 +1,8 @@
 # DLEOL JIT Bug 报告：sglang vs vLLM MoE 性能差距的阻塞点
 
-**报告日期**: 2026-07-13  
-**SDK 版本**: `../sdk/env.sh` (dl19-matching)  
-**模型**: Qwen3.5-35B-A3B-FP8, TP=4  
-**联系**: shaobo.xie@denglin.ai  
+**报告日期**: 2026-07-13
+**SDK 版本**: `../sdk/env.sh` (dl19-matching)
+**模型**: Qwen3.5-35B-A3B-FP8, TP=4
 
 ---
 
@@ -207,6 +206,5 @@ VLLM_VENV=../venv-vllm021
 
 ## 联系
 
-如有疑问，请联系 shaobo.xie@denglin.ai。完整实验记录见：
 - `docs/dl/sglang-vllm-tp4-gap-report.md`（10 章完整报告）
 - `docs/dl/sglang-vs-vllm-perf-gap.md` §7.24–7.29（逐轮实验记录）

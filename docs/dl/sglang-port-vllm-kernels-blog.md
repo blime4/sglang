@@ -1,10 +1,10 @@
 # SGLang 移除 vLLM .so 依赖 — 移植调试实录
 
-> 2026-07-22 ~ 2026-07-23 | DLIN (登临) KS38 QUAD | sglang dl-main branch
+> 2026-07-22 ~ 2026-07-23 | DLIN (DLIN) KS38 QUAD | sglang dl-main branch
 
 ## 1. 背景与目标
 
-SGLang 在 DLIN (登临) 平台的运行严重依赖 vLLM 的两个 C++ 扩展：
+SGLang 在 DLIN (DLIN) 平台的运行严重依赖 vLLM 的两个 C++ 扩展：
 - **`_dl_C.so`**：21 个 DLIN 专有 CUDA kernel（gemma_rms_norm、gptq_dlblas_gemmex、
   invoke_fused_moe_opt、flash_mla、dl_lora 等），链接 `libdlblas.so` + `libdlblasLt.so` + `libdldnn.so`
 - **`_C.so`**：标准 vLLM kernel（silu_and_mul_quant、dynamic_per_token_scaled_fp8_quant 等）
@@ -63,7 +63,7 @@ dlcc 的 fp16/bf16 类型转换限制），编写 `gemma_rmsnorm_dl.cu`（223 �
 **最初错误判断**：将 4b（fused_moe，需 dldnn）和 4d（lora、pos_encoding，需 dlblas）标记为
 "阻塞"，认为 DL 闭源库不可用。
 
-**用户纠正**：*"再深入分析一下，如果要实现 4b/4c/4d 需要怎么做，是可以做到的！参考登临 vllm 实现"*
+**用户纠正**：*"再深入分析一下，如果要实现 4b/4c/4d 需要怎么做，是可以做到的！参考DLIN vllm 实现"*
 
 **根因**：没有检查 SDK！`$SDK_DIR/include/` 有 `dlblas_ext.h`、`dldnn_ext.h`，
 `$SDK_DIR/lib/` 有 `libdlblas.so`、`libdldnn.so`。vllm 就是这样链接的。

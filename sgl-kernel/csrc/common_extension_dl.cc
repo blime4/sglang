@@ -1,5 +1,5 @@
 // DL begin
-// Denglin (登临/DLIN) curated pybind entry point for sgl_kernel.common_ops.
+// Denglin (DLIN/DLIN) curated pybind entry point for sgl_kernel.common_ops.
 //
 // DLIN analog of common_extension_rocm.cc. Registers ONLY ops whose backing
 // sources are header-clean (no FetchContent deps): the rest of sgl-kernel needs

@@ -2,7 +2,7 @@
 #===============================================================================
 # run_sglang.sh
 #-------------------------------------------------------------------------------
-# One-stop driver for building/running SGLang on DLIN (登临) GPUs.
+# One-stop driver for building/running SGLang on DLIN (DLIN) GPUs.
 #
 # Phases (run individually or all at once):
 #   setup        source DLIN SDK, create a uv venv (py3.12), install DLIN torch
@@ -100,11 +100,10 @@ VENV_DIR="${VENV_DIR:-$SGLANG_DIR/.venv}"
 # DLIN-patched torch that exposes torch.version.dl (NOT vanilla upstream 2.9.1).
 TORCH_SPEC="${TORCH_SPEC:-torch==2.9.1+dl24.sdk202606031721}"
 
-# DLIN-pinned triton. MUST be 3.1.0: its bundled LLVM matches the SDK's
-# libLLVM-15.so (LLVM 15) so they coexist; triton>=3.2 bundles a newer LLVM that
-# collides via symbol interposition -> PassBuilder static-init segfault (plan §6).
-# Installed explicitly from dl-virtual so uv doesn't grab the vanilla build.
-TRITON_SPEC="${TRITON_SPEC:-triton==3.1.0}"
+# DLIN triton 3.3.0 with dlgpu backend — compiles @triton.jit kernels to
+# dlgput64 format that the DLIN driver can load. Without this, Triton kernels
+# produce NVIDIA ELF -> "Unsupported elf format" at CG capture.
+TRITON_URL="${TRITON_URL:-http://ext-artifactory.denglin.com:8082/artifactory/sw-triton/V2_SOFTWARE_master_202607201723/cp312-cp312-manylinux_2_28_x86_64/triton-3.3.0%2Bgit0f83b16e-cp312-cp312-manylinux_2_28_x86_64.whl}"
 
 # DLIN Artifactory indexes (http -> needs trusted/allow-insecure host).
 DL_PYPI_INDEX="http://ext-artifactory.denglin.com:8082/artifactory/api/pypi/dl-pypi-remote/simple"
@@ -170,6 +169,14 @@ COMPARE_BASELINE="${COMPARE_BASELINE:-}"        # --baseline <id|commit>: diff v
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
 COMPARE_METRICS_DIR="${COMPARE_METRICS_DIR:-/tmp/sglang_compare}"
 COMPARE_STORE="${COMPARE_STORE:-$SGLANG_DIR/docs/dl/compare_results.json}"
+
+# chat options (wraps scripts/dl/chat.py — interactive OpenAI-compatible client).
+# Default: connect to $SERVE_HOST:$SERVE_PORT, auto-detect model.
+CHAT_QUICK="${CHAT_QUICK:-}"                        # -q: single message
+CHAT_URL="${CHAT_URL:-}"                            # --url: server API base URL
+CHAT_MODEL="${CHAT_MODEL:-}"                        # --chat-model: explicit model name
+CHAT_SYSTEM_PROMPT="${CHAT_SYSTEM_PROMPT:-}"        # --system-prompt
+CHAT_NO_STREAM="${CHAT_NO_STREAM:-0}"                # --no-stream
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -239,8 +246,33 @@ apply_ngram_overrides() {
 }
 
 #-------------------------------------------------------------------------------
-# uv config helpers — mirror the artifactory method (uv.toml / pip.conf) but add
-# dl-virtual as an extra index so the +dl24 DLIN torch resolves.
+# JFrog credential helper — stores credentials in ~/.netrc (chmod 600).
+# First run: prompts for username/password, saves.
+# Subsequent runs: silent (wget/curl/pip/uv all read ~/.netrc natively).
+#-------------------------------------------------------------------------------
+ensure_jfrog_credentials() {
+  local host="$DL_HOST"
+  local netrc="$HOME/.netrc"
+
+  if grep -q "machine ${host}" "$netrc" 2>/dev/null; then
+    return 0
+  fi
+
+  log "JFrog credentials needed for $host (stored in ~/.netrc, chmod 600)"
+  printf "  JFrog username: "; read -r jfrog_user
+  printf "  JFrog password: "; read -rs jfrog_pass; echo
+
+  if [ -z "$jfrog_user" ] || [ -z "$jfrog_pass" ]; then
+    die "Username and password are required"
+  fi
+
+  # Append entry (create file if missing)
+  printf "\nmachine %s\n  login %s\n  password %s\n" \
+    "$host" "$jfrog_user" "$jfrog_pass" >> "$netrc"
+  chmod 600 "$netrc"
+  log "Credentials saved to ~/.netrc (chmod 600). Will be reused automatically."
+}
+
 #-------------------------------------------------------------------------------
 activate_uv_indexes() {
   # Primary index = dl-pypi-remote (PyPI proxy, used by artifactory/uv.toml).
@@ -280,6 +312,9 @@ dlin_runtime_env() {
   # CG TP2, "Paris." correct — beats vLLM 70.3ms.
   export DLEOL_CACHE_SIZE="${DLEOL_CACHE_SIZE:-1024}"
   export DLEOL_CACHE_GRAPH_SIZE="${DLEOL_CACHE_GRAPH_SIZE:-1024}"
+  # DL: Disable torch.compile/dynamo/inductor — torchinductor's own codegen
+  # may still emit incompatible code even with DLIN triton on the path.
+  export TORCHDYNAMO_DISABLE=1
   # Prepend (do not overwrite) so the venv bin and SDK bin stay on PATH.
   export PATH="$VENV_DIR/bin:$SDK_DIR/bin:$SDK_DIR/tools:/usr/bin:/bin:${HOME:-}/.local/bin"
   : "${CUDA_VISIBLE_DEVICES:=0}"
@@ -317,12 +352,18 @@ phase_setup() {
   uv pip install "$TORCH_SPEC"
 
   # DL begin
-  # Install DLIN-pinned triton 3.1.0 from dl-virtual BEFORE the editable install
+  # Install DLIN triton 3.3.0 (dlgpu backend) BEFORE the editable install
   # so uv doesn't resolve a vanilla build from dl-pypi-remote and so torch's
   # triton dependency is already satisfied by the correct version.
-  log "Installing DLIN triton ($TRITON_SPEC from dl-virtual) ..."
-  uv pip install --index-url "$DL_VIRTUAL_INDEX" --trusted-host "$DL_HOST" \
-      --no-deps "$TRITON_SPEC"
+  local triton_whl="$SGLANG_DIR/whl-for-compare/$(basename "${TRITON_URL//%2B/+}")"
+  if [ ! -f "$triton_whl" ]; then
+    log "Downloading DLIN triton 3.3.0 (dlgpu backend) ..."
+    ensure_jfrog_credentials
+    wget --netrc -q --show-progress -O "$triton_whl" \
+      "${TRITON_URL//%2B/+}" || die "Failed to download DLIN triton"
+  fi
+  log "Installing DLIN triton 3.3.0 from $triton_whl ..."
+  uv pip install --no-deps "$triton_whl"
   # DL end
 
   # Sanity: confirm this is the DLIN-patched torch (torch.version.dl set),
@@ -391,6 +432,9 @@ phase_install() {
   local dl="$SGLANG_DIR/python/pyproject_dl.toml"
   local bak="$SGLANG_DIR/python/pyproject.toml.cuda-bak"
   [ -f "$dl" ] || die "missing $dl"
+  # vcs-versioning registers a setuptools_scm plugin incompatible with
+  # setuptools-scm>=8.0 (config.scm attribute missing). Remove it if present.
+  uv pip uninstall vcs-versioning --yes >/dev/null 2>&1 || true
   # Back up the CUDA pyproject once, then swap in the DLIN variant.
   if [ ! -f "$bak" ]; then cp "$py" "$bak"; fi
   cp "$dl" "$py"
@@ -414,8 +458,7 @@ phase_install() {
 #  1. DLIN torch detected + a real DLIN GPU compute (bf16 matmul) succeeds.
 #  2. `import sglang` works and current_platform resolves to DlinSRTPlatform.
 # Both require dlin_runtime_env: a CLEAN LD_LIBRARY_PATH (single SDK/lib) AND
-# the DLIN-pinned triton 3.1.0 (whose bundled LLVM matches the SDK's libLLVM-15
-# so they coexist — see DLIN_INTEGRATION_PLAN.md §6).
+# DLIN triton 3.3.0 (dlgpu backend, compiles @triton.jit to dlgput64 format).
 #
 # sgl-kernel is best-effort (build-kernel phase); absent → torch fallbacks.
 #-------------------------------------------------------------------------------
@@ -474,7 +517,7 @@ PY
 #-------------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
-run_sglang.sh — build/run SGLang on DLIN (登临) GPUs.
+run_sglang.sh — build/run SGLang on DLIN (DLIN) GPUs.
 
 Usage:
   ./run_sglang.sh                       # all phases: setup -> build-kernel -> install -> test
@@ -502,6 +545,10 @@ sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
   ./run_sglang.sh compare --history              # print the commit-keyed results log (no GPU run)
   ./run_sglang.sh compare --no-record            # run but don't append to the JSON store
   ./run_sglang.sh compare --baseline r001        # diff the new run vs run r001 (else vs previous)
+  ./run_sglang.sh chat                           # interactive chat (connect to existing server on :30000)
+  ./run_sglang.sh chat -q "hello"                # quick single message
+  ./run_sglang.sh chat --url http://10.0.0.1:30000/v1   # custom endpoint
+  ./run_sglang.sh chat --chat-model Qwen3-1.7B --system-prompt "You are helpful"
   Runs both engines on the same GPUs (fresh process each), caches metrics to
   /tmp/sglang_compare. vLLM runs APC-OFF — its prefix cache can't be enabled on
   this hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'). See
@@ -523,6 +570,12 @@ gen/serve options:
   -g, --cuda-graph          enable cuda graph (default off; safer on DLIN)
   -S, --spec-ngram          NGRAM spec-decode (qwen35-35b: num_draft=8; needs -M qwen35-35b)
   --port N / --host H       serve only        (default 30000 / 127.0.0.1)
+# chat options:
+#   -q, --quick TEXT          single message (non-interactive)
+#   --url URL                 server API base URL (default http://$SERVE_HOST:$SERVE_PORT/v1)
+#   --chat-model NAME         model name (default: auto-detect from /v1/models)
+#   --system-prompt TEXT      system prompt
+#   --no-stream               disable streaming output
 
 bench options (wraps sglang's official bench_serving / bench_one_batch):
   -c, --concurrency N       max concurrent requests   (default 1; see note)
@@ -588,7 +641,13 @@ parse_test_args() {
       --show)              COMPARE_SHOW=1; shift;;
       --history)           COMPARE_HISTORY=1; shift;;
       --no-record)         COMPARE_RECORD=0; shift;;
-      --baseline)          COMPARE_BASELINE="$2"; shift 2;;
+       --baseline)          COMPARE_BASELINE="$2"; shift 2;;
+      # chat
+      -q|--quick)           CHAT_QUICK="$2"; shift 2;;
+      --url)                CHAT_URL="$2"; shift 2;;
+      --chat-model)         CHAT_MODEL="$2"; shift 2;;
+      --system-prompt)      CHAT_SYSTEM_PROMPT="$2"; shift 2;;
+      --no-stream)          CHAT_NO_STREAM=1; shift;;
       -h|--help)           usage; exit 0;;
       *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
@@ -650,7 +709,9 @@ phase_serve() {
   local ctx_len="${DLIN_CONTEXT_LEN:-}"
   local cg_max_bs="${DLIN_CG_MAX_BS:-}"
   local cg_flag=""
-  [ "$USE_CUDA_GRAPH" = "1" ] || cg_flag="--disable-cuda-graph"
+  if [ "$USE_CUDA_GRAPH" != "1" ]; then
+    cg_flag="--disable-cuda-graph"
+  fi
   local extra_flags=""
   [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
   [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
@@ -690,7 +751,10 @@ start_server_bg() {  # launches launch_server detached; sets SERVER_PID
   local ctx_len="${DLIN_CONTEXT_LEN:-}"
   local cg_max_bs="${DLIN_CG_MAX_BS:-}"
   local cg_flag=""
-  [ "$USE_CUDA_GRAPH" = "1" ] || cg_flag="--disable-cuda-graph"
+  if [ "$USE_CUDA_GRAPH" != "1" ]; then
+    # DL: breakable CG backend — same rationale as phase_serve above.
+    cg_flag="--disable-cuda-graph"
+  fi
   local extra_flags=""
   [ -n "$mem_frac" ] && extra_flags="$extra_flags --mem-fraction-static $mem_frac"
   [ -n "$ctx_len" ] && extra_flags="$extra_flags --context-length $ctx_len"
@@ -852,6 +916,32 @@ EOF
   local model_tail; model_tail="$(basename "${MODEL_PATH%/}")"
   log "[benchrun] result: $work/benchrun_${model_tail}/benchrun_result.json"
   return $rc
+}
+
+#-------------------------------------------------------------------------------
+# Phase: chat -- interactive OpenAI-compatible chat client.
+#   Connects to an already-running SGLang (or any OpenAI-compatible) server.
+#   Defaults: url=http://$SERVE_HOST:$SERVE_PORT/v1, model=auto-detect.
+#   Supports interactive prompt loop with history, or -q for quick single-shot.
+#-------------------------------------------------------------------------------
+phase_chat() {
+  local script="$SGLANG_DIR/scripts/dl/chat.py"
+  [ -f "$script" ] || die "chat script not found: $script"
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+
+  local url="${CHAT_URL:-http://$SERVE_HOST:$SERVE_PORT/v1}"
+  local stream_flag=""
+  [ "$CHAT_NO_STREAM" = "1" ] && stream_flag="--no-stream"
+
+  log "Phase [chat]: interactive OpenAI-compatible chat client"
+  log "  url=$url  model=${CHAT_MODEL:-<auto>}  quick=${CHAT_QUICK:-<interactive>}"
+
+  python "$script" \
+    --url "$url" \
+    ${CHAT_MODEL:+--model "$CHAT_MODEL"} \
+    ${CHAT_SYSTEM_PROMPT:+--system-prompt "$CHAT_SYSTEM_PROMPT"} \
+    ${CHAT_QUICK:+--quick "$CHAT_QUICK"} \
+    $stream_flag
 }
 
 #-------------------------------------------------------------------------------
@@ -1033,12 +1123,13 @@ phase_compare() {
 #-------------------------------------------------------------------------------
 PHASE="${1:-all}"; shift || true
 case "$PHASE" in
-  gen|serve|bench|benchrun) parse_test_args "$@" ;;
-  compare)                  parse_test_args "$@" ;;
+  gen|serve|bench|benchrun|chat) parse_test_args "$@" ;;
+  compare)                        parse_test_args "$@" ;;
 esac
 # One-click default: gen/serve with no -m/-M -> Qwen3.5-35B-A3B-FP8 (TP4 preset).
 if [ -z "${MODEL_EXPLICIT:-}" ]; then
   case "$PHASE" in gen|serve|compare) pick_model qwen35-35b ;; esac
+  # chat: no model preset needed — connects to an existing server
 fi
 apply_ngram_overrides   # no-op unless -S/--spec-ngram; must run AFTER pick_model
 
@@ -1051,6 +1142,7 @@ case "$PHASE" in
   serve)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_serve ;;
   bench)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_bench ;;
   benchrun)     source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_benchrun ;;
+  chat)         source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_chat ;;
   compare)      source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_compare ;;
   all)
     phase_setup
@@ -1059,6 +1151,6 @@ case "$PHASE" in
     phase_test
     ;;
   -h|--help|help) usage; exit 0 ;;
-  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|compare|all)" ;;
+  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|chat|compare|all)" ;;
 esac
 ok "Done ($PHASE)."

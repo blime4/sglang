@@ -1,6 +1,6 @@
 // DL begin
 //
-// Standalone Gemma RMSNorm kernels for DLIN (登临) — built by setup_dl.py via
+// Standalone Gemma RMSNorm kernels for DLIN (DLIN) — built by setup_dl.py via
 // dlcc. Mirrors rmsnorm_dl.cu (no FlashInfer / CUTLASS / CUB dependency; plain
 // warp/block shuffle reduction). Replaces vllm._dl_C.gemma_rms_norm /
 // fused_add_gemma_rms_norm so sglang no longer has to load vllm's _dl_C.so for

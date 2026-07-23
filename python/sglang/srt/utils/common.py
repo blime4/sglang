@@ -153,7 +153,7 @@ def is_cuda():
 
 
 # DL begin
-# Denglin (登临) DLIN detection. DLIN's patched torch exposes `torch.version.dl`
+# Denglin (DLIN) DLIN detection. DLIN's patched torch exposes `torch.version.dl`
 # (e.g. "11.7"); upstream torch does not have this attribute. Ensure it always
 # exists so is_dlin() and any direct `torch.version.dl` access is safe on every
 # build. Mirrors vLLM's vllm/torch_dl_version.py shim.
@@ -163,7 +163,7 @@ if not hasattr(torch.version, "dl"):
 
 @lru_cache(maxsize=1)
 def is_dlin() -> bool:
-    """True when running on a Denglin (登临/DLIN) GPU.
+    """True when running on a Denglin (DLIN/DLIN) GPU.
 
     DLIN is CUDA-shaped: device_type is "cuda", torch.cuda.* works, CUDA_VISIBLE_DEVICES
     is honored, and is_cuda() is also True. Use is_dlin() to route hot operators to

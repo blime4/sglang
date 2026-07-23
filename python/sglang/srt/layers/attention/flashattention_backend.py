@@ -55,6 +55,38 @@ if _is_dlin_check():
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+    # DL: Optional pure-PyTorch metadata kernel (no Triton JIT dependency).
+    # Enable with SGLANG_DL_PYTORCH_METADATA=1 for environments where DLIN Triton
+    # is unavailable or as a ~2 tok/s faster alternative to the Triton fused kernel.
+    import os as _dl_os
+    if _dl_os.environ.get("SGLANG_DL_PYTORCH_METADATA", "0") == "1":
+        def _normal_decode_set_metadata_pytorch(
+            cache_seqlens_int32, cu_seqlens_k, page_table,
+            req_to_token, req_pool_indices, strided_indices,
+            max_seq_pages, seq_lens, seq_len_delta, page_size,
+            swa_page_table=None, token_to_kv_pool=None,
+        ):
+            batch_size = cache_seqlens_int32.shape[0]
+            cache_seqlens_int32.copy_((seq_lens[:batch_size] + seq_len_delta).to(torch.int32))
+            cu_seqlens_k[0] = 0
+            torch.cumsum(cache_seqlens_int32[:batch_size], dim=0, dtype=torch.int32, out=cu_seqlens_k[1:batch_size + 1])
+            if max_seq_pages > 0:
+                si = strided_indices[:max_seq_pages]
+                gathered = req_to_token[req_pool_indices[:batch_size]][:, si]
+                shift = (page_size).bit_length() - 1 if page_size > 1 else 0
+                page_table[:batch_size, :max_seq_pages] = (gathered >> shift).to(torch.int32)
+            if swa_page_table is not None and token_to_kv_pool is not None:
+                from sglang.srt.mem_cache.memory_pool import SWAKVPool
+                if isinstance(token_to_kv_pool, SWAKVPool) and max_seq_pages > 0:
+                    mapping = token_to_kv_pool.full_to_swa_index_mapping
+                    si = strided_indices[:max_seq_pages]
+                    swa_gathered = mapping[req_to_token[req_pool_indices[:batch_size]][:, si]]
+                    shift = (page_size).bit_length() - 1 if page_size > 1 else 0
+                    swa_page_table[:batch_size, :max_seq_pages] = (swa_gathered >> shift).to(torch.int32)
+
+        normal_decode_set_metadata = _normal_decode_set_metadata_pytorch
+
 # DL end
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 

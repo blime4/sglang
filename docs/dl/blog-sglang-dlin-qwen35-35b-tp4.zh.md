@@ -1,40 +1,40 @@
 ---
-title: "让 SGLang 跑在登临 GPU 上:运行 Qwen3.5-35B-A3B-FP8,并在 TP4 上对标 vLLM"
+title: "让 SGLang 跑在DLIN GPU 上:运行 Qwen3.5-35B-A3B-FP8,并在 TP4 上对标 vLLM"
 subtitle: "一篇关于把推理框架移植到非 NVIDIA GPU、并为 3 毫秒死磕一周的实战记录"
-authors: "SGLang 登临(DLIN)适配团队"
+authors: "SGLang DLIN(DLIN)适配团队"
 date: 2026-07-17
-tags: [sglang, dlin, 登临, 硬件适配, moe, fp8, 线性注意力, 性能]
+tags: [sglang, dlin, DLIN, 硬件适配, moe, fp8, 线性注意力, 性能]
 model: Qwen3.5-35B-A3B-FP8
-hardware: 登临 DLIN KS38(×4)
+hardware: DLIN DLIN KS38(×4)
 baseline: vLLM 0.21.1
 ---
 
-# 让 SGLang 跑在登临 GPU 上
+# 让 SGLang 跑在DLIN GPU 上
 ## 运行 Qwen3.5-35B-A3B-FP8,并在 TP4 上对标 vLLM
 
 > *一篇关于把推理框架移植到非 NVIDIA GPU、并为 3 毫秒死磕一周的实战记录。*
 
-**作者:**SGLang 登临(DLIN)适配团队　·　**日期:**2026 年 7 月　·　**模型:**Qwen3.5-35B-A3B-FP8　·　**硬件:**登临 DLIN KS38(4 卡)　·　**对标:**vLLM 0.21.1
+**作者:**SGLang DLIN(DLIN)适配团队　·　**日期:**2026 年 7 月　·　**模型:**Qwen3.5-35B-A3B-FP8　·　**硬件:**DLIN DLIN KS38(4 卡)　·　**对标:**vLLM 0.21.1
 
 ---
 
 ## 摘要
 
-我们将 SGLang 移植到登临(DLIN)GPU,使 **Qwen3.5-35B-A3B-FP8** ——一个混合线性注意力 + MoE、采用 blockwise FP8 量化的模型——达到正确、可对外提供服务的运行状态。工作分三个阶段推进:以 vLLM 为参考建立正确性、选择正确的 DLIN MoE kernel 路径以恢复吞吐、以及在 TP4 下对标 vLLM 的 decode 延迟。稳态下 SGLang 达到 **27.3 ms/token**,vLLM 为 **24.0 ms/token**;这 3.3 ms 的差距,我们用直接测量定位到了单一根因:两个引擎运行字节级相同的 GPU 原语,但 vLLM 的 `torch.compile` 应用了 Inductor 的 IR 级算子融合(`fuse_norm_quant`、`fuse_act_quant`),而 SGLang 在 DLIN 上暂时无法使用。我们已落地 compile 集成修复的第一阶段,并报告剩余路径。本文完整记录测量方法,并对过程中修正过的若干论断如实说明。
+我们将 SGLang 移植到DLIN(DLIN)GPU,使 **Qwen3.5-35B-A3B-FP8** ——一个混合线性注意力 + MoE、采用 blockwise FP8 量化的模型——达到正确、可对外提供服务的运行状态。工作分三个阶段推进:以 vLLM 为参考建立正确性、选择正确的 DLIN MoE kernel 路径以恢复吞吐、以及在 TP4 下对标 vLLM 的 decode 延迟。稳态下 SGLang 达到 **27.3 ms/token**,vLLM 为 **24.0 ms/token**;这 3.3 ms 的差距,我们用直接测量定位到了单一根因:两个引擎运行字节级相同的 GPU 原语,但 vLLM 的 `torch.compile` 应用了 Inductor 的 IR 级算子融合(`fuse_norm_quant`、`fuse_act_quant`),而 SGLang 在 DLIN 上暂时无法使用。我们已落地 compile 集成修复的第一阶段,并报告剩余路径。本文完整记录测量方法,并对过程中修正过的若干论断如实说明。
 
 ---
 
 ## 1. 背景
 
-### 1.1 登临(DLIN)GPU
+### 1.1 DLIN(DLIN)GPU
 
-登临 GPU 是一类国产 GPGPU。它在**编程模型层面兼容 CUDA,但运行时与算子栈完全自研**:没有 cuBLAS、cuDNN、cuBLASLt,也没有预编译好的 FlashAttention 二进制。其软件环境由以下几部分构成:
+DLIN GPU 是一类国产 GPGPU。它在**编程模型层面兼容 CUDA,但运行时与算子栈完全自研**:没有 cuBLAS、cuDNN、cuBLASLt,也没有预编译好的 FlashAttention 二进制。其软件环境由以下几部分构成:
 
 - 自研 SDK,提供算子头文件(`<dldnn_ext.h>`、`<dlblasLt_ext.h>`);
 - **DLEOL**,一个 JIT 编译虚拟机,在运行时把 Triton 和内部 IR 翻译成 GPU fatbin;
 - 一套 profiling 工具链(`dlpti_tools`,对标 Nsight)和 `dlsmi`(对标 `nvidia-smi`)。
 
-对一个推理框架而言,实际后果是:每一个性能关键算子——FP8 GEMM、分组 MoE、分页注意力、RMSNorm——都必须从 SDK 获取、经 DLEOL JIT 编译,或用登临编译器(`dlcc`)手写。高价值算子(分组 MoE、线性注意力)只有走 DLEOL-JIT 的 `_dl_C.so` op 才快,而这些 op 具有**上下文敏感的编译行为**:会根据调用上下文选择不同的 kernel 变体。
+对一个推理框架而言,实际后果是:每一个性能关键算子——FP8 GEMM、分组 MoE、分页注意力、RMSNorm——都必须从 SDK 获取、经 DLEOL JIT 编译,或用DLIN编译器(`dlcc`)手写。高价值算子(分组 MoE、线性注意力)只有走 DLEOL-JIT 的 `_dl_C.so` op 才快,而这些 op 具有**上下文敏感的编译行为**:会根据调用上下文选择不同的 kernel 变体。
 
 ### 1.2 模型:Qwen3.5-35B-A3B-FP8
 
@@ -42,7 +42,7 @@ baseline: vLLM 0.21.1
 
 - **MoE 路由:**256 个 expert,每 token 激活 8 个,blockwise FP8 `[128,128]` 权重。每个 decode 步要做一次路由决策,加 8 次 per-expert FP8 GEMM。
 - **混合注意力:**40 个 transformer 层里,**30 层是 GatedDeltaNet(GDN,线性/状态空间式注意力)**,只有 10 层是标准全注意力。每个 GDN 层除了因果 conv1d 和门控投影外,还要做一次循环状态更新(`dl_recurrent_gated_delta_rule`)。
-- **FP8 量化:**权重 blockwise `[128,128]`;激活量化则是登临上大多数正确性"地雷"所在之处。
+- **FP8 量化:**权重 blockwise `[128,128]`;激活量化则是DLIN上大多数正确性"地雷"所在之处。
 
 整体架构见**图 1**:每一个模块都必须映射到一个既存在、又足够快的 DLIN 算子。
 
@@ -62,7 +62,7 @@ baseline: vLLM 0.21.1
 
 | 原语 | DLIN 算子 | SGLang 获取方式 | 备注 |
 |---|---|---|---|
-| Decode 注意力 | `_vllm_fa2_C.so` / `paged_decode_attn` | `dlcc` 手写编译 | FlashAttention 源码 + 登临编译器 |
+| Decode 注意力 | `_vllm_fa2_C.so` / `paged_decode_attn` | `dlcc` 手写编译 | FlashAttention 源码 + DLIN编译器 |
 | GDN decode | `_dl_C.dl_recurrent_gated_delta_rule` | dlopen vLLM 的 `_dl_C.so` | DLEOL-JIT;约省 3 ms |
 | GDN prefill | `_dl_C.dl_chunk_gated_delta_rule` | 同上 | `l2norm` 需在 op 外部做 |
 | FP8 dense 线性 | `_dl_C.gptq_dlblas_gemmex` | 同上 | FP8 权重 + bf16 激活 |
@@ -103,11 +103,11 @@ is_neox_style = (
 
 ### 3.2 一个"防御性"的 `.contiguous()` 引发段错误
 
-FP8 GEMM 路径(`quant_type=2`)直接段错误退出(exit −11)。SGLang 在权重上加了防御性的 `.contiguous()`;vLLM 则直接传**非连续**的 `weight.t()` 转置视图。登临 kernel 硬编码了转置视图的 stride;一旦把张量拍平,stride 就对不上,kernel 越界访问。去掉这条路径上所有的 `.contiguous()`,崩溃消失,**还顺带省了约 4 ms TPOT**。一个"看起来更稳妥"的调用,恰恰是缺陷所在。
+FP8 GEMM 路径(`quant_type=2`)直接段错误退出(exit −11)。SGLang 在权重上加了防御性的 `.contiguous()`;vLLM 则直接传**非连续**的 `weight.t()` 转置视图。DLIN kernel 硬编码了转置视图的 stride;一旦把张量拍平,stride 就对不上,kernel 越界访问。去掉这条路径上所有的 `.contiguous()`,崩溃消失,**还顺带省了约 4 ms TPOT**。一个"看起来更稳妥"的调用,恰恰是缺陷所在。
 
 ### 3.3 自定义 all-reduce 在张量并行下崩溃
 
-开启张量并行后,在 `cross_device_reduce_1stage<bfloat16,2>` 崩溃,报 `HC_CUK Error=28`:登临 codegen 无法生成这个自定义 all-reduce kernel。vLLM 在登临上跑 TP 用的是 NCCL(`use_custom_allreduce=False`);SGLang 采用同样解法:
+开启张量并行后,在 `cross_device_reduce_1stage<bfloat16,2>` 崩溃,报 `HC_CUK Error=28`:DLIN codegen 无法生成这个自定义 all-reduce kernel。vLLM 在DLIN上跑 TP 用的是 NCCL(`use_custom_allreduce=False`);SGLang 采用同样解法:
 
 ```
 --disable-custom-all-reduce    # 走 NCCL,与 vLLM 一致
@@ -158,7 +158,7 @@ if (
     ...  # invoke_fused_moe_opt 快路径
 ```
 
-`FUSED_MAX_M` 上限定在 16 而非更高,是因为一个真实的登临编译器缺陷:`invoke_fused_moe_opt` 在 prefill `M ≥ ~100` 时触发 DLEOL assert(`tu_program.cc:625` stride 对齐 → SIGSEGV)。稳定的 serving 配方把融合路径与**分块 prefill**(`chunked_prefill_size=16`)配合,让每次 forward 的 MoE batch 保持 `M ≤ 16`,远离该 assert。长 prefill 从 33 s 降到暖态 5 s,输出连贯。
+`FUSED_MAX_M` 上限定在 16 而非更高,是因为一个真实的DLIN编译器缺陷:`invoke_fused_moe_opt` 在 prefill `M ≥ ~100` 时触发 DLEOL assert(`tu_program.cc:625` stride 对齐 → SIGSEGV)。稳定的 serving 配方把融合路径与**分块 prefill**(`chunked_prefill_size=16`)配合,让每次 forward 的 MoE batch 保持 `M ≤ 16`,远离该 assert。长 prefill 从 33 s 降到暖态 5 s,输出连贯。
 
 ---
 
@@ -236,7 +236,7 @@ vLLM    TPOT = GPU_forward(~18,  有融合) + host(6)   = 24 ms
 
 ### 5.5 为什么 SGLang 拿不到这些融合
 
-因为 SGLang 的 `torch.compile` **在登临上一开就崩**:
+因为 SGLang 的 `torch.compile` **在DLIN上一开就崩**:
 
 ```
 enable_torch_compile=True
@@ -244,7 +244,7 @@ enable_torch_compile=True
   → GDN conv kernel 期望 USE_GDC;SGLang 的调用没传
 ```
 
-vLLM 之所以能在登临上成功编译,是因为它带了一整套 **`dl_platform_plugin`**,专门处理登临特有的编译问题(kernel 签名、PDL primitive、算子注册)。SGLang 没有等价物。所以差距不是"登临不支持 compile"——vLLM 已经证伪了这点——而是**"SGLang 缺少登临的 compile 集成层"**。
+vLLM 之所以能在DLIN上成功编译,是因为它带了一整套 **`dl_platform_plugin`**,专门处理DLIN特有的编译问题(kernel 签名、PDL primitive、算子注册)。SGLang 没有等价物。所以差距不是"DLIN不支持 compile"——vLLM 已经证伪了这点——而是**"SGLang 缺少DLIN的 compile 集成层"**。
 
 ### 5.6 测量方法
 
@@ -301,13 +301,13 @@ vLLM 之所以能在登临上成功编译,是因为它带了一整套 **`dl_plat
 | "CUDA Graph 是净负收益,用 eager" | 本模型上错误 | 35B 混合模型上 CG **净正收益**(B=1 eager 7.2 → CG 16.7 tok/s)。早先结论来自 1.7B dense 模型。 |
 | "GDN 循环 kernel 是瓶颈" | 推翻 | `dlPTI` 显示 GDN 循环约 0.5 ms(1.3%)。MoE 修复后,剩余差距是 compile 融合。 |
 
-**净立场:**SGLang 在登临上能正确运行 Qwen3.5-35B-A3B-FP8、能对外提供服务,TP4 decode 延迟在 vLLM 的约 14% 以内,聚合吞吐持平。我们*尚未*在延迟上超过 vLLM,但精确知道原因:`torch.compile` 融合差距。投机解码的吞吐数字在 verify 路径回归修好之前,都带明确的质量星号。
+**净立场:**SGLang 在DLIN上能正确运行 Qwen3.5-35B-A3B-FP8、能对外提供服务,TP4 decode 延迟在 vLLM 的约 14% 以内,聚合吞吐持平。我们*尚未*在延迟上超过 vLLM,但精确知道原因:`torch.compile` 融合差距。投机解码的吞吐数字在 verify 路径回归修好之前,都带明确的质量星号。
 
 ---
 
 ## 8. 修复路径 —— DLIN `torch.compile` 集成
 
-既然根因是"SGLang 的 compile 在登临上崩",唯一能真正闭合差距的路径,就是让 compile 跑通,从而继承 `norm_quant`/`act_quant` 融合。预期收益:GPU forward 20.7 → 约 18 ms,叠加 SGLang 略低的 host,TPOT 进 23–24 ms 区间——与 vLLM 竞争。**图 3** 把这项工作放在优化轨迹上定位。
+既然根因是"SGLang 的 compile 在DLIN上崩",唯一能真正闭合差距的路径,就是让 compile 跑通,从而继承 `norm_quant`/`act_quant` 融合。预期收益:GPU forward 20.7 → 约 18 ms,叠加 SGLang 略低的 host,TPOT 进 23–24 ms 区间——与 vLLM 竞争。**图 3** 把这项工作放在优化轨迹上定位。
 
 ![图 3 — GPU forward 优化轨迹](figures/fig3-optimization-journey.zh.svg)
 
@@ -318,7 +318,7 @@ vLLM 之所以能在登临上成功编译,是因为它带了一整套 **`dl_plat
 解决了四个阻塞点:
 
 1. **GDN conv 的 `USE_GDC` 签名。**Triton kernel 用了 `**pdl_kwargs`(动态 dict);Inductor 的严格签名检查拒绝它。在 GDN、Mamba、elementwise、FP8 kernel 上全部改成显式 `USE_GDC=...` constexpr。
-2. **`gdc_wait` / `gdc_launch_dependents` 桩。**登临 Triton 没有这两个 PDL primitive;Inductor 解析 kernel AST 时 `getattr` 它们并崩。加了 `@triton.jit` 的 no-op device-function 桩。
+2. **`gdc_wait` / `gdc_launch_dependents` 桩。**DLIN Triton 没有这两个 PDL primitive;Inductor 解析 kernel AST 时 `getattr` 它们并崩。加了 `@triton.jit` 的 no-op device-function 桩。
 3. **DLIN 自定义 op 的 FakeTensor(抽象)实现。**没有它们,Inductor 会*分解* DLIN op(图膨胀:capture 306 s,decode 82 ms 对比基线 27 ms)。有了它们,Inductor 把调好的 DLIN kernel 当 opaque 保留:
 
    ```python
@@ -347,13 +347,13 @@ vLLM 之所以能在登临上成功编译,是因为它带了一整套 **`dl_plat
 
 ### 8.3 备选方案
 
-每次 compile 迭代都要一次模型加载(共享存储争用下 10–30 分钟)。若太慢,可走**路线 B**:请登临 kernel 团队把融合 kernel(norm+FP8 量化、act+量化)做成 `_dl_C.so` 里的独立 op,SGLang 直接调用,绕开 `torch.compile`。
+每次 compile 迭代都要一次模型加载(共享存储争用下 10–30 分钟)。若太慢,可走**路线 B**:请DLIN kernel 团队把融合 kernel(norm+FP8 量化、act+量化)做成 `_dl_C.so` 里的独立 op,SGLang 直接调用,绕开 `torch.compile`。
 
 ---
 
 ## 9. 已验证的 serving 配方
 
-下面的配置是登临 KS38 / TP4 上已验证、稳定的 serving 设置(长时间在线运行无崩溃):
+下面的配置是DLIN KS38 / TP4 上已验证、稳定的 serving 设置(长时间在线运行无崩溃):
 
 ```bash
 DLEOL_CACHE_SIZE=1024 \
@@ -383,7 +383,7 @@ python -m sglang.launch_server \
 1. **一套自洽的论证加上 profile 数据,仍可能是错的。**"两引擎用同一份 `.so`,所以 forward 时间相等"——逻辑成立,但建立在一个未经验证的前提上(两引擎实际跑同一批 kernel)。当所有合理修复都失效时,先质疑测量地基。
 2. **对"算错了"类缺陷,先和参考实现做输入的逐字节对比。**tensor-dump 工具一下午就解决了最难的正确性 bug,之前却是几小时的错误猜测。
 3. **防御性代码常是移植性缺陷。**`.contiguous()` 之类"更稳妥"的调用,经常破坏那些硬编码 stride/布局假设的 kernel。
-4. **在新 GPU 上,差距往往在 compile 集成层,而非 kernel。**登临的原语是够的——vLLM 已证明。SGLang 的欠缺,是教会 Inductor 这些登临 op 长什么样。
+4. **在新 GPU 上,差距往往在 compile 集成层,而非 kernel。**DLIN的原语是够的——vLLM 已证明。SGLang 的欠缺,是教会 Inductor 这些DLIN op 长什么样。
 5. **对不公平基准测试保持警惕。**本项目里每一个后来被推翻的"我们超过 vLLM"数字,都是不对等比较(CG 对 eager,或在损坏输出上的吞吐)。若某个数字好得过分,回头查分母。
 
 ---
@@ -405,4 +405,4 @@ python -m sglang.launch_server \
 
 ---
 
-*小结。SGLang 在登临 GPU 上能正确运行 Qwen3.5-35B-A3B-FP8 并对外提供服务;GPU 原语与 vLLM 完全相同;剩余的 decode 延迟差距,是 SGLang 的 DLIN compile 集成层尚未提供的 `torch.compile` IR 级融合。闭合它是一项工程任务,不是硬件限制——而且正在进行中。*
+*小结。SGLang 在DLIN GPU 上能正确运行 Qwen3.5-35B-A3B-FP8 并对外提供服务;GPU 原语与 vLLM 完全相同;剩余的 decode 延迟差距,是 SGLang 的 DLIN compile 集成层尚未提供的 `torch.compile` IR 级融合。闭合它是一项工程任务,不是硬件限制——而且正在进行中。*

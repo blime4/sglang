@@ -137,7 +137,7 @@ def _resolve_platform() -> SRTPlatform:
         # DLIN box resolves to DlinSRTPlatform (and current_platform.is_dlin()
         # is True).
         if _is_dlin_available():
-            logger.debug("DLIN (登临) GPU detected. Using DlinSRTPlatform.")
+            logger.debug("DLIN (DLIN) GPU detected. Using DlinSRTPlatform.")
             return DlinSRTPlatform()
         # DL end
         if _is_cuda_available():
