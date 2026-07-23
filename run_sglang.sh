@@ -551,10 +551,18 @@ sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
   ./run_sglang.sh compare --history              # print the commit-keyed results log (no GPU run)
   ./run_sglang.sh compare --no-record            # run but don't append to the JSON store
   ./run_sglang.sh compare --baseline r001        # diff the new run vs run r001 (else vs previous)
+  # FULL showcase (all 8 scenarios, ~25-30 min; vLLM re-prefills so it is slow):
+  ./run_sglang.sh compare --scenarios SC1,SC2,SC3,SC5,SC7,SC8,SC9,SC10
   ./run_sglang.sh chat                           # interactive chat (connect to existing server on :30000)
   ./run_sglang.sh chat -q "hello"                # quick single message
   ./run_sglang.sh chat --url http://10.0.0.1:30000/v1   # custom endpoint
   ./run_sglang.sh chat --chat-model Qwen3-1.7B --system-prompt "You are helpful"
+  Scenarios: SC1 prefix-share, SC2 multi-turn, SC3 batch, SC4 JSON,
+    SC5 multi-user fork (radix tree), SC7 long-RAG throughput, SC8 parallel
+    sampling (best-of-N), SC9 pure long decode (decode-bound control),
+    SC10 shared system-prompt throughput. SC5/SC7/SC8/SC10 = sglang wins
+    (RadixAttention); SC9 = vLLM-favored control. See
+    docs/dl/sglang-vs-vllm-new-scenarios.md.
   Runs both engines on the same GPUs (fresh process each), caches metrics to
   /tmp/sglang_compare. vLLM runs APC-OFF — its prefix cache can't be enabled on
   this hybrid Mamba model (MRV2 rejects mamba_cache_mode='align'). See
@@ -973,7 +981,12 @@ phase_chat() {
 #   --only sglang|vllm  re-measure just that side and diff vs the cached metrics
 #                       of the other (skip its ~90s load). Useful when iterating
 #                       on one engine.
-#   --scenarios SC1,SC2,SC3[,SC4]  default SC1,SC2,SC3 (SC4=JSON).
+#   --scenarios SC1,SC2,SC3[,SC4,SC5,SC7,SC8,SC9,SC10]
+#                       default SC1,SC2,SC3. SC4=JSON. DL: SC5=multi-user fork
+#                       (radix tree), SC7=long-RAG throughput, SC8=parallel
+#                       sampling (best-of-N), SC9=pure long decode (control),
+#                       SC10=shared system-prompt throughput. The full showcase
+#                       (all 8) is slow on vLLM (it re-prefills); ~25-30 min.
 #
 #   NOTE: the showcase script is Qwen3.5-35B-A3B-FP8 / TP4 specific (hardcoded
 #   prompts + the FP8 fused-MoE path). -M is accepted but only to set TP/mem env;
@@ -1121,6 +1134,30 @@ phase_compare() {
   if grep -q '^METRIC SC4_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
      || grep -q '^METRIC SC4_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
     _compare_row "SC4 JSON (tok/s)"      SC4_tps            higher
+  fi
+  # DL: SC5 multi-user fork (radix tree), SC7 long-RAG throughput, SC8 parallel
+  # sampling (decode-bound control). Conditional rows — render only if the
+  # scenario was run (--scenarios SC5,SC7,SC8). See showcase_prefix_sharing.py.
+  if grep -q '^METRIC SC5_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC5_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC5 fork total (ms)"   SC5_total_ms       lower
+    _compare_row "SC5 fork avg-turn(ms)" SC5_avg_turn_ms    lower
+  fi
+  if grep -q '^METRIC SC7_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC7_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC7 long-RAG (tok/s)"  SC7_throughput_tps higher
+  fi
+  if grep -q '^METRIC SC8_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC8_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC8 parallel-samp(t/s)" SC8_tps           higher
+  fi
+  if grep -q '^METRIC SC9_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC9_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC9 pure decode (t/s)"  SC9_tps           higher
+  fi
+  if grep -q '^METRIC SC10_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC10_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC10 sys-prompt(t/s)"  SC10_throughput_tps higher
   fi
   echo  "  ======================================================================="
   log "metrics cached: $COMPARE_METRICS_DIR/metrics_{sglang,vllm_mrv1,vllm_mrv2}.txt"

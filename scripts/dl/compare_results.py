@@ -50,6 +50,12 @@ HEADLINE = [
     ("SC1_speedup_x",     "SC1 speedup",  "high"),
     ("SC2_turn5_ms",      "SC2 turn5 ms", "low"),
     ("SC3_throughput_tps","SC3 tok/s",    "high"),
+    # DL: new candidate scenarios (render as FAIL/blank if not run).
+    ("SC5_total_ms",      "SC5 fork ms",  "low"),
+    ("SC7_throughput_tps","SC7 RAG t/s",  "high"),
+    ("SC8_tps",           "SC8 samp t/s", "high"),
+    ("SC9_tps",           "SC9 decode t/s","high"),
+    ("SC10_throughput_tps","SC10 sysprompt t/s", "high"),
 ]
 ENGINE_ORDER = ["sglang", "vllm_mrv2", "vllm_mrv1"]
 ENGINE_LABEL = {"sglang": "sglang", "vllm_mrv2": "vLLM-MRV2", "vllm_mrv1": "vLLM-MRV1"}

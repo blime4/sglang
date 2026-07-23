@@ -276,6 +276,94 @@
           "SC3_throughput_tps": 21.4
         }
       }
+    },
+    {
+      "id": "r007",
+      "timestamp": "2026-07-24T02:48:52",
+      "sglang_commit": "ba1bab09de",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC5",
+        "SC7",
+        "SC8",
+        "SC10"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC10_throughput_tps": 13.3,
+          "SC10_total_ms": 21705.0,
+          "SC5_avg_turn_ms": 1652.0,
+          "SC5_total_ms": 13215.0,
+          "SC7_throughput_tps": 13.0,
+          "SC7_total_ms": 14801.0,
+          "SC8_tps": 22.2
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC10_throughput_tps": 1.9,
+          "SC10_total_ms": 151442.0,
+          "SC5_avg_turn_ms": 13504.0,
+          "SC5_total_ms": 108032.0,
+          "SC7_throughput_tps": 0.8,
+          "SC7_total_ms": 227106.0
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r008",
+      "timestamp": "2026-07-24T03:26:41",
+      "sglang_commit": "ba1bab09de",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC5",
+        "SC7",
+        "SC8",
+        "SC9",
+        "SC10"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC10_throughput_tps": 13.4,
+          "SC10_total_ms": 21532.0,
+          "SC5_avg_turn_ms": 1653.0,
+          "SC5_total_ms": 13222.0,
+          "SC7_throughput_tps": 13.0,
+          "SC7_total_ms": 14809.0,
+          "SC8_tps": 22.2,
+          "SC9_tps": 30.5
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC10_throughput_tps": 1.9,
+          "SC10_total_ms": 152397.0,
+          "SC5_avg_turn_ms": 13578.0,
+          "SC5_total_ms": 108627.0,
+          "SC7_throughput_tps": 0.8,
+          "SC7_total_ms": 228318.0,
+          "SC8_tps": 3.8,
+          "SC9_tps": 39.6
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
     }
   ]
 }

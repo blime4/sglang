@@ -19,8 +19,19 @@
 | **SC3 并发批** 单请求 | **5.34 s** | 12.5 s | **sglang 2.3× 快** |
 | SC4 结构化 JSON（短 prompt，预热后） | 31.7 tok/s | 34.6 tok/s | vLLM +9%（基本持平） |
 | 纯 decode TPOT（无前缀） | 35.0 tok/s | 37.9 tok/s | vLLM +8% |
+| **SC5 多用户 fork**（共享根的 2 分支 radix 树） | **13.2 s** | 108.0 s | **sglang 8.2× 快** ✅ |
+| **SC7 长 RAG 吞吐**（~2K 文档 × 8 查询） | **13.0 tok/s** | 0.8 tok/s | **sglang 16.3× 高** ✅ |
+| **SC8 best-of-N 并行采样**（n=4，temp=0.7） | **22.2 tok/s** | 3.8 tok/s | **sglang 5.8× 高** ✅ |
+| **SC10 共享 system-prompt**（12 租户） | **13.4 tok/s** | 1.9 tok/s | **sglang 7.05× 高** ✅ |
+| SC9 纯长 decode（短 prompt，128 tok，无共享） | 30.5 tok/s | **39.6 tok/s** | vLLM 1.30×（诚实控制组）⚠️ |
 
 **一句话**：sglang 在**所有"前缀/多轮/并发"缓存复用场景**全面领先 1.6–2.3×；**vLLM 的 APC（前缀缓存）在本模型上根本无法开启**（硬 assert 失败）。vLLM 仅在**无缓存复用的纯 decode / 短 JSON** 上略快 ~8–9%。
+
+> **2026-07-24 新增场景**（SC5/SC7/SC8/SC9/SC10）：多用户 fork 树、长 RAG 吞吐、
+> best-of-N 并行采样、纯 decode 控制、共享 system-prompt 多租户。SC5/SC7/SC10 把
+> sglang 的领先从 1.6–2.3× 拉到 **7–16×**（前缀越长/复用越多，vLLM 重 prefill 越惨）。
+> 详见 [`sglang-vs-vllm-new-scenarios.md`](sglang-vs-vllm-new-scenarios.md)。运行：
+> `./run_sglang.sh compare --scenarios SC5,SC7,SC8,SC9,SC10`。
 
 ---
 

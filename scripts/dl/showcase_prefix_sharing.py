@@ -133,6 +133,107 @@ def build_multi_turn():
     return turns
 
 
+def build_long_doc(target_words=1150):
+    """DL: build a ~2K-token shared document (RAG-scale prefix).
+
+    SHARED_PREFIX (~700 tokens) + a repeated dense paragraph grown to
+    ~target_words. A LONG prefix makes re-prefill (vLLM APC-off) expensive,
+    which isolates the RadixAttention cross-request reuse win at RAG scale —
+    the whole point of SC7. Repeated prose is fine: SC7 measures prefill
+    compute cost, not semantics (output is ignore_eos fixed-length).
+    """
+    para = ("The KS38 heterogeneous accelerator combines 32 processing units "
+            "across 8 boards with 4 QUAD modules each, delivering 192 FP8 "
+            "TFLOPS per QUAD and 1.2 TB/s HBM bandwidth, programmed via the "
+            "DLCC toolchain with PDL dependent-launch and the DLEOL JIT layer. ")
+    body = SHARED_PREFIX + "\n## Extended Technical Notes\n\n"
+    while len(body.split()) < target_words:
+        body += para
+    return body
+
+
+def build_fork_users():
+    """DL: two independent 4-turn conversations sharing a common root prefix.
+
+    Exercises a 2-branch radix tree (the structure RadixAttention is named
+    for): both users share the system/context root, then each grows its OWN
+    branch. Distinct from SC2 (one linear conversation) and SC1 (flat prefix,
+    unrelated questions). Production shape: multiple users / agents behind a
+    shared system prompt.
+    """
+    user_a = [
+        "What is the FP8 throughput of a single QUAD on the KS38?",
+        "And the total across all 32 QUADs?",
+        "How much HBM bandwidth supports that compute?",
+        "Summarize the compute capability in one sentence.",
+    ]
+    user_b = [
+        "What compiler toolchain does the KS38 use?",
+        "What is DLEOL and what does it do?",
+        "Why must custom_all_reduce be disabled on DLIN?",
+        "What DLEOL_CACHE_SIZE is recommended and why?",
+    ]
+    return user_a, user_b
+
+
+def build_rag_questions():
+    """DL: 16 diverse short questions over the long shared doc (SC7)."""
+    return [
+        "What is the FP8 throughput per QUAD?",
+        "How much L2 cache does the KS38 have?",
+        "What is the HBM bandwidth per QUAD?",
+        "What page size is used for KV cache management?",
+        "Why prefer FP8 over BF16 on KS38?",
+        "What is DLEOL_CACHE_SIZE recommended value?",
+        "Which all-reduce mode should be disabled?",
+        "What is the L1 cache size per SM?",
+        "What compiler toolchain does KS38 use?",
+        "How many experts does the MoE routing use?",
+        "What is the BF16 throughput per QUAD?",
+        "How many QUADs are on each board?",
+        "What interconnect is used for host-device communication?",
+        "What is the decode throughput for a 35B MoE model?",
+        "What does PDL stand for?",
+        "How much cluster memory per QUAD?",
+    ]
+
+
+def build_tenant_questions():
+    """DL: 24 diverse short questions for the shared system-prompt scenario (SC10).
+
+    All share the SAME ~0.9K-token system/context prefix (SHARED_PREFIX) — the
+    canonical production RadixAttention shape: one chatbot/agent system prompt
+    served to many users. Distinct from SC7 (3K doc RAG) by short prefix +
+    higher request count.
+    """
+    return [
+        "What is the FP8 throughput per QUAD?",
+        "How much L2 cache does the KS38 have?",
+        "What is the HBM bandwidth per QUAD?",
+        "What page size is used for KV cache management?",
+        "Why prefer FP8 over BF16 on KS38?",
+        "What is the recommended DLEOL_CACHE_SIZE?",
+        "Which all-reduce mode should be disabled?",
+        "What is the L1 cache size per SM?",
+        "What compiler toolchain does KS38 use?",
+        "How many experts does the MoE routing use?",
+        "What is the BF16 throughput per QUAD?",
+        "How many QUADs are on each board?",
+        "What interconnect is used host-device?",
+        "What is the decode throughput for a 35B MoE model?",
+        "What does PDL stand for?",
+        "How much cluster memory per QUAD?",
+        "How many processing units does the KS38 have?",
+        "How many boards are in the KS38?",
+        "What is the FP32 throughput per QUAD?",
+        "What is the L2 cache latency in cycles?",
+        "What is the INT8 throughput per QUAD?",
+        "What is the cluster memory latency in cycles?",
+        "What does DLEOL stand for?",
+        "What is the HBM latency in cycles?",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Individual showcase scenarios. Each returns a metrics dict (KEY=value, all
 # lower-level numbers are floats/ints) so run_sglang.sh's `compare` phase can
@@ -271,6 +372,190 @@ def run_sc4(engine_name, raw, json_schema):
     return {"SC4_tps": f"{json_tps:.1f}", "SC4_valid": "1" if json_valid else "0"}
 
 
+def run_sc5(engine_name, generate):
+    """DL: SC5 — Multi-user fork (2-branch radix tree).
+
+    Two users each hold a 4-turn conversation over a SHARED system/context
+    root, interleaved. RadixAttention caches the root once and each user's
+    growing branch; vLLM (APC unsupported on this hybrid Mamba) re-prefills
+    the whole conversation every turn. Distinct from SC2 (one linear convo)
+    and SC1 (flat prefix, unrelated questions) — this is a branching tree,
+    the structure RadixAttention is named for. Production shape: N users /
+    agents behind one system prompt.
+    """
+    print(f"\n[showcase] === SC5: Multi-user Fork (2 users x 4 turns, shared root) ===", flush=True)
+    user_a, user_b = build_fork_users()
+    # Interleave so both branches grow from the shared root in one pass.
+    order = [("A", user_a[0]), ("B", user_b[0]),
+             ("A", user_a[1]), ("B", user_b[1]),
+             ("A", user_a[2]), ("B", user_b[2]),
+             ("A", user_a[3]), ("B", user_b[3])]
+
+    def _txt(out):
+        if isinstance(out, dict):
+            t = out.get("text", str(out))
+            return t[0] if isinstance(t, list) else t
+        if isinstance(out, list):
+            return out[0]
+        return str(out)
+
+    def one_pass():
+        hist = {"A": SHARED_PREFIX, "B": SHARED_PREFIX}
+        t0 = time.perf_counter()
+        for who, q in order:
+            prompt = hist[who] + f"\n\nUser: {q}\nAssistant:"
+            out = generate(prompt, max_new=24, ignore_eos=True)
+            hist[who] = prompt + " " + _txt(out)
+        return time.perf_counter() - t0
+
+    one_pass()  # warmup: populate the radix tree for both branches
+    times = [one_pass() for _ in range(2)]
+    best = min(times)
+    avg_turn = best / 8 * 1000
+    print(f"[showcase] SC5 {engine_name}: best_total={best*1000:.0f}ms  "
+          f"avg_turn={avg_turn:.0f}ms  reps={[f'{t*1000:.0f}' for t in times]} ms", flush=True)
+    return {"SC5_total_ms": f"{best*1000:.0f}", "SC5_avg_turn_ms": f"{avg_turn:.0f}"}
+
+
+def run_sc7(engine_name, generate):
+    """DL: SC7 — Long-prefix RAG throughput (~2K shared doc, 8 queries).
+
+    A long shared document (~2K tokens) + 8 diverse short questions, sent as
+    SEQUENTIAL requests. RadixAttention prefills the doc once and each query
+    only extends its short suffix; vLLM (APC-off) re-prefills the full doc on
+    all 8. Reported as aggregate decode throughput (best-of-2 after warmup),
+    which isolates the cross-request reuse win at RAG scale — bigger prefix
+    and throughput-focused vs SC1 (per-request latency, 8 reqs, ~0.9K prefix).
+    """
+    print(f"\n[showcase] === SC7: Long-RAG Throughput (~2K shared doc, 8 queries) ===", flush=True)
+    doc = build_long_doc()
+    questions = build_rag_questions()[:8]   # 8 queries (vLLM re-prefills the doc each)
+    ntok = len(doc.split())  # ~word count, logged for reference
+    total_decode = len(questions) * 24
+
+    def one_pass():
+        t0 = time.perf_counter()
+        for q in questions:
+            generate(doc + "\n\nQ: " + q + "\nA:", max_new=24, ignore_eos=True)
+        return time.perf_counter() - t0
+
+    one_pass()  # warmup: cache the long doc once
+    times = [one_pass() for _ in range(2)]
+    best = min(times)
+    tps = total_decode / best
+    print(f"[showcase] SC7 {engine_name}: doc~{ntok}words  best={best*1000:.0f}ms  "
+          f"throughput={tps:.1f} tok/s  reps={[f'{t*1000:.0f}' for t in times]} ms", flush=True)
+    return {"SC7_throughput_tps": f"{tps:.1f}", "SC7_total_ms": f"{best*1000:.0f}"}
+
+
+def run_sc8(engine_name, generate):
+    """DL: SC8 — Parallel sampling (best-of-N, n=4) over a substantive prompt.
+
+    One ~0.9K-token prompt, n=4 candidate completions (temperature=0.7),
+    single generate call. The prompt is prefilled ONCE and forked into 4
+    decode sequences in BOTH engines (APC is irrelevant within one call), so
+    this is prefill+decode. On DLIN, vLLM's prefill of the 0.9K prompt is
+    slow (~75 tok/s), so sglang's much faster prefill wins overall despite
+    vLLM's decode-IPC edge. Production shape: best-of-N / RLHF rejection
+    sampling over a real (non-trivial) prompt. (Pure decode, no shared
+    structure, is SC9 — the honest vLLM-favored control.)
+    """
+    print(f"\n[showcase] === SC8: Parallel Sampling (best-of-N, n=4, temp=0.7) ===", flush=True)
+    prompt = (SHARED_PREFIX + "\n\nWrite a concise technical summary of the "
+              "KS38 architecture, compute, and memory hierarchy.\n\nSummary:")
+    max_new = 48
+
+    def _samples(out):
+        # Normalize all engines' n>1 returns to a list[str]:
+        #   sglang -> [{"text": s1,...}, ...]  (list of dicts)  [offline Engine n>1]
+        #          OR {"text": [s1,...,s4]}    (dict of list)
+        #   vLLM   -> [s1, s2, s3, s4]         (list of str)
+        def _str(x):
+            if isinstance(x, dict):
+                return x.get("text", str(x))
+            return str(x)
+        if isinstance(out, dict):
+            t = out.get("text", "")
+            if isinstance(t, list):
+                return [_str(x) for x in t]
+            return [str(t)]
+        if isinstance(out, list):
+            return [_str(x) for x in out]
+        return [str(out)]
+
+    for _ in range(2):  # warmup (best-of-N needs sampling, NOT greedy)
+        generate(prompt, max_new=max_new, ignore_eos=True, n=4, temperature=0.7)
+    best, samples = 999, []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        outs = generate(prompt, max_new=max_new, ignore_eos=True, n=4, temperature=0.7)
+        best = min(best, time.perf_counter() - t0)
+        samples = _samples(outs)
+    tps = (4 * max_new) / best
+    sample = (samples[0][:60] if samples else "")
+    print(f"[showcase] SC8 {engine_name}: best={best*1000:.0f}ms  tok/s={tps:.1f}  "
+          f"n=4 x {max_new}tok  n_samples={len(samples)}  sample={sample!r}", flush=True)
+    return {"SC8_tps": f"{tps:.1f}"}
+
+
+def run_sc10(engine_name, generate):
+    """DL: SC10 — Shared system prompt, many tenants (aggregate throughput).
+
+    12 independent short requests, all sharing the SAME ~0.9K-token
+    system/context prefix (SHARED_PREFIX). The canonical production
+    RadixAttention shape: one chatbot / agent system prompt served to many
+    users. RadixAttention prefills the system prompt once and each tenant
+    extends only its short question; vLLM (APC-off) re-prefills the system
+    prompt on all 12. Reported as aggregate decode throughput (best-of-2 after
+    warmup). Distinct from SC7 (~2K long-doc RAG) by a ~2x shorter prefix and
+    more requests; from SC1 (per-request latency, 8 reqs) by throughput metric.
+    """
+    print(f"\n[showcase] === SC10: Shared System-Prompt Throughput (12 tenants) ===", flush=True)
+    sys_prompt = SHARED_PREFIX
+    questions = build_tenant_questions()[:12]   # 12 tenants share the system prompt
+    total_decode = len(questions) * 24
+
+    def one_pass():
+        t0 = time.perf_counter()
+        for q in questions:
+            generate(sys_prompt + "\n\nQ: " + q + "\nA:", max_new=24, ignore_eos=True)
+        return time.perf_counter() - t0
+
+    one_pass()  # warmup: cache the shared system prompt once
+    times = [one_pass() for _ in range(2)]
+    best = min(times)
+    tps = total_decode / best
+    print(f"[showcase] SC10 {engine_name}: tenants={len(questions)}  best={best*1000:.0f}ms  "
+          f"throughput={tps:.1f} tok/s  reps={[f'{t*1000:.0f}' for t in times]} ms", flush=True)
+    return {"SC10_throughput_tps": f"{tps:.1f}", "SC10_total_ms": f"{best*1000:.0f}"}
+
+
+def run_sc9(engine_name, generate):
+    """DL: SC9 — Pure long decode (short prompt) — decode-bound CONTROL / loss.
+
+    A SHORT prompt (~14 tokens) + a 128-token single-stream greedy decode,
+    best-of-3. Prefill is negligible, so this is dominated by raw decode TPOT —
+    where vLLM holds its DLIN IPC edge. The honest counterpoint to SC5/7/8/10:
+    with NO shared structure to reuse, vLLM's faster decode wins. Recorded as a
+    known sglang loss (the decode-IPC gap). Expected: vLLM faster (loss).
+    """
+    print(f"\n[showcase] === SC9: Pure Long Decode (short prompt, 128 tok) [decode-bound] ===", flush=True)
+    prompt = ("Write a detailed technical essay about the future of heterogeneous "
+              "AI accelerators and their software stacks.")
+    max_new = 128
+    for _ in range(3):  # warmup the decode CG path
+        generate(prompt, max_new=16, ignore_eos=True)
+    best = 999
+    for _ in range(3):
+        t0 = time.perf_counter()
+        generate(prompt, max_new=max_new, ignore_eos=True)
+        best = min(best, time.perf_counter() - t0)
+    tps = max_new / best
+    print(f"[showcase] SC9 {engine_name}: best={best*1000:.0f}ms  tok/s={tps:.1f}  "
+          f"{max_new}tok single-stream greedy", flush=True)
+    return {"SC9_tps": f"{tps:.1f}"}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", default="sglang", choices=["sglang", "vllm"])
@@ -279,15 +564,20 @@ def main():
                              "MRV1 enforces eager to avoid the DLIN torch.compile crash.")
     parser.add_argument("--mem-frac", type=float, default=0.55)
     parser.add_argument("--scenarios", default="SC1,SC2,SC3",
-                        help="comma list of SC1/SC2/SC3/SC4 (default SC1,SC2,SC3; "
-                             "SC4=JSON. SC1 cold is ~90s — skip it for a fast check.)")
+                        help="comma list of SC1/SC2/SC3/SC4/SC5/SC7/SC8/SC10 "
+                             "(default SC1,SC2,SC3). SC4=JSON. SC1 cold ~90s. "
+                             "DL: SC5=multi-user fork (radix tree), "
+                             "SC7=long-RAG throughput (3K prefix, 16 queries), "
+                             "SC8=parallel sampling n=4 (decode-bound control), "
+                             "SC10=shared system-prompt throughput (24 tenants).")
     args = parser.parse_args()
     engine_name = args.engine
     runner = args.vllm_runner if engine_name == "vllm" else "sglang"
     enabled = {s.strip().upper() for s in args.scenarios.split(",") if s.strip()}
-    unknown = enabled - {"SC1", "SC2", "SC3", "SC4"}
+    unknown = enabled - {"SC1", "SC2", "SC3", "SC4", "SC5", "SC7", "SC8", "SC9", "SC10"}
     if unknown:
-        raise SystemExit(f"unknown scenario(s): {unknown} (valid: SC1 SC2 SC3 SC4)")
+        raise SystemExit(f"unknown scenario(s): {unknown} "
+                         f"(valid: SC1 SC2 SC3 SC4 SC5 SC7 SC8 SC9 SC10)")
 
     print(f"[showcase] engine={engine_name} runner={runner} model={MODEL} tp={TP} "
           f"scenarios={sorted(enabled)}", flush=True)
@@ -305,8 +595,11 @@ def main():
             chunked_prefill_size=512,
         )
         raw = engine
-        def generate(prompt, max_new=32, temperature=0.0):
-            return engine.generate(prompt, {"max_new_tokens": max_new, "temperature": temperature})
+        def generate(prompt, max_new=32, temperature=0.0, ignore_eos=False, n=1):
+            sp = {"max_new_tokens": max_new, "temperature": temperature, "ignore_eos": ignore_eos}
+            if n > 1:
+                sp["n"] = n
+            return engine.generate(prompt, sp)
         def generate_batch(prompts, max_new=32, temperature=0.0):
             return engine.generate(prompts, {"max_new_tokens": max_new, "temperature": temperature})
         def shutdown():
@@ -339,9 +632,12 @@ def main():
             llm_kwargs["enforce_eager"] = True
         llm = LLM(**llm_kwargs)
         raw = llm
-        def generate(prompt, max_new=32, temperature=0.0):
-            sp = SamplingParams(temperature=temperature, max_tokens=max_new)
+        def generate(prompt, max_new=32, temperature=0.0, ignore_eos=False, n=1):
+            sp = SamplingParams(temperature=temperature, max_tokens=max_new,
+                                ignore_eos=ignore_eos, n=n)
             out = llm.generate([prompt], sp)[0]
+            if n > 1:
+                return [o.text for o in out.outputs]
             return out.outputs[0].text
         def generate_batch(prompts, max_new=32, temperature=0.0):
             sp = SamplingParams(temperature=temperature, max_tokens=max_new)
@@ -361,12 +657,23 @@ def main():
     turns = build_multi_turn()
     metrics = {}
 
+    # DL: run each scenario in a guard so one scenario's crash doesn't abort
+    # the whole (long, JIT-heavy) run and wipe the other scenarios' metrics.
+    # A failed scenario is logged and skipped (absent from the METRICS block).
+    import traceback as _tb
+    def _run(name, fn, *a, **kw):
+        try:
+            metrics.update(fn(*a, **kw))
+        except Exception as e:  # noqa: BLE001 - benchmark must be resilient
+            print(f"[showcase] !! {name} FAILED ({type(e).__name__}): {e}", flush=True)
+            _tb.print_exc()
+
     if "SC1" in enabled:
-        metrics.update(run_sc1(engine_name, generate, questions))
+        _run("SC1", run_sc1, engine_name, generate, questions)
     if "SC2" in enabled:
-        metrics.update(run_sc2(engine_name, generate, turns))
+        _run("SC2", run_sc2, engine_name, generate, turns)
     if "SC3" in enabled:
-        metrics.update(run_sc3(engine_name, generate_batch, questions))
+        _run("SC3", run_sc3, engine_name, generate_batch, questions)
     if "SC4" in enabled:
         import json as _json
         json_schema = _json.dumps({
@@ -379,7 +686,17 @@ def main():
             },
             "required": ["name", "age", "occupation", "city"],
         })
-        metrics.update(run_sc4(engine_name, raw, json_schema))
+        _run("SC4", run_sc4, engine_name, raw, json_schema)
+    if "SC5" in enabled:
+        _run("SC5", run_sc5, engine_name, generate)
+    if "SC7" in enabled:
+        _run("SC7", run_sc7, engine_name, generate)
+    if "SC8" in enabled:
+        _run("SC8", run_sc8, engine_name, generate)
+    if "SC9" in enabled:
+        _run("SC9", run_sc9, engine_name, generate)
+    if "SC10" in enabled:
+        _run("SC10", run_sc10, engine_name, generate)
 
     # ---- Machine-readable metrics (parsed by run_sglang.sh `compare` phase) ----
     model_tag = os.path.basename(MODEL.rstrip("/"))
