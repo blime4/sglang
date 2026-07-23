@@ -126,6 +126,7 @@ SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
 # Enabled with -S / --spec-ngram. Needs the fused-MoE path + extra mem headroom
 # for the num_draft=8 draft tree; apply_ngram_overrides() sets those when on.
 USE_NGRAM="${USE_NGRAM:-0}"
+DL_WARMUP="${DL_WARMUP:-0}"    # -W/--dl-warmup: pre-compile fused-MoE prefill-M dlcc shapes at serve start
 NGRAM_NUM_DRAFT="${NGRAM_NUM_DRAFT:-8}"
 NGRAM_MIN_BFS="${NGRAM_MIN_BFS:-1}"
 NGRAM_MAX_BFS="${NGRAM_MAX_BFS:-1}"
@@ -202,12 +203,17 @@ pick_model() {
       # expert weights and needs several GB headroom, else OOM (docs §7.14). 0.85 OOMs.
       DLIN_MEM_FRACTION=0.60; DLIN_CONTEXT_LEN=4096; DLIN_PAGE_SIZE=16
       # DLIN MoE routing (see fp8.py + docs §7.13/§7.14):
-      #   FUSED_MAX_M=16  — fused (invoke_fused_moe_opt) for decode M=1 + NGRAM verify
-      #                     M≈9 + short prefill. CRASHES (dleol tu_program.cc:625) for
-      #                     M>=~100, so kept small for serving stability.
-      #   MAX_BF16_M=2048 — bf16-bmm (torch-native, stable) for larger prefill (17-2048).
-      #                     Slow but the only non-crashing path on dl24.
-      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=16 SGLANG_DL_MOE_MAX_BF16_M=2048
+      #   FUSED_MAX_M=2048 — fused (invoke_fused_moe_opt) for decode + ALL prefill
+      #                     (serve/gen default chunked_prefill_size=2048 on 32GB KS38;
+      #                     compare uses 512). Verified 2026-07-23: the prior "CRASHES
+      #                     (dleol tu_program.cc:625) for M>=~100" note was STALE — the
+      #                     dleol issue was fixed since; invoke_fused_moe_opt runs clean
+      #                     at M=2048 with output bit-identical to bf16-bmm (math 17x23=391,
+      #                     sc3-style "6144 TFLOPS" both paths). Raising 16->2048 makes
+      #                     prefill use the fast fused path instead of slow bf16-bmm:
+      #                     compare SC3 6.0->20.2 tok/s, SC1/SC2 prefill 2.5-5x faster.
+      #   MAX_BF16_M=2048 — bf16-bmm fallback only for M>2048 (shouldn't occur w/ chunk<=2048).
+      export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=2048 SGLANG_DL_MOE_MAX_BF16_M=2048
       # Matches the tuned TP4 config in scripts/dl/compare_tp4.py (~27ms TPOT = ~vLLM parity):
       # FP8 Q2 GEMM, DLIN GDN op, multi-step decode, FLA pingpong/unroll.
       export SGLANG_DL_FP8_Q2=1 SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MULTI_STEP=1
@@ -569,6 +575,9 @@ gen/serve options:
   -b, --backend NAME        attention backend (default fa3; do not use 'triton' on DLIN)
   -g, --cuda-graph          enable cuda graph (default off; safer on DLIN)
   -S, --spec-ngram          NGRAM spec-decode (qwen35-35b: num_draft=8; needs -M qwen35-35b)
+  -W, --dl-warmup           serve only: pre-compile fused-MoE prefill-M dlcc kernels at
+                            startup (~20s/shape one-time, cached). Shapes via
+                            $SGLANG_DL_MOE_WARMUP_SHAPES (default 64,256,512,1024,2048)
   --port N / --host H       serve only        (default 30000 / 127.0.0.1)
 # chat options:
 #   -q, --quick TEXT          single message (non-interactive)
@@ -622,6 +631,7 @@ parse_test_args() {
       -b|--backend)        ATTN_BACKEND="$2"; shift 2;;
       -g|--cuda-graph)     USE_CUDA_GRAPH=1; shift;;
       -S|--spec-ngram)     USE_NGRAM=1; shift;;
+      -W|--dl-warmup)      DL_WARMUP=1; shift;;
       --port)              SERVE_PORT="$2"; shift 2;;
       --host)              SERVE_HOST="$2"; shift 2;;
       # bench
@@ -720,11 +730,17 @@ phase_serve() {
   [ "$tp" -gt 1 ] && extra_flags="$extra_flags --disable-custom-all-reduce"
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
-  log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT | ngram=$USE_NGRAM"
+  # DL: -W/--dl-warmup pre-compiles fused-MoE dlcc kernels for common prefill-M
+  # shapes at startup (one-time per shape, cached at ~/.triton/cache). Shapes via
+  # $SGLANG_DL_MOE_WARMUP_SHAPES (csv; default 64,256,512,1024,2048). ~20s/shape
+  # first time. See python/sglang/srt/entrypoints/warmup.py:dlin_prefill_shapes.
+  local warmup_flags=""
+  [ "$DL_WARMUP" = "1" ] && warmup_flags="--warmups dlin_prefill_shapes"
+  log "model=$MODEL_PATH | tp=$tp | backend=$ATTN_BACKEND | page=$page_size | host=$SERVE_HOST:$SERVE_PORT | ngram=$USE_NGRAM | dl_warmup=${DL_WARMUP:-0}"
   exec python -m sglang.launch_server \
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
     --tp-size "$tp" \
-    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags $ngram_flags \
+    --attention-backend "$ATTN_BACKEND" $cg_flag $extra_flags $ngram_flags $warmup_flags \
     --skip-server-warmup \
     --port "$SERVE_PORT" --host "$SERVE_HOST"
 }

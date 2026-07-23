@@ -125,3 +125,46 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+# DL begin — DLIN prefill-shape warmup for the SGLANG_DL_MOE_FUSED fast path.
+# invoke_fused_moe_opt (fast fused FP8 MoE prefill kernel) is JIT-compiled by dlcc
+# PER prefill-M shape (~20s one-time each, cached at ~/.triton/cache). Without
+# warmup the first real request at each new M pays that ~20s spike (measured:
+# M=64 24.5s, M=256 20s first-hit; repeats 2s). This pre-compiles a configurable
+# set of M shapes at server start so common prompt sizes are fast from request #1.
+# NOTE: JIT is per-M, so this only covers the warmed shapes; unwarmed M still spike
+# on first hit. For continuous/variable prompt lengths the proper fix is an
+# M-agnostic kernel; this is a stopgap for predictable prompt sizes (e.g. a fixed
+# system prompt). Enable via `--warmups=dlin_prefill_shapes`. Shapes from
+# SGLANG_DL_MOE_WARMUP_SHAPES (csv), default covers small..large prefill.
+@warmup("dlin_prefill_shapes")
+async def dlin_prefill_shapes(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    import os
+
+    default_shapes = "64,256,512,1024,2048"
+    shapes = [
+        int(x)
+        for x in os.environ.get("SGLANG_DL_MOE_WARMUP_SHAPES", default_shapes).split(",")
+        if x.strip()
+    ]
+    logger.info(
+        "DL dlin_prefill_shapes warmup: sweeping M=%s "
+        "(~20s/shape first time; dlcc JIT cached after at ~/.triton/cache)",
+        shapes,
+    )
+    for size in tqdm.tqdm(shapes):
+        generate_req_input = GenerateReqInput(
+            input_ids=(np.random.randint(2**16, size=[size])).tolist(),
+            # max_new_tokens=1: the prefill forward through the MoE is what triggers
+            # the M-shape dlcc compile; one decode step is enough and keeps it fast.
+            sampling_params={"max_new_tokens": 1, "temperature": 0, "min_p": 0.0},
+        )
+        if disaggregation_mode != "null":
+            generate_req_input.bootstrap_room = 0
+            generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+    logger.info("DL dlin_prefill_shapes warmup done.")
+    # DL end
