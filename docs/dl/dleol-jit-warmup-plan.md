@@ -39,6 +39,28 @@ sglang 的对应物就是 `server_args.cuda_graph_config`:
 
 成功判据:真实请求期 jit_monitor 零 JIT 事件。
 
+### Phase 0 结果(2026-07-24,已实测)— capture-list warmup 对 prefill **不够**
+
+`serve -W`(44 个 capture size 全量预热完成)后,真实 text 请求计时:
+
+| 请求 | prompt_tok | 首命中 | 重复 |
+|---|---|---|---|
+| short | 144 | 3.52s | 0.59s |
+| mid(非 capture) | **929** | **18.01s JIT** | 2.35s |
+| long(非 capture) | **1858** | **22.26s JIT** | 0.69s |
+
+**结论:sglang 的 eager prefill 产生任意 M,不会 snap 到 capture size**(929 落在 capture
+896/960 之间、1858 落在 1792/2048 之间 → 都没被预热 → 仍 JIT ~18-22s)。capture-list warmup
+只覆盖**恰好等于 capture size 的 prefill**(罕见)+ decode(capture-sized batch)。
+**vLLM 不靠 per-shape warmup 消除 JIT —— 它是 AOT `_dl_C.so`,运行时零 JIT**;它的 capture-size
+warmup 是给 cuda-graph capture 用的,不是给 JIT 用的。所以 "vLLM-style capture-list warmup"
+在 sglang(DLIN,有 per-M JIT)上**无法达到零运行时 JIT**。
+
+→ 要真正零 JIT,只能:**Phase 3(M-agnostic kernel,根因解)**,或密集预热每个 M
+(类 voice_chat step=4,但启动极慢 + cache ship),或让 sglang 把 prefill M round 到
+capture size(开 prefill cuda-graph / 加 prefill bucketing —— 但 DLIN 上 prefill CG 现为
+disabled,需评估)。
+
 ## Phase 1 — capture-size-list warmup(已落地,微调)
 
 - `dlin_capture_sizes` 已读 prefill.bs + decode.bs 并逐大小预热。
