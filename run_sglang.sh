@@ -165,6 +165,7 @@ COMPARE_SCENARIOS="${COMPARE_SCENARIOS:-SC1,SC2,SC3}"
 COMPARE_ONLY="${COMPARE_ONLY:-}"                # --only sglang|vllm-mrv2|vllm-mrv1
 COMPARE_SHOW="${COMPARE_SHOW:-0}"               # --show: re-render table from cache, no GPU run
 COMPARE_HISTORY="${COMPARE_HISTORY:-0}"         # --history: print the results log, no GPU run
+COMPARE_LIST="${COMPARE_LIST:-0}"               # --list: print all scenarios + ASCII diagrams, no GPU run
 COMPARE_RECORD="${COMPARE_RECORD:-1}"           # --no-record: don't append to the JSON store
 COMPARE_BASELINE="${COMPARE_BASELINE:-}"        # --baseline <id|commit>: diff vs this (else previous run)
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
@@ -544,6 +545,7 @@ One-click run Qwen3.5-35B-A3B-FP8 (TP4) — the DEFAULT model for gen/serve:
   ./run_sglang.sh benchrun /path/config_serving.json       # run an existing vLLM-format config
 
 sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
+  ./run_sglang.sh compare --list                # list all scenarios + ASCII diagrams (no GPU run)
   ./run_sglang.sh compare                       # SC1+SC2+SC3, both engines, prints gap table
   ./run_sglang.sh compare --scenarios SC2,SC3   # skip the ~90s SC1 cold prefill
   ./run_sglang.sh compare --only sglang         # re-measure sglang only, diff vs cached vLLM
@@ -659,6 +661,7 @@ parse_test_args() {
       --only)              COMPARE_ONLY="$2"; shift 2;;
       --show)              COMPARE_SHOW=1; shift;;
       --history)           COMPARE_HISTORY=1; shift;;
+      --list)              COMPARE_LIST=1; shift;;
       --no-record)         COMPARE_RECORD=0; shift;;
        --baseline)          COMPARE_BASELINE="$2"; shift 2;;
       # chat
@@ -737,6 +740,12 @@ phase_serve() {
   [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
   # DL: TP>1 on DLIN must use NCCL — the custom allreduce kernel hits HC_CUK Error=28.
   [ "$tp" -gt 1 ] && extra_flags="$extra_flags --disable-custom-all-reduce"
+  # DL: opt-in segmented prefill CG via --cuda-graph-backend-prefill. "breakable"
+  # bypasses the multimodal auto-disable (server_args.py:1639 is tc_piecewise-only;
+  # breakable's only rule is MLA @ _disable_breakable_cudagraph_if_incompatible).
+  # Targets sglang raw-prefill 1.55x slower than vLLM (SC6: 49 vs 76 tok/s) by
+  # capturing prefill instead of eager. See opt-plan P1-1.
+  [ -n "$DL_PREFILL_BACKEND" ] && extra_flags="$extra_flags --cuda-graph-backend-prefill $DL_PREFILL_BACKEND"
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
   # DL: -W/--dl-warmup pre-compiles fused-MoE dlcc kernels at startup by iterating
@@ -787,6 +796,12 @@ start_server_bg() {  # launches launch_server detached; sets SERVER_PID
   [ -n "$cg_max_bs" ] && [ "$USE_CUDA_GRAPH" = "1" ] && extra_flags="$extra_flags --cuda-graph-max-bs-decode $cg_max_bs"
   # DL: TP>1 on DLIN must use NCCL — the custom allreduce kernel hits HC_CUK Error=28.
   [ "$tp" -gt 1 ] && extra_flags="$extra_flags --disable-custom-all-reduce"
+  # DL: opt-in segmented prefill CG via --cuda-graph-backend-prefill. "breakable"
+  # bypasses the multimodal auto-disable (server_args.py:1639 is tc_piecewise-only;
+  # breakable's only rule is MLA @ _disable_breakable_cudagraph_if_incompatible).
+  # Targets sglang raw-prefill 1.55x slower than vLLM (SC6: 49 vs 76 tok/s) by
+  # capturing prefill instead of eager. See opt-plan P1-1.
+  [ -n "$DL_PREFILL_BACKEND" ] && extra_flags="$extra_flags --cuda-graph-backend-prefill $DL_PREFILL_BACKEND"
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
   BENCH_LOG="${BENCH_LOG:-/tmp/sglang_bench_server.log}"
@@ -981,6 +996,8 @@ phase_chat() {
 #   --only sglang|vllm  re-measure just that side and diff vs the cached metrics
 #                       of the other (skip its ~90s load). Useful when iterating
 #                       on one engine.
+#   --list              print every scenario with an ASCII workload diagram + the
+#                       win/loss verdict (no GPU run) — then pick with --scenarios.
 #   --scenarios SC1,SC2,SC3[,SC4,SC5,SC7,SC8,SC9,SC10]
 #                       default SC1,SC2,SC3. SC4=JSON. DL: SC5=multi-user fork
 #                       (radix tree), SC7=long-RAG throughput, SC8=parallel
@@ -1018,7 +1035,88 @@ _compare_row() {  # $1=label  $2=KEY  $3=dir(lower|higher) — 3 engines: sglang
   printf "  %-24s | %-10s | %-10s | %-10s | %s\n" "$label" "$sd" "$m2d" "$m1d" "$verdict"
 }
 
+# Print every compare scenario with an ASCII diagram of its workload shape, the
+# win/loss verdict, and the typical ratio — so you can pick which to run via
+# --scenarios SCx,SCy. No GPU/model/env needed. (compare --list)
+_compare_list() {
+  cat <<'COMPARE_EOF'
+
+================ sglang vs vLLM — compare scenarios (--list) ================
+Each scenario is a distinct workload shape. Pick any subset:
+    ./run_sglang.sh compare --scenarios SC2,SC5,SC7            # comma-list
+    ./run_sglang.sh compare --scenarios SC5,SC7,SC8,SC9,SC10   # full new showcase
+Both engines: same model (Qwen3.5/3.6-35B-A3B-FP8), TP4, same GPUs, fresh
+process each, temp 0 (SC8/SC8b=0.7 for real best-of-N), best-of-2 after warmup.
+vLLM runs APC-OFF (its prefix cache is structurally unsupported on hybrid-Mamba),
+so it RE-PREFILLS shared prefixes; sglang RadixAttention keeps the shared KV.
+  => sglang wins every KV-reuse workload; vLLM wins raw decode.
+legend: [sglang win ~Nx] / [vLLM win ~Nx]   [probe] = rigor diagnostic
+
+---------------------------------------------------------------------------
+SC1  prefix-sharing  (flat prefix)                  [sglang win ~2.3x warm / 16.4x cold->warm]
+     [shared prefix] -- req1 (independent suffix)
+                    -- req2
+                    -- req3
+     cold: prefill the prefix; warm: cache hit -> skip prefill entirely.
+
+SC2  multi-turn  (single linear conversation)        [sglang win ~1.6x]
+     sys+history -> turn1 -> turn2 -> turn3 -> turn4 -> turn5   (one user, growing)
+     each turn extends the linear prefix; vLLM re-prefills the whole history each turn.
+
+SC3  concurrent batch  (one prefix, batched decodes) [sglang win ~2.3x  (prefill 3.4x)]
+     [shared prompt] -- fork to a BATCH of N decodes at once (one call, many outputs)
+     aggregate batch prefill+decode throughput. Prefill-bound (fused FP8 MoE).
+
+SC4  structured JSON  (short constrained decode)     [vLLM win ~+9%]
+     prompt -> { "name": "...", "age": ... }   (greedy JSON)
+     decode-bound, short output, NO prefix reuse -> raw decode + JSON path decides it.
+
+SC5  multi-user fork  (radix TREE, shared root)      [sglang win ~8.2x]
+                [shared system-prompt root]   <- prefill ONCE, KV shared
+                   /              \
+            user-A branch        user-B branch
+          turn1->2->3->4         turn1->2->3->4    (interleaved, branching tree)
+     multi-tenant / many users behind one system prompt.
+
+SC6  raw-prefill parity  (UNIQUE prompts, NO cache)  [probe -- vLLM actually ~1.55x FASTER]
+     unique prompt1   unique prompt2   ...   (distinct prefixes -> cache cannot hit)
+     isolates RAW prefill rate. Proves the SC5/7/8/10 wins are 100% caching,
+     NOT faster raw prefill (sglang 49 < vLLM 76 tok/s here).
+
+SC7  long-RAG throughput  (~2K doc x 8 queries)      [sglang win ~16.3x]
+     [~2K-token doc]   <- prefill once (sglang) / re-prefill EACH query (vLLM)
+          |- Q1 |
+          |- Q2 |    8 diverse queries over the SAME doc; aggregate decode tok/s.
+          |- ...|    RAG over a long shared document.
+
+SC8  repeated best-of-N  (RLHF loop, same prompt)    [sglang win ~5.8x  (= cache 3.9x x single 2.0x)]
+     [prompt]  <- reused across reps; sglang caches it
+       /  |  |  \     n=4 sampled completions (temp=0.7)
+      c1 c2 c3 c4
+     RLHF rejection-sampling loop. Cache-dominated; single-call best-of-N is SC8b (~2x).
+
+SC8b cold single-call best-of-N  (UNIQUE prompt)     [probe -- sglang ~2x]
+     unique prompt per call -> n=4 samples (no cross-call cache).
+     isolates single-call best-of-N edge from SC8's caching factor.
+
+SC9  pure long decode  (short prompt + 128 tok)      [vLLM win ~1.1-1.3x  (control)]
+     [short ~14-tok prompt] -> decode 128 tokens (single stream, no shared structure)
+     decode-bound, nothing to cache -> vLLM's raw decode-IPC edge wins. The honest loss.
+
+SC10 shared system-prompt  (many tenants)            [sglang win ~7.1x]
+     [~0.9K system prompt]   <- shared by 12 tenants
+          |- tenant1 |
+          |- tenant2 |   24 short reqs, same persona; canonical RadixAttention-in-prod.
+          |- ...     |
+---------------------------------------------------------------------------
+Full docs: docs/dl/sglang-vs-vllm-showcase-dlin.md (SC1-4),
+           docs/dl/sglang-vs-vllm-new-scenarios.md (SC5/7/8/9/10),
+           docs/dl/sglang-vs-vllm-rigor-analysis.md (SC6/SC8b probes).
+COMPARE_EOF
+}
+
 phase_compare() {
+  [ "$COMPARE_LIST" = "1" ] && { _compare_list; return 0; }
   log "Phase [compare]: sglang vs vLLM (MRV2 + MRV1) showcase ($COMPARE_SCENARIOS)"
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
   # Source the SDK env.sh so TP-worker subprocesses inherit PYTHONPATH (SDK

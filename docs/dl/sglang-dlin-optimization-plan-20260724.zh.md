@@ -91,12 +91,15 @@ gather 回退（`:187`）更严重：`_cu_q = arange(0, batch+1) * _seqq`（均�
 ### 第一杠杆：async-replay（已有代码）
 `full_cuda_graph_backend.py:216-261`（`SGLANG_DL_ASYNC_REPLAY=1`）把同步 `cudaGraphLaunch` 丢到 daemon 线程，让 scheduler 主线程的 ZMQ recv / load_batch / sampling / ZMQ send 与 GPU 并行。这是把 decode 从"CPU+GPU 串行 ~27ms"拉到"GPU-bound ~22ms"的手段。
 
-### 验证（2026-07-24，部分完成）
-- baseline SC9（无 async-replay）：**31.5 tok/s**（4058ms TPOT）。
-- async-replay 测试 **OOM**（`max_mamba_cache_size=-4`，GPU 0-3 残留状态）→ 需干净 GPU（8-11）重试。
+### 验证结果（2026-07-24，干净 GPU 8-11）
+| 配置 | tok/s | TPOT | host overhead |
+|---|---|---|---|
+| Baseline | 31.5 | ~39.4ms | ~18.7ms |
+| **async-replay** | **32.7** | ~37.2ms | ~16.5ms |
 
-### 待办
-1. `SGLANG_DL_TIME_REPLAY=1`（`full_cuda_graph_backend.py:153-173`）量 GPU 时间 / launch 阻塞分解。
+- **async-replay +3.8%**（31.5→32.7 tok/s），节省 host overhead ~2.2ms（**非预期 ~5ms**）。
+- **GPU replay（cudaGraphLaunch 阻塞）= ~20.7ms 固定 = decode 瓶颈**（step 8/16/128 median 都 ~20.7ms）。
+- **结论**：async-replay 是**小杠杆**（+3.8%），非大胜。decode TPOT 37.2ms = 20.7ms GPU + 16.5ms host。更大杠杆在 **GPU kernel 融合（减 20.7ms replay）** 或 host 深并行化。
 2. 开 `SGLANG_DL_ASYNC_REPLAY=1` 跑 decode，对比 TPOT，确认 wall-gap 是否收敛到 GPU 时间。
 3. **piecewise CG 降级为 fallback**：它的真实价值是"让 MoE 走 eager 解锁 PDL act-quant"，但首选先试已存在的 capture-state 实验（`full_cuda_graph_backend.py:107-130`：`SGLANG_DL_CAP_MODE`/`CAP_STREAM`/`CAP_DEFAULT_POOL`）；**只有全部失败才做 piecewise**。
 
@@ -112,8 +115,14 @@ gather 回退（`:187`）更严重：`_cu_q = arange(0, batch+1) * _seqq`（均�
 1. **`--cuda-graph-backend-prefill=breakable`**（`server_args.py:1603`）：分段 capture，**不走 torch.compile，绕开 triton 编译错误**。首选。已有 `breakable_cuda_graph_backend.py`（DL 已加 LogitsProcessorOutput 切片支持，break point 在 attention 边界）。
 2. `--enable-torch-compile`：绕过 multimodal 禁用，但要验证 DLIN triton fused_experts "too many resources" 是否复现。风险高，后置。
 
-### 收益（P0-2 证伪后，优先级 ↑↑）
-- **SC6 已证 sglang raw prefill 真实慢 1.55×（49 vs 76 tok/s）** → 本项从"P0-2 若证真低效才做"升级为**确定要做**。消 prefill host 开销（eager forward 的 Python dispatch / env 读 / copies）直接对症。
+### 收益（P0-2 证伪后，原以为 ↑↑）
+- SC6 已证 sglang raw prefill 真实慢 1.55×（49 vs 76 tok/s）→ 原以为消 prefill host 开销可对症。
+
+### 验证结果（2026-07-24，**负结果**）
+实测 `DL_PREFILL_BACKEND=breakable`（flag 生效、server 无崩、绕过 multimodal auto-disable）跑 SC6：
+- **SC6 raw prefill 仍 49 tok/s（219447ms），和 eager 完全一样，零收益。**
+- 原因：**breakable 未真正 capture prefill** —— sglang log `Capturing batches` 只有 decode 的 bs=1/2/4，**无 prefill 大 bs capture**。prefill 仍走 eager。
+- 结论：breakable flag 生效但 prefill capture 路径没触发（可能需 `prefill.bs` 配置，或 breakable prefill capture 未实现/有 bug）。**SC6 raw prefill 慢的真根因不是 prefill CG / host 开销**。**P1-1 暂搁**，SC6 真根因待查（疑 GPU compute / MoE kernel 效率）。
 - 与 P1-3 bucketing 联动 → 任意-M prefill 零 JIT
 
 ### 风险
