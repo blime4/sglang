@@ -234,6 +234,20 @@ def build_tenant_questions():
     ]
 
 
+def build_unique_prompt(i, target_words=700):
+    """DL: a ~1K-token prompt with a UNIQUE prefix per i (no shared root across
+    different i) — for raw-prefill testing where RadixAttention must NOT hit.
+    The distinct header (different first tokens per i) defeats root-matching.
+    """
+    header = f"### Analysis record {i} (run id {i * 7919 % 10007}): "
+    seed = (f"in record {i} the measured metric {i} for component {i} "
+            f"yields value {i} under load step {i}, which on device {i} ")
+    body = header
+    while len(body.split()) < target_words:
+        body += seed
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Individual showcase scenarios. Each returns a metrics dict (KEY=value, all
 # lower-level numbers are floats/ints) so run_sglang.sh's `compare` phase can
@@ -449,18 +463,18 @@ def run_sc7(engine_name, generate):
 
 
 def run_sc8(engine_name, generate):
-    """DL: SC8 — Parallel sampling (best-of-N, n=4) over a substantive prompt.
+    """DL: SC8 — Repeated best-of-N (RLHF rejection-sampling loop), n=4, temp=0.7.
 
-    One ~0.9K-token prompt, n=4 candidate completions (temperature=0.7),
-    single generate call. The prompt is prefilled ONCE and forked into 4
-    decode sequences in BOTH engines (APC is irrelevant within one call), so
-    this is prefill+decode. On DLIN, vLLM's prefill of the 0.9K prompt is
-    slow (~75 tok/s), so sglang's much faster prefill wins overall despite
-    vLLM's decode-IPC edge. Production shape: best-of-N / RLHF rejection
-    sampling over a real (non-trivial) prompt. (Pure decode, no shared
-    structure, is SC9 — the honest vLLM-favored control.)
+    The SAME ~0.9K prompt is regenerated n=4 across warmup+measured reps, so
+    sglang's RadixAttention caches the prompt across calls (reps skip prefill)
+    while vLLM (APC-off) re-prefills it every call. This is the *repeated*
+    best-of-N (RLHF-loop) advantage, NOT a single best-of-N call. Rigor
+    decomposition (SC8b + docs/dl/sglang-vs-vllm-rigor-analysis.md): the win =
+    cross-call caching (~3.9x) x a single-call best-of-N edge (~2x; vLLM's n=4
+    decode is pathologically slow on DLIN). For the cold single-call best-of-N
+    figure, see SC8b. (sglang's RAW prefill is NOT faster than vLLM's — see SC6.)
     """
-    print(f"\n[showcase] === SC8: Parallel Sampling (best-of-N, n=4, temp=0.7) ===", flush=True)
+    print(f"\n[showcase] === SC8: Repeated best-of-N (RLHF loop), n=4, temp=0.7 ===", flush=True)
     prompt = (SHARED_PREFIX + "\n\nWrite a concise technical summary of the "
               "KS38 architecture, compute, and memory hierarchy.\n\nSummary:")
     max_new = 48
@@ -496,6 +510,36 @@ def run_sc8(engine_name, generate):
     print(f"[showcase] SC8 {engine_name}: best={best*1000:.0f}ms  tok/s={tps:.1f}  "
           f"n=4 x {max_new}tok  n_samples={len(samples)}  sample={sample!r}", flush=True)
     return {"SC8_tps": f"{tps:.1f}"}
+
+
+def run_sc8b(engine_name, generate):
+    """DL: SC8b — best-of-N, COLD (unique prompt each call) — rigor control.
+
+    Identical to SC8 EXCEPT a UNIQUE ~0.9K prompt per measured call, so
+    RadixAttention gets NO cross-call cache hit. This is the FAIR single-call
+    best-of-N: both engines prefill the prompt once per call, then fork n=4.
+    Compare to SC8 (same prompt reused => sglang caches across reps) to isolate
+    that confound. If SC8b shows vLLM >= sglang (decode-bound), then SC8's
+    sglang win was the cross-call caching, NOT best-of-N speed — and SC8 should
+    be framed as a repeated/RLHF-loop workload, not single best-of-N.
+    """
+    print(f"\n[showcase] === SC8b: best-of-N COLD (unique prompt/call, no cache) ===", flush=True)
+    max_new = 48
+    # 5 unique ~0.9K prompts (best-of-5 cold single-call best-of-N).
+    prompts = [build_unique_prompt(500 + r, target_words=650)
+               + "\n\nWrite a concise technical summary.\n\nSummary:" for r in range(5)]
+    # warmup the n=4 decode path with a throwaway unique prompt (no cache reuse).
+    generate(build_unique_prompt(999, 650) + "\n\nSummary:",
+             max_new=8, ignore_eos=True, n=4, temperature=0.7)
+    best = 999
+    for p in prompts:
+        t0 = time.perf_counter()
+        generate(p, max_new=max_new, ignore_eos=True, n=4, temperature=0.7)
+        best = min(best, time.perf_counter() - t0)
+    tps = (4 * max_new) / best
+    print(f"[showcase] SC8b {engine_name}: best={best*1000:.0f}ms  tok/s={tps:.1f}  "
+          f"n=4 x {max_new}tok (cold, unique prompt/call)", flush=True)
+    return {"SC8b_cold_tps": f"{tps:.1f}"}
 
 
 def run_sc10(engine_name, generate):
@@ -556,6 +600,46 @@ def run_sc9(engine_name, generate):
     return {"SC9_tps": f"{tps:.1f}"}
 
 
+def run_sc6(engine_name, generate):
+    """DL: SC6 — Raw-prefill parity (UNIQUE prompts, NO caching) — rigor probe.
+
+    N unique ~1K-token prompts (distinct prefixes => RadixAttention CANNOT hit),
+    each followed by a 4-token decode. Both engines prefill every prompt fully,
+    so this isolates RAW prefill throughput. Purpose: determine whether the
+    SC5/SC7/SC8/SC10 wins come from RadixAttention caching, or ALSO from sglang
+    having faster raw-prefill kernels. If sglang ~= vLLM here, the prefix-scenario
+    wins are PURELY caching (rigorous attribution). If sglang >> vLLM, raw prefill
+    is an additional factor (and we check whether vLLM's slow prefill is a config
+    artifact). Distinct prompts are used each pass so sglang gets no cross-pass
+    cache hit. (Not a "showcase win" scenario — a diagnostic.)
+    """
+    print(f"\n[showcase] === SC6: Raw-Prefill Parity (8 unique ~1K prompts, no cache) ===", flush=True)
+    # 3 passes (warmup + 2 measured) of 8 UNIQUE prompts each = 24 distinct prompts.
+    pool = [build_unique_prompt(100 + p * 8 + k) for p in range(3) for k in range(8)]
+    try:
+        from transformers import AutoTokenizer
+        _tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+        tok_per = len(_tok.encode(pool[0]))
+    except Exception:
+        tok_per = int(len(pool[0].split()) * 1.4)
+    total_prefill = 8 * tok_per
+
+    def one_pass(offset):
+        t0 = time.perf_counter()
+        for k in range(8):
+            generate(pool[offset * 8 + k], max_new=4, ignore_eos=True)
+        return time.perf_counter() - t0
+
+    one_pass(0)  # warmup (JIT)
+    times = [one_pass(1), one_pass(2)]
+    best = min(times)
+    prefill_tps = total_prefill / best
+    print(f"[showcase] SC6 {engine_name}: best={best*1000:.0f}ms  "
+          f"raw_prefill~{prefill_tps:.0f} tok/s  ({tok_per}tok/prompt x8)  "
+          f"reps={[f'{t*1000:.0f}' for t in times]} ms", flush=True)
+    return {"SC6_prefill_tps": f"{prefill_tps:.0f}", "SC6_total_ms": f"{best*1000:.0f}"}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", default="sglang", choices=["sglang", "vllm"])
@@ -574,10 +658,10 @@ def main():
     engine_name = args.engine
     runner = args.vllm_runner if engine_name == "vllm" else "sglang"
     enabled = {s.strip().upper() for s in args.scenarios.split(",") if s.strip()}
-    unknown = enabled - {"SC1", "SC2", "SC3", "SC4", "SC5", "SC7", "SC8", "SC9", "SC10"}
+    unknown = enabled - {"SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "SC7", "SC8", "SC8B", "SC9", "SC10"}
     if unknown:
         raise SystemExit(f"unknown scenario(s): {unknown} "
-                         f"(valid: SC1 SC2 SC3 SC4 SC5 SC7 SC8 SC9 SC10)")
+                         f"(valid: SC1 SC2 SC3 SC4 SC5 SC6 SC7 SC8 SC8B SC9 SC10)")
 
     print(f"[showcase] engine={engine_name} runner={runner} model={MODEL} tp={TP} "
           f"scenarios={sorted(enabled)}", flush=True)
@@ -689,10 +773,14 @@ def main():
         _run("SC4", run_sc4, engine_name, raw, json_schema)
     if "SC5" in enabled:
         _run("SC5", run_sc5, engine_name, generate)
+    if "SC6" in enabled:
+        _run("SC6", run_sc6, engine_name, generate)
     if "SC7" in enabled:
         _run("SC7", run_sc7, engine_name, generate)
     if "SC8" in enabled:
         _run("SC8", run_sc8, engine_name, generate)
+    if "SC8B" in enabled:
+        _run("SC8B", run_sc8b, engine_name, generate)
     if "SC9" in enabled:
         _run("SC9", run_sc9, engine_name, generate)
     if "SC10" in enabled:

@@ -4,6 +4,12 @@
 > (SC1–SC4). This doc records the **2026-07-24 investigation** that extended the
 > showcase with new workload patterns, the methodology used, and an honest
 > win/loss accounting for each new scenario.
+>
+> **Rigor audit:** each scenario's fairness is stress-tested in
+> [`sglang-vs-vllm-rigor-analysis.md`](sglang-vs-vllm-rigor-analysis.md) —
+> including the SC6 raw-prefill-parity probe (sglang 49 vs vLLM 76 tok/s ⇒ the
+> wins are 100% RadixAttention caching, not faster raw prefill) and the SC8b
+> cold-best-of-N probe (SC8's 5.84× = caching 3.9× × single-call 2.0×).
 
 ## TL;DR
 
@@ -14,8 +20,8 @@ vLLM decode win (SC9, the control)._
 |----------|-----------------------------------|--------|-----------|---------|
 | **SC5** multi-user fork | 2 users × 4 turns, shared root (radix **tree**) | **13.2 s** (1653 ms/turn) | **108.6 s** (13578 ms/turn) | **sglang 8.22× faster** ✅ |
 | **SC7** long-RAG throughput | ~2K-token doc × 8 sequential queries | **13.0 tok/s** | **0.8 tok/s** (228 s) | **sglang 16.25× higher** ✅ |
-| **SC8** parallel sampling | n=4 candidates (temp=0.7) from a 0.9K prompt | **22.2 tok/s** | **3.8 tok/s** (51 s) | **sglang 5.84× higher** ✅ |
-| **SC9** pure long decode | short prompt + 128 tok single-stream (decode-bound) | 30.5 tok/s | **39.6 tok/s** | **vLLM 1.30× (honest loss / control)** ⚠️ |
+| **SC8** repeated best-of-N (RLHF loop) | n=4 (temp=0.7), same prompt reused | **22.2 tok/s** | **3.8 tok/s** (51 s) | **sglang 5.84×** ⚠️ (= caching 3.9× × single-call 2.0×; see SC8b) |
+| **SC9** pure long decode | short prompt + 128 tok single-stream (decode-bound) | 30.5 tok/s | **39.6 tok/s** | **vLLM 1.13–1.30× (honest loss / control)** ⚠️ |
 | **SC10** shared system prompt | ~0.9K system prompt × 12 tenants | **13.4 tok/s** | **1.9 tok/s** (151 s) | **sglang 7.05× higher** ✅ |
 
 **Hypotheses vs. reality (measured):**

@@ -1159,6 +1159,17 @@ phase_compare() {
      || grep -q '^METRIC SC10_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
     _compare_row "SC10 sys-prompt(t/s)"  SC10_throughput_tps higher
   fi
+  # DL: rigor diagnostic probes (run via --scenarios SC6 / SC8B). See
+  # docs/dl/sglang-vs-vllm-rigor-analysis.md. SC6 = raw-prefill parity (unique
+  # prompts, no cache); SC8B = cold single-call best-of-N (no cross-call cache).
+  if grep -q '^METRIC SC6_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC6_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC6 raw-prefill(t/s)"  SC6_prefill_tps     higher
+  fi
+  if grep -q '^METRIC SC8b_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC8b_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC8b cold best-of-N(t/s)" SC8b_cold_tps    higher
+  fi
   echo  "  ======================================================================="
   log "metrics cached: $COMPARE_METRICS_DIR/metrics_{sglang,vllm_mrv1,vllm_mrv2}.txt"
   log "results store:  $COMPARE_STORE   (./run_sglang.sh compare --history to view)"
