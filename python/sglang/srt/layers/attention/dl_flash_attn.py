@@ -149,7 +149,12 @@ def flash_attn_with_kvcache(*args, **kwargs):
             q=q,
             k=k_cache,
             v=v_cache,
-            max_seqlen_q=_seqq,
+            # DL: max_seqlen_q MUST be max(extend_seq_lens), NOT the average _seqq.
+            # _seqq = total_q // batch equals max only for decode (1 token/seq) or
+            # equal-length prefill; for unequal-length multi-seq prefill (online
+            # concurrency) avg < max under-sizes the kernel softmax_lse workspace
+            # (num_seqs, heads, num_splits) -> OOB write -> wrong result / SIGSEGV.
+            max_seqlen_q=(max_seqlen_q_arg if max_seqlen_q_arg is not None else _seqq),
             cu_seqlens_q=_cu_q,
             max_seqlen_k=_max_k_ub,
             seqused_k=cache_seqlens,
@@ -184,7 +189,9 @@ def flash_attn_with_kvcache(*args, **kwargs):
         _max_k = _k_packed.shape[0] // _batch
         _cu_k = torch.arange(0, _batch + 1, dtype=torch.int32, device=k_cache.device) * _max_k
 
-    _cu_q = torch.arange(0, _batch + 1, dtype=torch.int32, device=q.device) * _seqq
+    # DL: prefer the backend-provided cu_seqlens_q (= cumsum(extend_seq_lens));
+    # uniform arange*_seqq is only correct for equal-length sequences.
+    _cu_q = cu_seqlens_q_arg if cu_seqlens_q_arg is not None else torch.arange(0, _batch + 1, dtype=torch.int32, device=q.device) * _seqq
 
     if _Dm > 128:
         import torch.nn.functional as F
@@ -202,7 +209,7 @@ def flash_attn_with_kvcache(*args, **kwargs):
         t = _fa2_varlen(
             q, _k_packed, _v_packed,
             _cu_q, _cu_k,
-            max_seqlen_q=_seqq,
+            max_seqlen_q=(max_seqlen_q_arg if max_seqlen_q_arg is not None else _seqq),
             max_seqlen_k=_max_k,
             softmax_scale=softmax_scale,
             causal=False if _seqq == 1 else causal,
