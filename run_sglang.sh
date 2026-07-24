@@ -167,6 +167,7 @@ COMPARE_SHOW="${COMPARE_SHOW:-0}"               # --show: re-render table from c
 COMPARE_HISTORY="${COMPARE_HISTORY:-0}"         # --history: print the results log, no GPU run
 COMPARE_LIST="${COMPARE_LIST:-0}"               # --list: print all scenarios + ASCII diagrams, no GPU run
 COMPARE_RECORD="${COMPARE_RECORD:-1}"           # --no-record: don't append to the JSON store
+COMPARE_RUN_MRV1="${COMPARE_RUN_MRV1:-0}"       # DL: MRV1 skipped by default (fails on DLIN, +10min)
 COMPARE_BASELINE="${COMPARE_BASELINE:-}"        # --baseline <id|commit>: diff vs this (else previous run)
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
 COMPARE_METRICS_DIR="${COMPARE_METRICS_DIR:-/tmp/sglang_compare}"
@@ -1149,16 +1150,21 @@ phase_compare() {
   # metrics_{engine}[_{runner}].txt and {tag}_last.log. On failure: removes the
   # stale metrics file (so status=fail is recorded) and returns 1 (non-fatal for vLLM).
   _compare_run_one() {
-    local eng="$1" runner="${2:-}" tag mfile vllm_args="" logf
+    local eng="$1" runner="${2:-}" tag mfile vllm_args="" logf cmd
     if [ "$eng" = "vllm" ]; then
       tag="vllm-$runner"; mfile="metrics_vllm_${runner}.txt"; vllm_args="--vllm-runner $runner"
     else
       tag="$eng"; mfile="metrics_${eng}.txt"
     fi
     logf="$COMPARE_METRICS_DIR/${tag}_${stamp}.log"
-    log "[compare] running $tag (scenarios=$COMPARE_SCENARIOS, log: $logf) ..."
-    if ! python "$script" --engine "$eng" $vllm_args --mem-frac "$COMPARE_MEM_FRAC" \
-           --scenarios "$COMPARE_SCENARIOS" > "$logf" 2>&1; then
+    # DL: log the FULL command + config (reproducibility + fairness audit) to console + log head.
+    cmd="python $script --engine $eng $vllm_args --mem-frac $COMPARE_MEM_FRAC --scenarios $COMPARE_SCENARIOS"
+    log "[compare] running $tag (scenarios=$COMPARE_SCENARIOS, log: $logf)"
+    log "[compare] COMMAND: $cmd"
+    if ! { echo "[showcase] === COMMAND: $cmd ===";
+           echo "[showcase] === CONFIG: model=$(basename ${MODEL_PATH%/}) tp=${DLIN_TP_SIZE:-4} mem-frac=$COMPARE_MEM_FRAC backend=${ATTN_BACKEND:-fa3} temp=0(SC8/SC8b=0.7) scenarios=$COMPARE_SCENARIOS ===";
+           python "$script" --engine "$eng" $vllm_args --mem-frac "$COMPARE_MEM_FRAC" \
+                  --scenarios "$COMPARE_SCENARIOS"; } > "$logf" 2>&1; then
       warn "$tag run FAILED. Tail of $logf:"; tail -n 18 "$logf" 2>/dev/null
       rm -f "$COMPARE_METRICS_DIR/$mfile"
       cp -f "$logf" "$COMPARE_METRICS_DIR/${tag}_last.log" 2>/dev/null || true
@@ -1182,7 +1188,13 @@ phase_compare() {
       "")
         _compare_run_one sglang    || die "sglang run failed (cannot compare without it)"
         _compare_run_one vllm mrv2 || warn "vllm-mrv2 failed (recorded as fail)"
-        _compare_run_one vllm mrv1 || warn "vllm-mrv1 failed (expected on DLIN; recorded as fail)"
+        # DL: MRV1 skipped by default — it usually FAILs on DLIN (assert num_cache_lines)
+        # and adds ~10min. Opt in with COMPARE_RUN_MRV1=1 (or --only vllm-mrv1).
+        if [ "$COMPARE_RUN_MRV1" = "1" ]; then
+          _compare_run_one vllm mrv1 || warn "vllm-mrv1 failed (expected on DLIN; recorded as fail)"
+        else
+          log "[compare] skipping vllm-mrv1 (default; fails on DLIN). Set COMPARE_RUN_MRV1=1 to include."
+        fi
         ;;
     esac
   fi
