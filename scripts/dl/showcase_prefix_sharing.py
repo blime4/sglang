@@ -755,12 +755,15 @@ def main():
             engine.shutdown()
     else:
         from vllm import LLM, SamplingParams
-        # NOTE: enable_prefix_caching=True is UNSUPPORTED for this hybrid Mamba
-        # model on DLIN. vLLM forces mamba_cache_mode='align' when APC is on,
+        # NOTE: enable_prefix_caching (APC) CANNOT be enabled on the compare's runner
+        # (MRV2) for this hybrid Mamba model — vLLM forces mamba_cache_mode='align',
         # which MRV2 hard-rejects ("Model Runner V2 has not yet supported
-        # mamba_cache_mode='align'"). So vLLM runs APC-OFF here — re-prefilling
-        # the shared prefix every request (SC1 speedup = 1.0x). Contrast: sglang
-        # RadixAttention works on this model and gives 16x+. See blog.
+        # mamba_cache_mode='align'", vllm/config/vllm.py:2030). MRV1 can enable APC
+        # (eager) but is unstable on DLIN (this compare skips it). So vLLM runs
+        # APC-OFF here (its only stable config) — re-prefilling shared prefixes.
+        # Proven 2026-07-25 by scripts/dl/apc_failure_probe.py (MRV2+APC fails under
+        # both CG and eager; MRV1+APC+eager works but MRV1 crashes on DLIN). Contrast:
+        # sglang RadixAttention works natively + with CG. See fairness-defense doc.
         #
         # MRV1 vs MRV2: MRV2 (VLLM_USE_V2_MODEL_RUNNER=1 + CG) is the only
         # config that works on DLIN; MRV1 historically hits a torch.compile
