@@ -20,6 +20,7 @@
 | **SC5** multi-user fork | sglang **8.22×** | ✅ **Rigorous** — win is RadixAttention caching (proven: not raw prefill, see SC6) |
 | **SC7** long-RAG | sglang **16.25×** | ✅ **Rigorous** — win is caching |
 | **SC10** shared system-prompt | sglang **7.05×** | ✅ **Rigorous** — win is caching |
+| **SC11** online concurrency | sglang **9.16×** | ✅ **Rigorous** — caching amplified by concurrency; FA2 fix (`0fe8c7cc86`) unblocked it (pre-fix the unequal concurrent batch crashed) |
 | **SC8** best-of-N (same prompt reused) | sglang **5.84×** | ⚠️ **Mixed** — decomposes (via SC8b) into: cross-call prompt caching (~3.9×, RLHF-loop) × a real single-call best-of-N edge (sglang ~2×; vLLM n=4 is pathologically slow on DLIN). Both factors are real sglang wins but measure different workloads — see §3 SC8. |
 | **SC9** pure decode | vLLM **1.30×** | ⚠️ **Direction rigorous, magnitude caveat** — vLLM wins decode (robust), but 1.30× is an upper bound: sglang's decode here (30.5 tok/s) is below its ~35 optimum, so the true gap is ~1.13×. |
 
@@ -216,6 +217,22 @@ attribution. (Corollary: on a workload of *all-unique* prompts, vLLM wins — SC
 ### SC10 — shared system-prompt (sglang 7.05×) — ✅ RIGOROUS
 - Same mechanism as SC7 (caching) with a shorter prefix (0.9K) × more tenants
   (12). SC6 confirms attribution. ✓ **Rigorous.**
+
+### SC11 — online concurrency (sglang 9.16×) — ✅ RIGOROUS (FA2-unblocked)
+- **Mechanism:** 12 tenants behind a shared ~0.9K system prompt fire CONCURRENTLY
+  (one batch), each a different-length query (unequal `extend_lens` → the FA2 varlen
+  path). The multi-tenant-concurrent production shape fix `0fe8c7cc86` unblocked
+  (pre-fix the unequal concurrent batch OOB/SIGSEGV'd). Distinct from SC10 (same
+  shape, SEQUENTIAL) by concurrency; the harness caps concurrency at
+  `max_running_requests=4` → 12 tenants process in waves of 4.
+- **Result (r016):** sglang **17.4 tok/s** vs vLLM **1.9** → **9.16×**.
+- **Attribution:** same as SC5–SC10 — RadixAttention caching (vLLM APC-off
+  re-prefills the shared system prompt ×12 each pass; SC6 rules out raw-prefill
+  speed), **amplified by concurrency** (9.16× > SC10 sequential 7.05× — concurrent
+  decode batching helps sglang). The FA2 fix is the *enabler*, not the win source.
+- **Confound check:** caching-driven (✓ SC6); no per-scenario failure; the
+  unequal-concurrent path itself is validated in the FA2 e2e tests (offline batch
+  + online server). **Rigorous.**
 
 ### SC8 — best-of-N parallel sampling (sglang 5.84×) — ⚠️ MIXED (two factors)
 - **The confound:** the SC8 harness runs warmup + 3 measured reps of the **same**
