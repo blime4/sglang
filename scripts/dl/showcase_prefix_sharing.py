@@ -234,6 +234,35 @@ def build_tenant_questions():
     ]
 
 
+def build_sc11_queries():
+    """DL: 12 user queries of DELIBERATELY DIFFERENT lengths for SC11 (online
+    concurrency). With the shared SHARED_PREFIX system prompt, the concurrent
+    batch has UNEQUAL extend_lens -> the FA2 varlen path that fix 0fe8c7cc86
+    unblocked (pre-fix: >2 overlapping unequal prefills OOB/SIGSEGV). Short
+    factual prompts + a few long ones -> a clear length spread."""
+    return [
+        "What is the FP8 throughput per QUAD?",
+        "L2 cache?",
+        "Explain in detail the three-tier memory hierarchy of the KS38: the L1, L2, "
+        "and cluster memory (HBM), including their sizes, access latencies in cycles, "
+        "and bandwidth, and how a kernel author should reason about data placement.",
+        "HBM bandwidth per QUAD?",
+        "What page size is used for KV cache management, and why does it matter for "
+        "paged attention efficiency and memory fragmentation?",
+        "DLEOL_CACHE_SIZE?",
+        "Describe the MoE routing: number of experts, top-k selection, and the fused "
+        "grouped GEMM kernel, and how it differs from a dense MLP forward.",
+        "Why must custom_all_reduce be disabled on DLIN, what mode is used instead, "
+        "and what was the error code?",
+        "INT8 throughput?",
+        "Explain PDL (Programmatic Dependent Launch) and DLEOL (the JIT optimization "
+        "layer): what each does, how they interact, and when each helps latency.",
+        "Cluster memory latency in cycles?",
+        "Summarize the KS38 compute capabilities across all numeric formats (FP32, "
+        "BF16, FP16, INT8, FP8) per QUAD and in aggregate, with the tradeoffs.",
+    ]
+
+
 def build_unique_prompt(i, target_words=700):
     """DL: a ~1K-token prompt with a UNIQUE prefix per i (no shared root across
     different i) — for raw-prefill testing where RadixAttention must NOT hit.
@@ -574,6 +603,39 @@ def run_sc10(engine_name, generate):
     return {"SC10_throughput_tps": f"{tps:.1f}", "SC10_total_ms": f"{best*1000:.0f}"}
 
 
+def run_sc11(engine_name, generate_batch):
+    """DL: SC11 — Online concurrency (N tenants, shared system-prompt, UNEQUAL
+    queries, concurrent batch). The production multi-tenant-concurrent shape that
+    fix 0fe8c7cc86 (FA2 wrapper max_seqlen_q=max(extend_lens)) unblocked: N users
+    behind one system prompt fire CONCURRENTLY (one batch), each a different-length
+    query (unequal extend_lens -> the FA2 varlen path; pre-fix this crashed).
+    Distinct from SC10 (same shape, SEQUENTIAL) by concurrency; from SC3 (equal-
+    length batch) by unequal lengths. The harness caps concurrency at
+    max_running_requests=4 (parity), so N tenants process in waves of 4. Aggregate
+    decode throughput, best-of-N after warmup.
+    """
+    print(f"\n[showcase] === SC11: Online Concurrency (N tenants, shared sys-prompt, unequal queries) ===", flush=True)
+    n = int(os.environ.get("SC11_USERS", "12"))
+    sys_prompt = SHARED_PREFIX
+    queries = build_sc11_queries()[:n]
+    prompts = [sys_prompt + "\n\nQ: " + q + "\nA:" for q in queries]
+    max_new = 24
+    total_decode = len(prompts) * max_new
+
+    def one_pass():
+        t0 = time.perf_counter()
+        generate_batch(prompts, max_new=max_new)  # concurrent batch -> N in-flight
+        return time.perf_counter() - t0
+
+    one_pass()  # warmup: cache shared sys-prompt + exercise the concurrent varlen path
+    times = [one_pass() for _ in range(int(os.environ.get("SHOWCASE_REPS", "2")))]
+    best = min(times)
+    tps = total_decode / best
+    print(f"[showcase] SC11 {engine_name}: tenants={len(prompts)} best={best*1000:.0f}ms  "
+          f"throughput={tps:.1f} tok/s  reps={[f'{t*1000:.0f}' for t in times]} ms", flush=True)
+    return {"SC11_throughput_tps": f"{tps:.1f}", "SC11_total_ms": f"{best*1000:.0f}"}
+
+
 def run_sc9(engine_name, generate):
     """DL: SC9 — Pure long decode (short prompt) — decode-bound CONTROL / loss.
 
@@ -648,20 +710,21 @@ def main():
                              "MRV1 enforces eager to avoid the DLIN torch.compile crash.")
     parser.add_argument("--mem-frac", type=float, default=0.55)
     parser.add_argument("--scenarios", default="SC1,SC2,SC3",
-                        help="comma list of SC1/SC2/SC3/SC4/SC5/SC7/SC8/SC10 "
+                        help="comma list of SC1/SC2/SC3/SC4/SC5/SC7/SC8/SC10/SC11 "
                              "(default SC1,SC2,SC3). SC4=JSON. SC1 cold ~90s. "
                              "DL: SC5=multi-user fork (radix tree), "
                              "SC7=long-RAG throughput (3K prefix, 16 queries), "
                              "SC8=parallel sampling n=4 (decode-bound control), "
-                             "SC10=shared system-prompt throughput (24 tenants).")
+                             "SC10=shared system-prompt throughput (24 tenants), "
+                             "SC11=online concurrency (N tenants, unequal queries, concurrent batch).")
     args = parser.parse_args()
     engine_name = args.engine
     runner = args.vllm_runner if engine_name == "vllm" else "sglang"
     enabled = {s.strip().upper() for s in args.scenarios.split(",") if s.strip()}
-    unknown = enabled - {"SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "SC7", "SC8", "SC8B", "SC9", "SC10"}
+    unknown = enabled - {"SC1", "SC2", "SC3", "SC4", "SC5", "SC6", "SC7", "SC8", "SC8B", "SC9", "SC10", "SC11"}
     if unknown:
         raise SystemExit(f"unknown scenario(s): {unknown} "
-                         f"(valid: SC1 SC2 SC3 SC4 SC5 SC6 SC7 SC8 SC8B SC9 SC10)")
+                         f"(valid: SC1 SC2 SC3 SC4 SC5 SC6 SC7 SC8 SC8B SC9 SC10 SC11)")
 
     print(f"[showcase] engine={engine_name} runner={runner} model={MODEL} tp={TP} "
           f"scenarios={sorted(enabled)}", flush=True)
@@ -793,6 +856,8 @@ def main():
         _run("SC9", run_sc9, engine_name, generate)
     if "SC10" in enabled:
         _run("SC10", run_sc10, engine_name, generate)
+    if "SC11" in enabled:
+        _run("SC11", run_sc11, engine_name, generate_batch)
 
     # ---- Machine-readable metrics (parsed by run_sglang.sh `compare` phase) ----
     model_tag = os.path.basename(MODEL.rstrip("/"))

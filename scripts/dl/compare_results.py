@@ -56,6 +56,7 @@ HEADLINE = [
     ("SC8_tps",           "SC8 samp t/s", "high"),
     ("SC9_tps",           "SC9 decode t/s","high"),
     ("SC10_throughput_tps","SC10 sysprompt t/s", "high"),
+    ("SC11_throughput_tps","SC11 conc t/s", "high"),
 ]
 ENGINE_ORDER = ["sglang", "vllm_mrv2", "vllm_mrv1"]
 ENGINE_LABEL = {"sglang": "sglang", "vllm_mrv2": "vLLM-MRV2", "vllm_mrv1": "vLLM-MRV1"}

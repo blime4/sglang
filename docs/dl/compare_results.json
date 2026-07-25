@@ -613,6 +613,36 @@
           "error": ""
         }
       }
+    },
+    {
+      "id": "r016",
+      "timestamp": "2026-07-25T10:47:09",
+      "sglang_commit": "8c7e0b66b7",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC11"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC11_throughput_tps": 17.4,
+          "SC11_total_ms": 16546.0
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC11_throughput_tps": 1.9,
+          "SC11_total_ms": 150023.0
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
     }
   ]
 }

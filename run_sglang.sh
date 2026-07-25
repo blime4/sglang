@@ -1230,7 +1230,11 @@ phase_compare() {
               | sed -n 's/.*model=\([^ ]*\).*/\1/p' || true)
   [ -z "$model_tag" ] && model_tag=$(basename "${MODEL_PATH%/}")
   echo  "  model=$model_tag  tp=${DLIN_TP_SIZE:-4}  scenarios=$COMPARE_SCENARIOS"
-  echo  "  (same GPUs, FP8, fresh process each; vLLM APC-OFF; MRV1 often FAIL on DLIN)"
+  echo  "  (same GPUs, FP8, fresh process each; vLLM APC-OFF (structurally unsupported on"
+  echo  "   hybrid-Mamba -> re-prefills shared prefixes); MRV1 skipped by default on DLIN)"
+  echo  "  fairness audit: same model/TP/temp/warmup; see each {tag}.log COMMAND+CONFIG header."
+  echo  "  win source: sglang KV-reuse wins = RadixAttention cache, NOT raw speed (SC6 raw-"
+  echo  "   prefill parity proves sglang 49 < vLLM 76 tok/s); vLLM wins raw decode IPC (SC9)."
   echo  "  $(date '+%Y-%m-%d %H:%M:%S')"
   echo  "  -----------------------------------------------------------------------"
   echo  "  metric                   | sglang    | vLLM-MRV2 | vLLM-MRV1 | sglang vs MRV2"
@@ -1268,6 +1272,10 @@ phase_compare() {
   if grep -q '^METRIC SC10_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
      || grep -q '^METRIC SC10_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
     _compare_row "SC10 sys-prompt(t/s)"  SC10_throughput_tps higher
+  fi
+  if grep -q '^METRIC SC11_' "$COMPARE_METRICS_DIR/metrics_sglang.txt" 2>/dev/null \
+     || grep -q '^METRIC SC11_' "$COMPARE_METRICS_DIR/metrics_vllm_mrv2.txt" 2>/dev/null; then
+    _compare_row "SC11 online-conc(t/s)" SC11_throughput_tps higher
   fi
   # DL: rigor diagnostic probes (run via --scenarios SC6 / SC8B). See
   # docs/dl/sglang-vs-vllm-rigor-analysis.md. SC6 = raw-prefill parity (unique
