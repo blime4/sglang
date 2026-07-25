@@ -364,6 +364,255 @@
           "error": ""
         }
       }
+    },
+    {
+      "id": "r009",
+      "timestamp": "2026-07-24T12:18:42",
+      "sglang_commit": "491b38560f",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC6"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC6_prefill_tps": 49.0,
+          "SC6_total_ms": 219584.0
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC8b_cold_tps": 2.8
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r010",
+      "timestamp": "2026-07-24T12:31:22",
+      "sglang_commit": "491b38560f",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC6"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC6_prefill_tps": 48.0,
+          "SC6_total_ms": 222379.0
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC8b_cold_tps": 2.8
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r011",
+      "timestamp": "2026-07-24T12:38:24",
+      "sglang_commit": "491b38560f",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC9"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC9_tps": 31.5
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC8b_cold_tps": 2.8
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r012",
+      "timestamp": "2026-07-24T13:05:57",
+      "sglang_commit": "0fe8c7cc86",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC9"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC9_tps": 32.7
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC8b_cold_tps": 2.8
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r013",
+      "timestamp": "2026-07-24T13:20:45",
+      "sglang_commit": "0fe8c7cc86",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC6"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC6_prefill_tps": 49.0,
+          "SC6_total_ms": 219447.0
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC8b_cold_tps": 2.8
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r014",
+      "timestamp": "2026-07-24T15:33:41",
+      "sglang_commit": "c6b199b3ad",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC2",
+        "SC3"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC2_avg_ms": 6474.0,
+          "SC2_turn5_ms": 2084.0,
+          "SC3_per_req_ms": 1584.0,
+          "SC3_throughput_tps": 20.2
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC2_avg_ms": 14312.0,
+          "SC2_turn5_ms": 15653.0,
+          "SC3_per_req_ms": 12476.0,
+          "SC3_throughput_tps": 2.6
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
+    },
+    {
+      "id": "r015",
+      "timestamp": "2026-07-24T21:21:59",
+      "sglang_commit": "0a0cf34add",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC1",
+        "SC2",
+        "SC3",
+        "SC5",
+        "SC6",
+        "SC7",
+        "SC8",
+        "SC8B",
+        "SC9",
+        "SC10"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC10_throughput_tps": 13.3,
+          "SC10_total_ms": 21696.0,
+          "SC1_cold_ms": 20856.0,
+          "SC1_speedup_x": 10.32,
+          "SC1_warm_ms": 2022.0,
+          "SC2_avg_ms": 2922.0,
+          "SC2_turn5_ms": 2258.0,
+          "SC3_per_req_ms": 1616.0,
+          "SC3_throughput_tps": 19.8,
+          "SC5_avg_turn_ms": 1636.0,
+          "SC5_total_ms": 13087.0,
+          "SC6_prefill_tps": 49.0,
+          "SC6_total_ms": 219671.0,
+          "SC7_throughput_tps": 13.1,
+          "SC7_total_ms": 14697.0,
+          "SC8_tps": 22.2,
+          "SC8b_cold_tps": 5.7,
+          "SC9_tps": 30.6
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC10_throughput_tps": 1.9,
+          "SC10_total_ms": 152605.0,
+          "SC1_cold_ms": 13045.0,
+          "SC1_speedup_x": 1.01,
+          "SC1_warm_ms": 12887.0,
+          "SC2_avg_ms": 14360.0,
+          "SC2_turn5_ms": 15773.0,
+          "SC3_per_req_ms": 12520.0,
+          "SC3_throughput_tps": 2.6,
+          "SC5_avg_turn_ms": 13575.0,
+          "SC5_total_ms": 108600.0,
+          "SC6_prefill_tps": 76.0,
+          "SC6_total_ms": 140162.0,
+          "SC7_throughput_tps": 0.8,
+          "SC7_total_ms": 228675.0,
+          "SC8_tps": 3.7,
+          "SC8b_cold_tps": 2.8,
+          "SC9_tps": 39.5
+        },
+        "vllm_mrv1": {
+          "status": "fail",
+          "error": ""
+        }
+      }
     }
   ]
 }

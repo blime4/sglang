@@ -259,7 +259,7 @@ def run_sc1(engine_name, generate, questions):
     print(f"\n[showcase] === SC1: Prefix Sharing (8 reqs, 2K shared prefix) ===", flush=True)
     cold_prompt = SHARED_PREFIX + "\n" + questions[0]
     t0 = time.perf_counter()
-    cold_out = generate(cold_prompt, max_new=32)
+    cold_out = generate(cold_prompt, max_new=32, ignore_eos=True)
     cold_time = time.perf_counter() - t0
     if isinstance(cold_out, dict):
         cold_out = cold_out.get("text", str(cold_out))
@@ -267,7 +267,7 @@ def run_sc1(engine_name, generate, questions):
     warm_times, warm_outs = [], []
     for q in questions[1:]:
         t0 = time.perf_counter()
-        out = generate(SHARED_PREFIX + "\n" + q, max_new=32)
+        out = generate(SHARED_PREFIX + "\n" + q, max_new=32, ignore_eos=True)
         warm_times.append(time.perf_counter() - t0)
         if isinstance(out, dict):
             out = out.get("text", str(out))
@@ -296,7 +296,7 @@ def run_sc2(engine_name, generate, turns):
     for i, turn_q in enumerate(turns):
         conversation += f"\n\nHuman: {turn_q}\nAssistant:"
         t0 = time.perf_counter()
-        out = generate(conversation, max_new=32)
+        out = generate(conversation, max_new=32, ignore_eos=True)
         dt = time.perf_counter() - t0
         turn_times.append(dt)
         if isinstance(out, dict):
@@ -316,7 +316,7 @@ def run_sc3(engine_name, generate_batch, questions):
     print(f"\n[showcase] === SC3: Concurrent Batch (4 reqs, shared prefix) ===", flush=True)
     batch_prompts = [SHARED_PREFIX + "\n" + q for q in questions[:4]]
     best_batch = 999
-    for _ in range(3):
+    for _ in range(int(os.environ.get("SHOWCASE_REPS", "3"))):
         t0 = time.perf_counter()
         generate_batch(batch_prompts, max_new=32)
         best_batch = min(best_batch, time.perf_counter() - t0)
@@ -423,7 +423,7 @@ def run_sc5(engine_name, generate):
         return time.perf_counter() - t0
 
     one_pass()  # warmup: populate the radix tree for both branches
-    times = [one_pass() for _ in range(2)]
+    times = [one_pass() for _ in range(int(os.environ.get("SHOWCASE_REPS", "2")))]
     best = min(times)
     avg_turn = best / 8 * 1000
     print(f"[showcase] SC5 {engine_name}: best_total={best*1000:.0f}ms  "
@@ -454,7 +454,7 @@ def run_sc7(engine_name, generate):
         return time.perf_counter() - t0
 
     one_pass()  # warmup: cache the long doc once
-    times = [one_pass() for _ in range(2)]
+    times = [one_pass() for _ in range(int(os.environ.get("SHOWCASE_REPS", "2")))]
     best = min(times)
     tps = total_decode / best
     print(f"[showcase] SC7 {engine_name}: doc~{ntok}words  best={best*1000:.0f}ms  "
@@ -566,7 +566,7 @@ def run_sc10(engine_name, generate):
         return time.perf_counter() - t0
 
     one_pass()  # warmup: cache the shared system prompt once
-    times = [one_pass() for _ in range(2)]
+    times = [one_pass() for _ in range(int(os.environ.get("SHOWCASE_REPS", "2")))]
     best = min(times)
     tps = total_decode / best
     print(f"[showcase] SC10 {engine_name}: tenants={len(questions)}  best={best*1000:.0f}ms  "
@@ -684,8 +684,10 @@ def main():
             if n > 1:
                 sp["n"] = n
             return engine.generate(prompt, sp)
-        def generate_batch(prompts, max_new=32, temperature=0.0):
-            return engine.generate(prompts, {"max_new_tokens": max_new, "temperature": temperature})
+        def generate_batch(prompts, max_new=32, temperature=0.0, ignore_eos=True):
+            return engine.generate(prompts, {"max_new_tokens": max_new,
+                                             "temperature": temperature,
+                                             "ignore_eos": ignore_eos})
         def shutdown():
             engine.shutdown()
     else:
@@ -723,8 +725,8 @@ def main():
             if n > 1:
                 return [o.text for o in out.outputs]
             return out.outputs[0].text
-        def generate_batch(prompts, max_new=32, temperature=0.0):
-            sp = SamplingParams(temperature=temperature, max_tokens=max_new)
+        def generate_batch(prompts, max_new=32, temperature=0.0, ignore_eos=True):
+            sp = SamplingParams(temperature=temperature, max_tokens=max_new, ignore_eos=ignore_eos)
             outs = llm.generate(prompts, sp)
             return [o.outputs[0].text for o in outs]
         def shutdown():
@@ -751,6 +753,12 @@ def main():
         except Exception as e:  # noqa: BLE001 - benchmark must be resilient
             print(f"[showcase] !! {name} FAILED ({type(e).__name__}): {e}", flush=True)
             _tb.print_exc()
+            # F4: persist an explicit per-scenario fail marker so a single-SC crash
+            # (engine OK, one scenario threw) is recorded in the METRICS block +
+            # JSON store + CSV, not just silently absent (both renderers already
+            # surface a missing metric as FAIL/NA, but this disambiguates crash
+            # from slow/zero).
+            metrics[f"{name}_status"] = "fail"
 
     if "SC1" in enabled:
         _run("SC1", run_sc1, engine_name, generate, questions)

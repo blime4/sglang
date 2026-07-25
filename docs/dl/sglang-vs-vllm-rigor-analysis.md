@@ -13,6 +13,10 @@
 
 | Scenario | sglang vs vLLM | Rigor verdict |
 |----------|----------------|---------------|
+| **SC1** prefix sharing | sglang warm **6.4×** (cold→warm 10.3×) | ✅ **Rigorous (warm latency)** — ⚠️ cold→warm speedup conflates JIT (F5, see §3) |
+| **SC2** multi-turn | sglang turn5 **7.0×** | ✅ **Rigorous** — caching, latency |
+| **SC3** concurrent batch | sglang **7.6×** | ✅ **Rigorous** — caching; F1 (`ignore_eos`) now controls token count |
+| **SC4** short JSON | vLLM **+9%** | ✅ **Rigorous** — only SC with a built-in output-validity check |
 | **SC5** multi-user fork | sglang **8.22×** | ✅ **Rigorous** — win is RadixAttention caching (proven: not raw prefill, see SC6) |
 | **SC7** long-RAG | sglang **16.25×** | ✅ **Rigorous** — win is caching |
 | **SC10** shared system-prompt | sglang **7.05×** | ✅ **Rigorous** — win is caching |
@@ -23,7 +27,15 @@
 and correctly attributed — SC6 proves they come from **caching, not faster raw
 prefill** (vLLM actually prefills 1.55× *faster* on unique prompts). SC8 needs a
 framing fix (it's a repeated/RLHF-loop win, not single-call best-of-N). SC9 is an
-honest loss whose magnitude is soft.
+honest loss whose magnitude is soft. SC1–SC4 are now covered too (§3): SC1/2/3
+are clean caching wins (SC1's cold→warm *speedup* is JIT-contaminated — F5; use
+its warm latency), SC4 is an honest vLLM win with built-in validity checking.
+
+**Cross-cutting caveat (§1d):** sglang and vLLM do **not** produce token-identical
+output on long prefills (cross-engine FP8 drift, greedy-amplified). The speed
+compare stays valid (token-count-controlled via `ignore_eos`), but we claim
+"sglang is faster," never "sglang produces the same text." All numbers below
+**reproduced within ±3% on r015** (full re-run, 2026-07-24).
 
 ---
 
@@ -77,6 +89,36 @@ inflate the caching wins.
   throughput — they're offline-overhead-bound for short (24-token) decodes.
   sglang's online decode is ~35 tok/s. So read the **ratios**, not the absolutes.
 
+### 1d. Do the engines produce comparable OUTPUT? (greedy-agreement probe)
+
+The speed compare measures tokens/second but never checked whether sglang and
+vLLM emit the *same* tokens at temperature=0. They run different FP8 paths
+(sglang fused-MoE/fa3/GDN vs vLLM `_dl_C`), so greedy outputs could diverge —
+and if they do, different token counts / EOS points would make the speed compare
+apples-to-oranges. Probe: `scripts/dl/greedy_agreement.py`, 6 workload prompts
+(the real SC1/SC7/SC6/SC9 shapes), temp=0, 48 tok, `ignore_eos`, FUSED_MAX_M=2048:
+
+| prompt shape | agreement | reading |
+|---|---|---|
+| **SC9** short prompt (~14 tok), pure decode | **48/48 IDENTICAL** | short prefill → negligible FP8 drift → greedy stays locked |
+| **SC1 / SC7 / SC6** long/prefix-sharing prefill (~2K tok) | **diverge @ token 0–12** | 2K-token prefill accumulates FP8 drift → greedy forks early |
+
+Both sides are **coherent and factually correct** (e.g. both answer "6144
+TFLOPS", "192 TFLOPS per QUAD"); neither is garbage. The divergence is **benign
+cross-engine FP8 numerical drift**, amplified by greedy decoding — an expected
+property of FP8 inference across different kernel implementations, **not a bug**
+in either engine.
+
+**Implication for the speed compare:** still **valid** — both engines emit the
+same token COUNT (`ignore_eos`), tok/s is token-identity-independent, and decode
+is ~constant cost per token. But output **quality is not equivalent** on
+long-prefill SCs: we claim "sglang is faster," never "sglang produces the same
+text." This is precisely why F1 (`ignore_eos=True` on SC1/SC2/SC3) is required:
+since outputs diverge, the token count must be locked, or different EOS points
+across engines would skew throughput (the F2 risk). Empirically this model enters
+`<think>` and does not early-EOS (`nat_ntok` = 48/48), so F1's numerical impact
+is tiny (SC3 20.2→19.8 tok/s) — it is a correctness guard, not a number-fix.
+
 ---
 
 ## 2. The linchpin experiment: SC6 raw-prefill parity
@@ -111,6 +153,44 @@ attribution. (Corollary: on a workload of *all-unique* prompts, vLLM wins — SC
 ---
 
 ## 3. Per-scenario rigor
+
+### SC1 — prefix sharing (sglang warm 6.4× / cold→warm 10.3×) — ✅ WARM RIGOROUS, ⚠️ SPEEDUP = JIT (F5)
+- **Mechanism:** 8 reqs share a ~2K-token prefix. cold = first request (full
+  prefill + dleol first-JIT); warm = 7 requests whose prefix is RadixAttention-
+  cached (only the short question suffix is new). vLLM (APC-off) re-prefills each.
+- **Clean metric = warm latency:** sglang **2022 ms** vs vLLM **12887 ms** →
+  **6.4×**. This isolates the caching win. ✓ (r015: cold sglang 20856 ms — the
+  JIT first-hit — vs vLLM 13045 ms; vLLM's cold is *faster* because its `_dl_C`
+  is AOT, no JIT.)
+- **⚠️ cold→warm speedup conflates JIT (F5):** the cold leg is dominated by the
+  dleol first-JIT (~21 s on a warm JIT cache, ~90 s on a cold one), so the
+  speedup swings with JIT state, not caching alone — r008 reported 16.4×, r015
+  measures 10.3×, with the *same* warm ≈2 s both times. **Report warm latency;
+  treat cold→warm speedup as JIT-contaminated.**
+- **Confound check (SC6):** the warm win is caching, not raw prefill (sglang is
+  slower raw). ✓
+
+### SC2 — multi-turn (sglang turn5 7.0×) — ✅ RIGOROUS
+- **Mechanism:** 5-turn conversation, each turn appends to the history.
+  RadixAttention caches the growing prefix; vLLM (APC-off) re-prefills the whole
+  history every turn. turn5 sglang **2258 ms** vs vLLM **15773 ms** → **7.0×**
+  (avg-turn 4.9×). ✓ Caching, correctly attributed (SC6). F1 (`ignore_eos`) makes
+  every turn decode the full 32 tokens (turn times rebased upward vs pre-F1).
+
+### SC3 — concurrent batch (sglang 7.6×) — ✅ RIGOROUS (F1 applied)
+- **Mechanism:** 4 prefix-sharing requests submitted as one batch. sglang
+  **19.8 tok/s** vs vLLM **2.6 tok/s** → **7.6×** (per-req 7.75×).
+- **F1 (correctness):** SC3 is a throughput metric that previously assumed the
+  full `max_new` (128 tokens for 4×32); it now forces `ignore_eos=True` via
+  `generate_batch` so both engines emit the same 128 tokens. Numerical impact was
+  tiny (20.2→19.8) because this model enters `<think>` and does not early-EOS —
+  but the guard is correct given the two engines' outputs diverge (§1d).
+
+### SC4 — short JSON (vLLM +9%) — ✅ RIGOROUS (built-in validity check)
+- **Mechanism:** extract-to-JSON with a schema; the only scenario that parses
+  its output and records `valid`. Both engines produce **valid JSON**. vLLM is
+  ~9% faster on this short, decode-light, no-shared-prefix prompt — an honest
+  vLLM win of the same flavor as SC9 (decode-IPC, no caching structure to exploit).
 
 ### SC5 — multi-user fork (sglang 8.22×) — ✅ RIGOROUS
 - **Mechanism:** 2 users × 4 turns over a shared root, interleaved. sglang
@@ -209,8 +289,28 @@ For each conclusion, the evidence you can re-derive:
 
 ## 5. Honest summary & fixes
 
-**Rock-solid (report as-is):** SC5 (8.22×), SC7 (16.25×), SC10 (7.05×) — caching
-wins, attribution proven by SC6.
+**Rock-solid (report as-is):** SC1/SC2/SC3 (prefix-sharing, multi-turn,
+concurrent-batch caching wins — report SC1 by its **warm latency**, not the
+JIT-contaminated cold→warm speedup), SC5 (8.22×), SC7 (16.25×), SC10 (7.05×) —
+all caching wins, attribution proven by SC6. SC4 is an honest vLLM win with
+built-in output-validity checking. **All reproduced within ±3% on r015** (full
+re-run, 2026-07-24, 10 scenarios × sglang+vLLM-MRV2, zero failures).
+
+**Correctness fixes applied this round (F1/F4):**
+- **F1:** SC1/SC2/SC3 now force `ignore_eos=True` (via `generate_batch` for SC3)
+  so both engines emit identical token counts — required because the two engines'
+  greedy outputs diverge on long prefills (§1d; different EOS points would
+  otherwise skew throughput). Numerical impact was tiny (SC3 20.2→19.8 tok/s):
+  this model enters `<think>` and does not early-EOS, so F1 is a correctness
+  guard, not a number-fix.
+- **F4:** per-scenario failures now emit an explicit `SCx_status=fail` marker
+  (persisted to the JSON store + CSV) instead of being silently absent.
+
+**Output-equivalence caveat (new, §1d):** sglang and vLLM do **not** produce
+token-identical output on long prefills (cross-engine FP8 drift, greedy-
+amplified; identical only on short-prefill pure decode — SC9). The speed compare
+stays valid, but the claim is "sglang is faster," never "sglang produces the same
+text."
 
 **Needs a fix:**
 - **SC8:** relabel as "repeated best-of-N (RLHF rejection-sampling loop)" — the
