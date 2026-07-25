@@ -20,7 +20,7 @@
 
 | 优先级 | 项 | 性质 | 预期收益 | 风险 | 工作量 |
 |---|---|---|---|---|---|
-| **P0-1** | FA2-varlen wrapper 修复 | 🎯 sglang-side，两行 | 打开在线并发质变场景 | 低 | 0.5d |
+| **P0-1** ✅ | FA2-varlen wrapper 修复（**已 e2e 验证 2026-07-25**） | 🎯 sglang-side，两行 | 打开在线并发质变场景 | 低 | 0.5d |
 | **P0-2** | SC6 raw prefill 根因验证 | 🎯 只读实验 | 澄清是否真低效 / 修测量配置 | 无 | 0.5d |
 | **P0-3** | decode gap → async-replay 量化 | 🎯 已有代码，先量 | decode 27ms→~22ms（GPU-bound） | 低 | 0.5d |
 | **P1-1** | prefill CG 解禁（breakable） | 🎯 sglang-side | 消 prefill host 开销 + 任意-M 零 JIT 联动 | 中 | 2–3d |
@@ -58,7 +58,11 @@ gather 回退（`:187`）更严重：`_cu_q = arange(0, batch+1) * _seqq`（均�
 ### 验证（2026-07-24）
 1. ✅ **Spy 验证 PASS**（`scripts/dl/test_prefill_varlen.py`）：拦截 `_sgl_fa2_varlen`，断言 wrapper 传 `max_seqlen_q=max(extend_lens)=32`（修复前 `_seqq=14`）、`cu_seqlens_q=[0,16,24,56,59]` 正确。**wrapper 修复确认。**
 2. ⚠️ **裸调单测数值对比失败 = 单测方法问题，非 wrapper**：直接调 `_sgl_fa2_C.varlen_fwd` 对不等长多序列 dleol JIT `to bc failed`。但单测用错 head 配置（8/8 vs 35B 真实 `num_attention_heads=16 / num_key_value_heads=2 / head_dim=256`）+ 缺 sinks/metadata，**不代表端到端**。教训：wrapper 修复应**端到端验证**，不要裸调 kernel。
-3. ✅ **端到端 flash_attn 工作**：SC6 sglang 跑通 48 tok/s（未崩 `to bc failed`）→ 端到端 attention 正常。FA2 在线并发（不等长多请求）直接端到端验证可后续（SC5 多用户 overnight 8.22× 间接佐证多请求并发能跑）。
+3. ✅ **端到端 flash_attn 工作**：SC6 sglang 跑通 48 tok/s（未崩 `to bc failed`）→ 端到端 attention 正常。
+4. ✅✅ **在线并发 e2e 验证 DONE（2026-07-25）** — pre-fix 崩溃形态（>2 重叠不等长 prefill）端到端跑通，**在线并发 prefill 解锁**（周报 §7.3 最后一个被阻塞负载类）：
+   - `scripts/dl/test_fa2_online_concurrency.py`（离线 Engine，fa3=DLIN FA2，不等长 batch 压进一个 varlen extend）：equal_x4 控制 PASS、**unequal_x4（lens [50,164,392,88]）PASS**、**unequal_x8 stress（lens [50,164,392,88,278,126,202,316]）PASS**。
+   - `scripts/dl/fa2_online_serve_client.py`（真·server `run_sglang.sh serve`，8 并发不等长 HTTP 请求，staggered 到达、scheduler 并发 prefill）：**PASS**。
+   - 边界：裸调 `_sgl_fa2_varlen` kernel（`diag_dldnn_fa2_crash.py` case C）在 dleol JIT 下仍 SIGSEGV —— 独立于 wrapper，不影响 engine/serve 路径。
 
 > ⚠️ 修改 attention 相关代码，动手前读 `.claude/skills/speculative-naming`（如涉及 spec）/ `sglang-modify`（DL 标记约定）。
 
@@ -191,7 +195,7 @@ bucketing + prefill CG 解禁（breakable）= 让任意-M prefill 走 capture + 
 ## 推荐执行顺序（Roadmap）
 
 **Week 1（验证 + 快胜）**
-1. **P0-1 FA2-varlen 两行修复** + 正确性单测 + 在线并发端到端验证 ← 最高优先
+1. ~~**P0-1 FA2-varlen 两行修复** + 正确性单测 + 在线并发端到端验证~~ ✅ **DONE（2026-07-25）**：修复 `0fe8c7cc86` 已合；spy 单测 + 离线 batch（unequal x4/x8）+ 在线 server（8 并发）e2e 全 PASS ← 在线并发解锁
 2. **P0-2 SC6 根因验证**（serve chunked=2048 测） ← 决定 P1-1 要不要做
 3. **P0-3 async-replay 量化**（`SGLANG_DL_TIME_REPLAY=1` + `SGLANG_DL_ASYNC_REPLAY=1`）
 4. **基础设施：CI 门禁**（顺手）
