@@ -1500,6 +1500,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             x_quant=x_quant,
         )
+        # DL: dump attention output magnitude to localize layer-0 explosion.
+        import os as _os_attn
+        if _os_attn.environ.get("SGLANG_DL_LAYER_STATS") == "1":
+            _fa = hidden_states.float()
+            print(f"[LSTAT] ATTN_OUT std={_fa.std().item():.3f} "
+                  f"absmax={_fa.abs().max().item():.3f}", flush=True)
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1544,6 +1550,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
             residual = hidden_states
+            # DL: dump hc_post output magnitude to localize layer-0 explosion.
+            import os as _os_hcp
+            if _os_hcp.environ.get("SGLANG_DL_LAYER_STATS") == "1":
+                _fh = hidden_states.float()
+                print(f"[LSTAT] HCPOST_OUT std={_fh.std().item():.3f} "
+                      f"absmax={_fh.abs().max().item():.3f}", flush=True)
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
                 self.hc_ffn_fn,
@@ -1786,6 +1798,14 @@ class DeepseekV4Model(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
+        # DL begin: dump entry (embedding) hidden scale before the layer loop.
+        import os as _os_pre
+        if _os_pre.environ.get("SGLANG_DL_LAYER_STATS") == "1":
+            _f0 = hidden_states.float()
+            print(f"[LSTAT] layer=PRE shape={tuple(hidden_states.shape)} "
+                  f"mean={_f0.mean().item():.3f} std={_f0.std().item():.3f} "
+                  f"absmax={_f0.abs().max().item():.3f}", flush=True)
+        # DL end
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             last_layer = layer
@@ -1805,6 +1825,16 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+            # DL begin: per-layer hidden-state stats to localize gibberish corruption
+            # (SGLANG_DL_LAYER_STATS=1). NaN/Inf or a magnitude explosion/vanish pinpoints
+            # the first bad layer. Temporary diagnostic.
+            import os as _os
+            if _os.environ.get("SGLANG_DL_LAYER_STATS") == "1":
+                _f = hidden_states.float()
+                print(f"[LSTAT] layer={i} mean={_f.mean().item():.3f} std={_f.std().item():.3f} "
+                      f"absmax={_f.abs().max().item():.3f} nan={torch.isnan(_f).any().item()} "
+                      f"inf={torch.isinf(_f).any().item()}", flush=True)
+            # DL end
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
