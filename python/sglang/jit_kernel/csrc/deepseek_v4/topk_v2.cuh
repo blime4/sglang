@@ -335,7 +335,9 @@ topk_fused_transform(const __grid_constant__ TopKParams params) {
     Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/true);
     Small::transform(transform);
   } else {
-    const auto [offset, length] = partition_work(seq_len, cluster_rank);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+    const auto [_offset, _length] = partition_work(seq_len, cluster_rank); const auto offset = _offset; const auto length = _length;
+// DL end
     const auto ws = params.workspace + batch_id * params.workspace_stride;
     Large::stage1_init(smem);
     device::PDLWaitPrimary<true>();

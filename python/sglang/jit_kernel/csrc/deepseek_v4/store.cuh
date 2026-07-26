@@ -50,7 +50,9 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
   using Float2 = packed_t<Float>;
   const auto elems = static_cast<const Float2*>(input)[tid + bid * 256];
   if (wid != 7) {
-    const auto [x, y] = cast<fp32x2_t>(elems);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+    const auto [_x, _y] = cast<fp32x2_t>(elems); const auto x = _x; const auto y = _y;
+// DL end
     const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
     const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
     const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
@@ -99,8 +101,12 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   using InStorage = AlignedVector<Float2, 2>;
   using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
   const auto elems = static_cast<const InStorage*>(input)[global_tid];
-  const auto [x0, x1] = cast<fp32x2_t>(elems[0]);
-  const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_x0, _x1] = cast<fp32x2_t>(elems[0]); const auto x0 = _x0; const auto x1 = _x1;
+// DL end
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_y0, _y1] = cast<fp32x2_t>(elems[1]); const auto y0 = _y0; const auto y1 = _y1;
+// DL end
   const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
   const auto abs_max = warp::reduce_max(local_max);
   // use normal fp32 scale

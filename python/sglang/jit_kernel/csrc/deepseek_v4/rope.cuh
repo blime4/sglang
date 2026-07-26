@@ -60,11 +60,15 @@ __global__ __launch_bounds__(kBlockSize, 16)  //
   const auto input = static_cast<DType2*>(pointer::offset(base_ptr, batch_id * stride_batch, local_head * stride_head));
 
   const auto freq_ptr = reinterpret_cast<const fp32x2_t*>(freqs_cis + position * kRopeDim);
-  const auto [f_real, f_imag] = freq_ptr[lane_id];
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_f_real, _f_imag] = freq_ptr[lane_id]; const auto f_real = _f_real; const auto f_imag = _f_imag;
+// DL end
   PDLWaitPrimary<kUsePDL>();
 
   const auto data = input[lane_id];
-  const auto [x_real, x_imag] = cast<fp32x2_t>(data);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_x_real, _x_imag] = cast<fp32x2_t>(data); const auto x_real = _x_real; const auto x_imag = _x_imag;
+// DL end
   fp32x2_t output;
   if constexpr (kInverse) {
     // (a + bi) * (c - di) = (ac + bd) + (bc - ad)i

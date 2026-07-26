@@ -152,8 +152,12 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   using DType2 = packed_t<DType>;
   const auto mem_elem = tile::Memory<DType2>{lane_id, kWarpThreads};
   const auto elem = mem_elem.load(s_rope[warp_id]);
-  const auto [x_real, x_imag] = cast<fp32x2_t>(elem);
-  const auto [freq_real, freq_imag] = freq;
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_x_real, _x_imag] = cast<fp32x2_t>(elem); const auto x_real = _x_real; const auto x_imag = _x_imag;
+// DL end
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_freq_real, _freq_imag] = freq; const auto freq_real = _freq_real; const auto freq_imag = _freq_imag;
+// DL end
   const fp32x2_t rotated = {
       x_real * freq_real - x_imag * freq_imag,
       x_real * freq_imag + x_imag * freq_real,

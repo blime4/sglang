@@ -796,8 +796,10 @@ inline OnlinePrefillPlan plan_online_prefill(
     std::memset(pc, 0xAB, bytes);
     std::memset(pw, 0xAB, bytes);
   }
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
 
-  const auto [num_c, num_w] = _plan_prefill_partial(stage0_params);
+  const auto [_num_c, _num_w] = _plan_prefill_partial(stage0_params); const auto num_c = _num_c; const auto num_w = _num_w;
+// DL end
   const auto num_c_padded = use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_c;
   const auto num_w_padded = use_cuda_graph ? static_cast<uint32_t>(N.unwrap()) : num_w;
 

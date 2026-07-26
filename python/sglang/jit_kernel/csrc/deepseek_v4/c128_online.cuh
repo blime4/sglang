@@ -339,7 +339,9 @@ __global__ __launch_bounds__(kPrefillBlockSize, 2)  //
   const uint32_t global_pid = global_id / kNumSplit;  // plan id
   const uint32_t global_sid = global_id % kNumSplit;  // split id
   if (global_pid >= num_plans) return;
-  const auto [ragged_id, batch_id, position, window_len] = plan_ptr[global_pid];
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_ragged_id, _batch_id, _position, _window_len] = plan_ptr[global_pid]; const auto ragged_id = _ragged_id; const auto batch_id = _batch_id; const auto position = _position; const auto window_len = _window_len;
+// DL end
   if (ragged_id == 0xFFFFFFFFu) [[unlikely]]
     return;
 

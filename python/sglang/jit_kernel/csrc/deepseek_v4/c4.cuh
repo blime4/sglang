@@ -322,7 +322,9 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
 
   if constexpr (kMode == PageMode::Page4Align) {
     const auto write_second_page = index;
-    const auto [load_first_page, load_second_page, write_first_page, last_pos] = extra[global_bid];
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+    const auto [_load_first_page, _load_second_page, _write_first_page, _last_pos] = extra[global_bid]; const auto load_first_page = _load_first_page; const auto load_second_page = _load_second_page; const auto write_first_page = _write_first_page; const auto last_pos = _last_pos;
+// DL end
     if constexpr (kWrite) {
       int32_t index;
       if (position < static_cast<uint32_t>(last_pos)) {

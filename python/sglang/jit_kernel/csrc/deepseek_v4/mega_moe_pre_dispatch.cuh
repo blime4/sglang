@@ -64,7 +64,9 @@ __global__ __launch_bounds__(1024, 2) void  //
     float vals[kVecElems];
 #pragma unroll
     for (uint32_t i = 0; i < kVecElems / 2; ++i) {
-      const auto [v0, v1] = cast<fp32x2_t>(in_vec[i]);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+      const auto [_v0, _v1] = cast<fp32x2_t>(in_vec[i]); const auto v0 = _v0; const auto v1 = _v1;
+// DL end
       vals[2 * i + 0] = v0;
       vals[2 * i + 1] = v1;
       local_max = fmaxf(local_max, fmaxf(fabsf(v0), fabsf(v1)));

@@ -59,8 +59,12 @@ SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
     up = __hmax2(up, {-limit, -limit});
     up = __hmin2(up, {limit, limit});
   }
-  const auto [g0, g1] = cast<fp32x2_t>(gate);
-  const auto [u0, u1] = cast<fp32x2_t>(up);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_g0, _g1] = cast<fp32x2_t>(gate); const auto g0 = _g0; const auto g1 = _g1;
+// DL end
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+  const auto [_u0, _u1] = cast<fp32x2_t>(up); const auto u0 = _u0; const auto u1 = _u1;
+// DL end
   const auto silu0 = g0 / (1.0f + __expf(-g0));
   const auto silu1 = g1 / (1.0f + __expf(-g1));
   const float val0 = silu0 * u0;
@@ -171,7 +175,9 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+    const auto [_x, _y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit); const auto x = _x; const auto y = _y;
+// DL end
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
@@ -426,7 +432,9 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
+// DL begin: structured binding -> regular vars (dlcc lambda-capture compat)
+    const auto [_x, _y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit); const auto x = _x; const auto y = _y;
+// DL end
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
