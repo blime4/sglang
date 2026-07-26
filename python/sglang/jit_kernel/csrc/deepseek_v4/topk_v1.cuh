@@ -332,7 +332,11 @@ struct TopKKernel {
         .page_bits = page_bits,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
+// DL begin: KS38 may have lower max dynamic shared mem than 64KB
+#ifndef SGL_ON_DLIN
     setup_kernel_smem_once<kernel, kSMEM_>();
+#endif
+    // DL end
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
   }
 };
