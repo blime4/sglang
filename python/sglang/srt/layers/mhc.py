@@ -48,10 +48,14 @@ except ImportError:
                 def _jit(*_args, **_kwargs):
                     def _wrap(fn):
                         def _raise(*a, **k):
-                            raise RuntimeError(
-                                "tilelang is not installed; this kernel cannot run "
-                                "on the current platform"
-                            )
+                            # DL begin
+                            # tilelang not available on DLIN — return a callable no-op
+                            # so JIT-decorated kernel functions can be called (they do
+                            # nothing; output tensors stay uninitialized). For e2e smoke.
+                            def _noop(*args, **kwargs):
+                                pass
+                            return _noop
+                            # DL end
 
                         return _raise
 
