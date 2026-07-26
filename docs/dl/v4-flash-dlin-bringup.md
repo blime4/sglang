@@ -199,3 +199,65 @@ fallbacks), CG (OOM), fast execution (all torch fallbacks).
 (item 4) → unblocks fast MoE + correct expert selection → re-test the torch
 Sinkhorn (item 1) → potentially coherent output. Then wire the DL indexer +
 deep_gemm → remove remaining fallbacks → benchmark (item 5).
+
+---
+
+## Correctness investigation — 2026-07-27 (gibberish root-cause hunt)
+
+**Symptom:** V4-Flash runs end-to-end on DLIN sglang (loads, generates) but emits
+input-dependent **gibberish** (multilingual-random tokens / 16×EOS for some prompts) =
+near-uniform logits = severely corrupted hidden states.
+
+**Verified EXONERATED (arg/math correct vs vLLM's working DL ops):**
+1. **Sinkhorn MHC port** (`hc_split_sinkhorn`) — unit-tested well-conditioned; arg indexing
+   matches tilelang kernel exactly.
+2. **Indexer** (`fp8_fp4_paged_mqa_logits`) — FP8 path matches vLLM contract; torch-fallback
+   math sound. The prior "DL op HANGS" was a malformed *FP4* adapter (tuple/int8/68-wide into
+   an FP8-only op) on a path DLIN never takes (`enable_deepseek_v4_fp4_indexer` defaults False,
+   gated to sm100).
+3. **MLA decode** (`flash_mla_with_kvcache`) — every arg matches vLLM. **Fixed real bug:**
+   `causal=True→False` (commit `29d8b28e35`); causal=True read the None
+   block_table/cache_seqlens as null descriptors in sparse mode.
+4. **MLA prefill** (PATH A reuses decode kernel; PATH B sparse kernel broken on DLIN via
+   op-name mismatch, only affects >11673-token prefill) — PATH A args structurally identical
+   to verified decode.
+5. **KV-store quantization** (`quant_to_nope_fp8_rope_bf16_pack_triton`) — inspected correct
+   (per-64-tile FP8e4m3 + ue8m0 pow2 scales, 584-byte layout matches vLLM).
+
+**Primary gibberish = MLA value-level** (not MHC): uniform MHC sets `post=0` (zeroes MHC
+contribution → MHC≈identity via residual), yet output is *still* full gibberish → corruption
+is in the MLA layers. MLA args are verified-correct, so it's a **value-level** bug
+(q-projection / KV-store values / weight-loading / RoPE / norm) that arg-diffs can't catch.
+
+**Secondary: Sinkhorn→empty** — correct Sinkhorn pre/post/comb values collapse output to
+empty (uniform→gibberish). Implicates the MHC pre/post/fused torch fallbacks
+(`mhc_pre`/`mhc_post`/`mhc_fused_post_pre`, used when `SGLANG_OPT_USE_TILELANG_MHC_PRE=0`).
+Toggle: `SGLANG_DL_MHC_UNIFORM=1`. Layer 0 is MHC → processes first.
+
+**CRITICAL REFRAME — vLLM V4-Flash ALSO fails on this DLIN setup (hangs).** `.venv` vLLM has
+native V4 support. Serve cmd: `.venv/bin/vllm serve /LocalRun/hao.dong/DeepSeek-V4-Flash
+--port 8299 --dtype bf16 --tp 8 --max-model-len 4096 --max-num-seqs 8 --kv-cache-dtype fp8
+--enforce-eager --trust-remote-code` + `VLLM_USE_V2_MODEL_RUNNER=1` + sourced SDK env
+(needs `--kv-cache-dtype fp8` or AssertionError). Model loads fine (19.83 GiB/worker), uses
+fp8_ds_mla KV + Lightning Indexer, sets SWA block=256, then **HANGS** at warmup (0% util,
+no log). So the "match vLLM's working call" strategy's premise is broken — there is no
+working vLLM V4 reference on this DLIN box. V4-on-DLIN is immature in BOTH frameworks.
+
+**Repro (sglang smoke, eager, TP8):** `CUDA_VISIBLE_DEVICES=8-15` (or 24-31 if 8-15 leaked)
++ `source sdk-dlop-07-13-20-30/env.sh` + env: `DLI_V2=ON TORCHDYNAMO_DISABLE=1
+SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 SGLANG_DL_FP8_Q2=1 SGLANG_DL_MOE_FUSED=1
+SGLANG_DL_MOE_FUSED_MAX_M=2048 SGLANG_DL_GDN_DLIN=1 SGLANG_OPT_USE_FUSED_HASH_TOPK=0
+SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0 SGLANG_OPT_USE_TOPK_V2=0
+SGLANG_TOPK_TRANSFORM_512_TORCH=1 SGLANG_OPT_USE_TILELANG_MHC_PRE=0` →
+`.venv/bin/python scripts/dl/v4_smoke.py`.
+
+**Next steps (multi-session):**
+- Debug vLLM V4's warmup hang (verbose logging) to recover a working reference, then compare
+  sglang vs vLLM tensors layer-by-layer (layer-0 MLA output, post-store KV, logits).
+- OR build a standalone pure-torch V4 MLA layer reference (heavy, avoids vLLM import which
+  SIGABRT-crashes sglang's process via `_dl_C` double-registration).
+- In-process MLA ref-check is a dead end: importing vLLM into sglang SIGABRT-crashes the
+  scheduler (not catchable).
+
+**Card notes:** killed vLLM leaked ~20GB on cards 8-15 (DLIN driver doesn't release on kill;
+needs `sudo dlsmi -r -i <id>`). Cards 24-31 are a fresh free TP8 block.
