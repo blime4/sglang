@@ -126,7 +126,11 @@ struct ClusterTopK {
 
     // 2-shot all-reduce
     {
+      #ifdef SGL_ON_DLIN
+      auto cluster = DLClusterStub();
+#else
       auto cluster = cooperative_groups::this_cluster();
+#endif
       cluster.sync();
       const auto cluster_rank = blockIdx.y;
       const auto kLocalSize = kHistBins / kClusterSize;
@@ -205,7 +209,11 @@ struct ClusterTopK {
   // ---------------------------------------------------------------------------
 
   SGL_DEVICE static void stage1_epilogue(const TransformParams params, const uint32_t offset, void* _ws, void* _smem) {
-    auto cluster = cooperative_groups::this_cluster();
+    #ifdef SGL_ON_DLIN
+      auto cluster = DLClusterStub();
+#else
+      auto cluster = cooperative_groups::this_cluster();
+#endif
     const auto smem = static_cast<Smem*>(_smem);
     const auto tx = threadIdx.x;
     const auto local_above = smem->counter_gt;
