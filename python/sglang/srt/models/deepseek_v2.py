@@ -189,7 +189,16 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
+    # DL begin: flashinfer is NVIDIA-only and absent on DLIN; sgl_kernel's dsv3_*
+    # GEMMs ARE present on DLIN, so guard just the flashinfer symbol. DeepSeek-V4
+    # uses its own dsv4/ MLA path; the DSv3 flashinfer router GEMM
+    # (_raw_dsv3_router_gemm) is unused on DLIN (stubbed None — if a DLIN model's
+    # forward hits it, wire it to the vendored gptq_dlblas_gemmex FP8 GEMM).
+    try:
+        from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
+    except ModuleNotFoundError:
+        _raw_dsv3_router_gemm = None
+    # DL end
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
