@@ -121,7 +121,13 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   static_assert(8 * kWorkThreads == 128, "Invalid tiling");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
-  const auto [expert_id, token_id, valid] = get_work(params);
+  // DL begin: C++17 structured bindings can't be lambda-captured in dlcc/clang
+  // (nvcc allows it as an extension). Copy to regular vars before the lambda.
+  const auto [_expert_id, _token_id, _valid] = get_work(params);
+  const auto expert_id = _expert_id;
+  const auto token_id = _token_id;
+  const auto valid = _valid;
+  // DL end
 
   if (!valid) return;
 
