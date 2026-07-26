@@ -302,3 +302,9 @@ artifacts/
 /vllm-new-overlay/
 /models-dl/
 /whl-for-compare/
+
+# DL: accidental kernel dumps
+MHAPostProcessOp_invoke_kernel_int32.cu
+dleol::v2::per_group_high_dim_dequant_kernel_wrap.cu
+flash_attn_kvcache_mha_int32.cu
+bench_features_result.json
