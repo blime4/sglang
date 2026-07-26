@@ -153,9 +153,12 @@ def hc_split_sinkhorn(
     eps: float = 1e-6,
 ):
     b, s, _ = mixes.size()
-    pre = mixes.new_empty(b, s, hc_mult)
-    post = mixes.new_empty(b, s, hc_mult)
-    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
+    # DL begin: use zeros (not empty) so the no-op tilelang stub leaves finite
+    # values instead of NaN/garbage — prevents NaN propagation to the sampler.
+    pre = mixes.new_zeros(b, s, hc_mult)
+    post = mixes.new_zeros(b, s, hc_mult)
+    comb = mixes.new_zeros(b, s, hc_mult, hc_mult)
+    # DL end
     kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
     kernel(
         mixes.view(-1, (2 + hc_mult) * hc_mult),
