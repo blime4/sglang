@@ -4,9 +4,9 @@
 #include <cstdint>
 
 // DL begin: cuda/ptx (Hopper TMA/mbarrier/elect_sync) not available on DLIN's
-// dlcc. The topk_v2 kernel doesn't use these PTX functions (only __syncwarp),
-// so guard the include + definitions. Other kernels that DO need them will
-// fail at compile time (clear error) rather than silently break.
+// dlcc. Provide no-op stubs in the #else branch so all topk headers compile.
+// The TMA/streaming paths are never called at runtime (kClusterSize=1 routes
+// everything through the small single-block path for decode).
 #ifndef SGL_ON_DLIN
 #include <cuda/ptx>
 #endif
@@ -55,9 +55,9 @@ SGL_DEVICE bool elect_sync_cta(uint32_t tx) {
   const auto uniform_warp_id = __shfl_sync(0xFFFFFFFF, warp_id, 0);
   return (uniform_warp_id == 0 && elect_sync());
 }
-// DL stubs: provide no-op implementations so streaming.cuh compiles on DLIN.
-// These are never called at runtime (kClusterSize=1 means the streaming/cluster
-// path is not used for decode). They just need to compile.
+#else
+// DL stubs: no-op implementations so streaming.cuh + register.cuh compile on DLIN.
+// Never called at runtime (kClusterSize=1, decode uses small path only).
 SGL_DEVICE void mbarrier_wait(uint64_t* addr, uint32_t phase) {}
 SGL_DEVICE void mbarrier_init(uint64_t* addr, uint32_t arrives) {}
 SGL_DEVICE void mbarrier_arrive_expect_tx(uint64_t* addr, uint32_t tx) {}
@@ -65,7 +65,7 @@ SGL_DEVICE void mbarrier_arrive(uint64_t* addr) {}
 SGL_DEVICE void tma_load(void* dst, const void* src, uint32_t num_bytes, uint64_t* mbar) {}
 SGL_DEVICE uint32_t elect_sync() { return threadIdx.x == 0 ? 1u : 0u; }
 SGL_DEVICE bool elect_sync_cta(uint32_t tx) { return tx == 0; }
-#endif // SGL_ON_DLIN
+#endif
 
 }  // namespace ptx
 
