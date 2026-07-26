@@ -1,14 +1,21 @@
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda/ptx>
-
 #include <cstdint>
+
+// DL begin: cuda/ptx (Hopper TMA/mbarrier/elect_sync) not available on DLIN's
+// dlcc. The topk_v2 kernel doesn't use these PTX functions (only __syncwarp),
+// so guard the include + definitions. Other kernels that DO need them will
+// fail at compile time (clear error) rather than silently break.
+#ifndef SGL_ON_DLIN
+#include <cuda/ptx>
+#endif
 
 namespace device::top512 {
 
 namespace ptx {
 
+#ifndef SGL_ON_DLIN
 SGL_DEVICE void mbarrier_wait(uint64_t* addr, uint32_t phase) {
   while (!cuda::ptx::mbarrier_try_wait_parity(cuda::ptx::sem_relaxed, cuda::ptx::scope_cta, addr, phase))
     ;
@@ -48,6 +55,7 @@ SGL_DEVICE bool elect_sync_cta(uint32_t tx) {
   const auto uniform_warp_id = __shfl_sync(0xFFFFFFFF, warp_id, 0);
   return (uniform_warp_id == 0 && elect_sync());
 }
+#endif // SGL_ON_DLIN
 
 }  // namespace ptx
 
