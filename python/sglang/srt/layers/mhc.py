@@ -153,12 +153,26 @@ def hc_split_sinkhorn(
     eps: float = 1e-6,
 ):
     b, s, _ = mixes.size()
-    # DL begin: tilelang not available — approximate MHC with uniform weights
-    # (pre=1/hc_mult, comb=identity) so the model processes FINITE meaningful
-    # attention instead of zeros. Output quality degraded but not empty/NaN.
-    pre = mixes.new_ones(b, s, hc_mult) / hc_mult
-    post = mixes.new_zeros(b, s, hc_mult)
-    comb = torch.eye(hc_mult, device=mixes.device, dtype=mixes.dtype).unsqueeze(0).unsqueeze(0).expand(b, s, hc_mult, hc_mult).contiguous()
+    # DL begin: tilelang not available on DLIN — torch port of the EXACT
+    # hc_split_sinkhorn_kernel algorithm (pre=sigmoid, post=2*sigmoid, comb=Sinkhorn).
+    if isinstance(tilelang, _TilelangMissing):
+        n_mix = (2 + hc_mult) * hc_mult
+        mf = mixes.reshape(-1, n_mix).float()
+        pre = torch.sigmoid(mf[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+        post = 2 * torch.sigmoid(mf[:, hc_mult:2*hc_mult] * hc_scale[1] + hc_base[hc_mult:2*hc_mult])
+        comb = mf[:, 2*hc_mult:] * hc_scale[2] + hc_base[2*hc_mult:]
+        comb = comb.reshape(-1, hc_mult, hc_mult)
+        # Sinkhorn: exp-max + row-normalize + col-normalize, then iterate
+        comb = torch.exp(comb - comb.max(dim=-1, keepdim=True).values)
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        pre = pre.reshape(b, s, hc_mult).to(mixes.dtype)
+        post = post.reshape(b, s, hc_mult).to(mixes.dtype)
+        comb = comb.reshape(b, s, hc_mult, hc_mult).to(mixes.dtype)
+        return pre, post, comb
     # DL end
     kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
     kernel(
