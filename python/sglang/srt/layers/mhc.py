@@ -153,11 +153,12 @@ def hc_split_sinkhorn(
     eps: float = 1e-6,
 ):
     b, s, _ = mixes.size()
-    # DL begin: use zeros (not empty) so the no-op tilelang stub leaves finite
-    # values instead of NaN/garbage — prevents NaN propagation to the sampler.
-    pre = mixes.new_zeros(b, s, hc_mult)
+    # DL begin: tilelang not available — approximate MHC with uniform weights
+    # (pre=1/hc_mult, comb=identity) so the model processes FINITE meaningful
+    # attention instead of zeros. Output quality degraded but not empty/NaN.
+    pre = mixes.new_ones(b, s, hc_mult) / hc_mult
     post = mixes.new_zeros(b, s, hc_mult)
-    comb = mixes.new_zeros(b, s, hc_mult, hc_mult)
+    comb = torch.eye(hc_mult, device=mixes.device, dtype=mixes.dtype).unsqueeze(0).unsqueeze(0).expand(b, s, hc_mult, hc_mult).contiguous()
     # DL end
     kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
     kernel(
