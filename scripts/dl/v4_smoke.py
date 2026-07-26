@@ -27,7 +27,7 @@ if __name__ == "__main__":
     try:
         engine = sgl.Engine(
             model_path=MODEL, tp_size=TP, dtype="bfloat16",
-            trust_remote_code=True, mem_fraction_static=0.90,
+            trust_remote_code=True, mem_fraction_static=0.85,
             disable_custom_all_reduce=True,  # NCCL (DLIN HC_CUK Error=28 blocker)
             disable_cuda_graph=False,  # DL: try CG (was eager to avoid hang; testing now)
         )
