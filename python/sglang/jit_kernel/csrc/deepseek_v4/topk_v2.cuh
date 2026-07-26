@@ -31,7 +31,12 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
+    // DL begin: skip on DLIN (KS38 shared mem limit may reject)
+#ifndef SGL_ON_DLIN
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#else
+    return cudaSuccess;
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }
@@ -479,8 +484,6 @@ struct CombinedTopKKernel {
     if (max_seq_len <= Small::kMax1PassLength) {
       // All items fit in the short path -- no stage-1 needed
       constexpr auto kernel = topk_short_transform;
-      // DL: skip smem setup on DLIN (device limit)
-#ifndef SGL_ON_DLIN
       setup_kernel_smem_once<kernel, kStage2SMEM>();
       LaunchKernel(batch_size, kBlockSize, device, kStage2SMEM)  //
           .enable_pdl(true)(kernel, params);
@@ -490,26 +493,20 @@ struct CombinedTopKKernel {
         // can fuse into 1 stage
         constexpr auto kernel = topk_fused_transform;
         constexpr auto kSMEM = std::max(kStage1SMEM, kStage2SMEM);
-        // DL: skip smem setup on DLIN (device limit)
-#ifndef SGL_ON_DLIN
-      setup_kernel_smem_once<kernel, kSMEM>();
+        setup_kernel_smem_once<kernel, kSMEM>();
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kSMEM)
             .enable_cluster({1, kClusterSize})
             .enable_pdl(true)(kernel, params);
       } else {
         // stage 1 + stage 2
         constexpr auto kernel_stage_1 = topk_combine_preprocess;
-        // DL: skip smem setup on DLIN (device limit)
-#ifndef SGL_ON_DLIN
-      setup_kernel_smem_once<kernel_stage_1, kStage1SMEM>();
+        setup_kernel_smem_once<kernel_stage_1, kStage1SMEM>();
         const auto num_clusters = std::min(batch_size, kNumClusters);
         LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device, kStage1SMEM)
             .enable_cluster({1, kClusterSize})
             .enable_pdl(true)(kernel_stage_1, params);
         constexpr auto kernel_stage_2 = topk_combine_transform;
-        // DL: skip smem setup on DLIN (device limit)
-#ifndef SGL_ON_DLIN
-      setup_kernel_smem_once<kernel_stage_2, kStage2SMEM>();
+        setup_kernel_smem_once<kernel_stage_2, kStage2SMEM>();
         LaunchKernel(batch_size, kBlockSize, device, kStage2SMEM)  //
             .enable_pdl(true)(kernel_stage_2, params);
       }
