@@ -519,7 +519,18 @@ class C4IndexerBackendMixin:
             weights = weights.float()
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            # DL begin: route to vendored DL op on DLIN (deep_gemm absent)
+            from sglang.srt.utils.common import is_dlin as _is_dlin
+            if _is_dlin():
+                def fn(q_values, kv_cache, weights, context_lens, block_tables, sched_meta, max_len, clean):
+                    return torch.ops.sgl_kernel.fp8_fp4_paged_mqa_logits(
+                        q_values, None, kv_cache, weights, context_lens, block_tables,
+                        sched_meta if sched_meta is not None else torch.empty(0, dtype=torch.int32, device=q_values.device),
+                        int(max_len), clean
+                    )
+            else:
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            # DL end
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
@@ -532,7 +543,18 @@ class C4IndexerBackendMixin:
             else:
                 fn = fp8_paged_mqa_logits_torch
         else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
+            # DL begin: route to vendored DL op on DLIN
+            from sglang.srt.utils.common import is_dlin as _is_dlin
+            if _is_dlin():
+                def fn(q_values, kv_cache, weights, context_lens, block_tables, sched_meta, max_len, clean):
+                    return torch.ops.sgl_kernel.fp8_fp4_paged_mqa_logits(
+                        q_values, None, kv_cache, weights, context_lens, block_tables,
+                        sched_meta if sched_meta is not None else torch.empty(0, dtype=torch.int32, device=q_values.device),
+                        int(max_len), clean
+                    )
+            else:
+                from deep_gemm import fp8_paged_mqa_logits as fn
+            # DL end
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 

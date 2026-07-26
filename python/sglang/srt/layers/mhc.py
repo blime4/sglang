@@ -157,12 +157,7 @@ def hc_split_sinkhorn(
     # from tilelang hc_split_sinkhorn_kernel). With nan_to_num guard for numerical
     # stability (prevents NaN propagation through the forward → empty output).
     if isinstance(tilelang, _TilelangMissing):
-        # DL: use uniform for non-empty output (Sinkhorn produces empty with degraded indexer)
-        pre = mixes.new_ones(b, s, hc_mult) / hc_mult
-        post = mixes.new_zeros(b, s, hc_mult)
-        comb = torch.eye(hc_mult, device=mixes.device, dtype=mixes.dtype).unsqueeze(0).unsqueeze(0).expand(b, s, hc_mult, hc_mult).contiguous()
-        return pre, post, comb
-        # Sinkhorn (exact algo, produces empty with degraded components):
+        # Sinkhorn (exact algo from tilelang hc_split_sinkhorn_kernel):
         n_mix = (2 + hc_mult) * hc_mult
         mf = mixes.reshape(-1, n_mix).float()
         mf = torch.nan_to_num(mf)  # guard: NaN in mixes → NaN everywhere → empty output
