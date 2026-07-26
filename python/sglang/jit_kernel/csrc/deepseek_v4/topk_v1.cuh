@@ -17,7 +17,14 @@ namespace {
 
 constexpr uint32_t kTopK = SGL_TOPK;
 constexpr uint32_t kTopKBlockSize = SGL_TOPK;
-constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
+
+// Use 32KB on DLIN (sufficient for decode with k=6 experts, 256 total).
+#ifdef SGL_ON_DLIN
+constexpr uint32_t kSMEM = 8 * 1024 * sizeof(uint32_t);  // 32KB
+#else
+constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB
+
+
 
 struct TopKParams {
   const float* __restrict__ scores;
@@ -332,11 +339,11 @@ struct TopKKernel {
         .page_bits = page_bits,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little
-// DL begin: KS38 may have lower max dynamic shared mem than 64KB
-#ifndef SGL_ON_DLIN
+
+
     setup_kernel_smem_once<kernel, kSMEM_>();
-#endif
-    // DL end
+
+    
     LaunchKernel(batch_size, kTopKBlockSize, device.unwrap(), kSMEM_).enable_pdl(kUsePDL)(kernel, params);
   }
 };
