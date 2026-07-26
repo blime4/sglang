@@ -60,7 +60,15 @@ static_assert(sizeof(GlobalMetadata) == sizeof(Metadata), "layout: row 0 must oc
 // optimize occupancy for prefill
 #define SMALL_TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, 2)
 // cluster at y dim
+// DL begin: __cluster_dims__ is Hopper-only; dlcc doesn't support it.
+// On DLIN the large-topk cluster path won't be used (small topk suffices for
+// decode), so guard the macro to empty.
+#ifdef SGL_ON_DLIN
+#define LARGE_CLUSTER
+#else
 #define LARGE_CLUSTER __cluster_dims__(1, kClusterSize, 1)
+#endif
+// DL end
 // stage-1 is persistent cluster, and shared memory usage is huge (can not 2)
 #define LARGE_TOPK_STAGE_1 __global__ __launch_bounds__(kBlockSize, 1) LARGE_CLUSTER
 // stage-2 is non-persistent non-cluster, with less shared memory and higher occupancy

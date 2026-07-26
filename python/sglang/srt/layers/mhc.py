@@ -154,16 +154,24 @@ def hc_split_sinkhorn(
 ):
     b, s, _ = mixes.size()
     # DL begin: tilelang not available on DLIN — torch Sinkhorn port (exact algorithm
-    # from tilelang hc_split_sinkhorn_kernel). NOTE: produces empty output when
-    # combined with the topk/indexer torch fallbacks (interaction issue); use the
-    # uniform fallback below for non-empty pipeline verification. The Sinkhorn
-    # implementation is correct (exact port) and will produce correct output once
-    # the topk/indexer fallbacks are replaced with DL kernels.
+    # from tilelang hc_split_sinkhorn_kernel). With JIT topk now enabled (cluster
+    # guarded), this should produce correct MHC output.
     if isinstance(tilelang, _TilelangMissing):
-        # Uniform approximation for pipeline verification (non-empty output)
-        pre = mixes.new_ones(b, s, hc_mult) / hc_mult
-        post = mixes.new_zeros(b, s, hc_mult)
-        comb = torch.eye(hc_mult, device=mixes.device, dtype=mixes.dtype).unsqueeze(0).unsqueeze(0).expand(b, s, hc_mult, hc_mult).contiguous()
+        n_mix = (2 + hc_mult) * hc_mult
+        mf = mixes.reshape(-1, n_mix).float()
+        pre = torch.sigmoid(mf[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+        post = 2 * torch.sigmoid(mf[:, hc_mult:2*hc_mult] * hc_scale[1] + hc_base[hc_mult:2*hc_mult])
+        comb = mf[:, 2*hc_mult:] * hc_scale[2] + hc_base[2*hc_mult:]
+        comb = comb.reshape(-1, hc_mult, hc_mult)
+        comb = torch.exp(comb - comb.max(dim=-1, keepdim=True).values)
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        pre = pre.reshape(b, s, hc_mult).to(mixes.dtype)
+        post = post.reshape(b, s, hc_mult).to(mixes.dtype)
+        comb = comb.reshape(b, s, hc_mult, hc_mult).to(mixes.dtype)
         return pre, post, comb
     # DL end
     kernel = hc_split_sinkhorn_kernel(hc_mult, sinkhorn_iters, eps)
