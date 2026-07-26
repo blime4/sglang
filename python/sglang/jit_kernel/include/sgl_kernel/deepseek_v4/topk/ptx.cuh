@@ -55,6 +55,16 @@ SGL_DEVICE bool elect_sync_cta(uint32_t tx) {
   const auto uniform_warp_id = __shfl_sync(0xFFFFFFFF, warp_id, 0);
   return (uniform_warp_id == 0 && elect_sync());
 }
+// DL stubs: provide no-op implementations so streaming.cuh compiles on DLIN.
+// These are never called at runtime (kClusterSize=1 means the streaming/cluster
+// path is not used for decode). They just need to compile.
+SGL_DEVICE void mbarrier_wait(uint64_t* addr, uint32_t phase) {}
+SGL_DEVICE void mbarrier_init(uint64_t* addr, uint32_t arrives) {}
+SGL_DEVICE void mbarrier_arrive_expect_tx(uint64_t* addr, uint32_t tx) {}
+SGL_DEVICE void mbarrier_arrive(uint64_t* addr) {}
+SGL_DEVICE void tma_load(void* dst, const void* src, uint32_t num_bytes, uint64_t* mbar) {}
+SGL_DEVICE uint32_t elect_sync() { return threadIdx.x == 0 ? 1u : 0u; }
+SGL_DEVICE bool elect_sync_cta(uint32_t tx) { return tx == 0; }
 #endif // SGL_ON_DLIN
 
 }  // namespace ptx

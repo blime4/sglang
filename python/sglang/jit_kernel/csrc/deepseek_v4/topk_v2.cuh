@@ -157,7 +157,11 @@ PLAN_KERNEL void topk_plan(
   constexpr uint32_t kNumCandidates = std::size(kCandidates);
   constexpr uint32_t kMinBatchSize = kCandidates[0].max_batch_size;
   static_assert(kCandidates[0].threshold == kMax2PassLength);
-  static_assert(kCandidates[kNumCandidates - 1].threshold == kMaxSupportedLength);
+  // DL begin: kMaxLength changes with kClusterSize; skip this assert on DLIN
+#ifndef SGL_ON_DLIN
+    static_assert(kCandidates[kNumCandidates - 1].threshold == kMaxSupportedLength);
+#endif
+    // DL end
 
   __shared__ uint32_t s_count;  // final N after compaction
   __shared__ uint32_t s_counts[kNumCandidates];
