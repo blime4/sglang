@@ -37,7 +37,7 @@ if __name__ == "__main__":
         import traceback; traceback.print_exc(); sys.exit(1)
     print(f"[v4-smoke] engine up in {time.perf_counter()-t0:.0f}s", flush=True)
     try:
-        out = engine.generate("The capital of France is", {"max_new_tokens": 16, "temperature": 0})
+        out = engine.generate("The capital of France is", {"max_new_tokens": 16, "temperature": 0, "ignore_eos": True})
         txt = out["text"] if isinstance(out, dict) else str(out)
         print(f"[v4-smoke] GENERATED: {txt!r}", flush=True)
         print("[v4-smoke] E2E OK", flush=True)
