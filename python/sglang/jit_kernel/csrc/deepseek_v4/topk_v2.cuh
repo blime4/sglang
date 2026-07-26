@@ -352,7 +352,12 @@ topk_fused_transform(const __grid_constant__ TopKParams params) {
     Large::stage1_prologue(params.get_scores(batch_id) + offset, length, smem);
     Large::stage1(s_topk_indices, length, smem);
     Large::stage1_epilogue(transform, offset, ws, smem);
+    // DL: cluster not supported on DLIN
+#ifdef SGL_ON_DLIN
+    cooperative_groups::this_thread_block().sync();
+#else
     cooperative_groups::this_cluster().sync();
+#endif
     if (cluster_rank != 0) return;  // only first rank do the stage-2
     Large::transform(transform, ws, smem);
   }

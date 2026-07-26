@@ -1,4 +1,7 @@
 #pragma once
+#ifdef SGL_ON_DLIN
+#define this_cluster() this_thread_block()
+#endif
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
