@@ -27,9 +27,9 @@ if __name__ == "__main__":
     try:
         engine = sgl.Engine(
             model_path=MODEL, tp_size=TP, dtype="bfloat16",
-            trust_remote_code=True, mem_fraction_static=0.85,
+            trust_remote_code=True, mem_fraction_static=0.90,
             disable_custom_all_reduce=True,  # NCCL (DLIN HC_CUK Error=28 blocker)
-            disable_cuda_graph=False,  # DL: try CG (was eager to avoid hang; testing now)
+            disable_cuda_graph=True,  # DL: CG OOM on 32GB cards (149GB model + workspace > 32GB)
         )
     except Exception as e:
         print(f"[v4-smoke] ENGINE LOAD FAILED ({type(e).__name__}) after "
