@@ -1086,6 +1086,19 @@ def mhc_post(
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
+    # DL begin: tilelang absent on DLIN -> mhc_post_tilelang is a no-op, so the
+    # torch.empty_like(out) below stays UNINITIALIZED and is returned as garbage,
+    # corrupting the residual at layer 0 (an MHC layer) for all 43 layers (root cause
+    # of V4-Flash gibberish). Compute the verified torch equivalent instead, mirroring
+    # mhc_post_tilelang: out[j,h] = post[j]*x[h] + sum_k comb[k,j]*residual[k,h]
+    # (identical to models/deepseek_v4.py hc_post_torch_impl, agent-verified vs kernel).
+    if isinstance(tilelang, _TilelangMissing):
+        _post = post_layer_mix.squeeze(-1)
+        return (
+            _post.unsqueeze(-1) * x.unsqueeze(1)
+            + (comb_res_mix.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
+        ).type_as(x)
+    # DL end
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,
