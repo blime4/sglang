@@ -1,7 +1,4 @@
 #pragma once
-#ifdef SGL_ON_DLIN
-#define this_cluster() this_thread_block()
-#endif
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
@@ -12,6 +9,18 @@
 #include <cstdint>
 
 namespace device::top512 {
+
+#ifdef SGL_ON_DLIN
+// DL: cluster stub for kClusterSize=1 (single-block cluster)
+struct DLClusterStub {
+  void sync() { __syncthreads(); }
+  template<typename T> T* map_shared_rank(T* addr, uint32_t rank) { return addr; }
+  uint32_t block_rank() const { return 0; }
+  uint32_t num_blocks() const { return 1; }
+  uint32_t dim_threads() const { return blockDim.x; }
+  uint32_t thread_rank() const { return threadIdx.x; }
+};
+#endif
 
 template <uint32_t K>
 struct ClusterTopK {
