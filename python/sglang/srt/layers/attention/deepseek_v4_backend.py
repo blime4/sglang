@@ -1453,7 +1453,13 @@ class DeepseekV4AttnBackend(
                     cache_seqlens=None,
                     head_dim_v=self.head_dim_v,
                     softmax_scale=self.softmax_scale,
-                    causal=True,
+                    # DL: causal must be False in sparse mode (indices provided,
+                    # block_table/cache_seqlens=None). causal=True forces the kernel onto a
+                    # causal path that reads the None block_table/cache_seqlens as a null
+                    # descriptor -> garbage positions across all MLA layers -> gibberish.
+                    # Matches vLLM (omits causal->False), our sm120 + NVIDIA paths (omit it),
+                    # and the op docstring ("causal ... Only valid for dense attention").
+                    causal=False,
                     is_fp8_kvcache=True,
                     indices=swa_page_indices,
                     attn_sink=attn_sink,
