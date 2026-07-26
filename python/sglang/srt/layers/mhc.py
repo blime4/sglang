@@ -34,6 +34,11 @@ try:
     }
 except ImportError:
 
+    # DL begin: ensure _mhc_pre_warmed is defined even without tilelang (DLIN has
+    # no tilelang); without this, mhc_pre() hits NameError on the global.
+    _mhc_pre_warmed = False
+    # DL end
+
     class _TilelangMissing:
         """Stub so module-level @tilelang.jit and PassConfigKey accesses parse."""
 
