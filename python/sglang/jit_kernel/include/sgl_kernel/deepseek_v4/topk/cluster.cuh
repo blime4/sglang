@@ -13,12 +13,12 @@ namespace device::top512 {
 #ifdef SGL_ON_DLIN
 // DL: cluster stub for kClusterSize=1 (single-block cluster)
 struct DLClusterStub {
-  void sync() { __syncthreads(); }
-  template<typename T> T* map_shared_rank(T* addr, uint32_t rank) { return addr; }
-  uint32_t block_rank() const { return 0; }
-  uint32_t num_blocks() const { return 1; }
-  uint32_t dim_threads() const { return blockDim.x; }
-  uint32_t thread_rank() const { return threadIdx.x; }
+  SGL_DEVICE void sync() { __syncthreads(); }
+  template<typename T> SGL_DEVICE T* map_shared_rank(T* addr, uint32_t rank) { return addr; }
+    SGL_DEVICE uint32_t block_rank() const { return 0; }
+    SGL_DEVICE uint32_t num_blocks() const { return 1; }
+    SGL_DEVICE uint32_t dim_threads() const { return blockDim.x; }
+    SGL_DEVICE uint32_t thread_rank() const { return threadIdx.x; }
 };
 #endif
 
