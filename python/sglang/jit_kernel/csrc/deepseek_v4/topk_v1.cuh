@@ -23,8 +23,7 @@ constexpr uint32_t kTopKBlockSize = SGL_TOPK;
 constexpr uint32_t kSMEM = 8 * 1024 * sizeof(uint32_t);  // 32KB
 #else
 constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB
-
-
+#endif
 
 struct TopKParams {
   const float* __restrict__ scores;
