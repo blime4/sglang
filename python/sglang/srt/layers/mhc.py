@@ -154,11 +154,12 @@ def hc_split_sinkhorn(
 ):
     b, s, _ = mixes.size()
     # DL begin: tilelang not available on DLIN — torch Sinkhorn port (exact algorithm
-    # from tilelang hc_split_sinkhorn_kernel). With JIT topk now enabled (cluster
-    # guarded), this should produce correct MHC output.
+    # from tilelang hc_split_sinkhorn_kernel). With nan_to_num guard for numerical
+    # stability (prevents NaN propagation through the forward → empty output).
     if isinstance(tilelang, _TilelangMissing):
         n_mix = (2 + hc_mult) * hc_mult
         mf = mixes.reshape(-1, n_mix).float()
+        mf = torch.nan_to_num(mf)  # guard: NaN in mixes → NaN everywhere → empty output
         pre = torch.sigmoid(mf[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
         post = 2 * torch.sigmoid(mf[:, hc_mult:2*hc_mult] * hc_scale[1] + hc_base[hc_mult:2*hc_mult])
         comb = mf[:, 2*hc_mult:] * hc_scale[2] + hc_base[2*hc_mult:]
@@ -169,6 +170,7 @@ def hc_split_sinkhorn(
         for _ in range(sinkhorn_iters - 1):
             comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
             comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        comb = torch.nan_to_num(comb)  # guard: Sinkhorn may produce inf/nan edge cases
         pre = pre.reshape(b, s, hc_mult).to(mixes.dtype)
         post = post.reshape(b, s, hc_mult).to(mixes.dtype)
         comb = comb.reshape(b, s, hc_mult, hc_mult).to(mixes.dtype)
