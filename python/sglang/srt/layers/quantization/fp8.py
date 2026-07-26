@@ -2144,10 +2144,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _srt = layer._dl_moecu_srt
                 _eid = layer._dl_moecu_eid
                 _npp = layer._dl_moecu_npp
+                # DL: V4 MoE is mxfp4/FP4 (int8=2×FP4 packed). The fused op was called with
+                # use_fp8_w8a8=True (FP8 mode), which interprets FP4-packed bytes as FP8 ->
+                # 9000× garbage explosion -> gibberish (the V4 gibberish ROOT CAUSE). Switch
+                # to use_mxfp4_w4a16=True (the op's native FP4 mode) for FP4 models. Auto via
+                # self.is_fp4_expert; SGLANG_DL_MOE_FP4=1 forces it on (V4 config mislabels
+                # quant_method=fp8). Verified: "The capital of France is"->" Paris", "1+1="->"2".
+                _use_mxfp4 = getattr(self, "is_fp4_expert", False) or _os.environ.get("SGLANG_DL_MOE_FP4") == "1"
+                _qf = (False, False, False, True) if _use_mxfp4 else (True, False, False, False)
                 _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
                    _tw, _ti,
                    _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
-                   True, False, False, False, [128, 128], M)
+                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
                 he = _silu_and_mul(c13.reshape(-1, 2 * inter)).reshape(M, topk, inter)
                 _M2 = M * topk
                 _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
@@ -2156,7 +2164,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
                    _tw_w2, _ti_w2.to(torch.int32),
                    _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
-                   True, False, False, False, [128, 128], _M2)
+                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
                 out = c2.reshape(M, topk, hidden).sum(dim=1)
                 return StandardCombineInput(hidden_states=out)
                 # DL end (use_moe_cu)
