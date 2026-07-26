@@ -339,6 +339,8 @@ class RMSNorm(MultiPlatformOp):
             if needs_reshape_dl:
                 original_shape_dl = x.shape
                 x = x.contiguous().reshape(-1, original_shape_dl[-1])
+            else:
+                x = x.contiguous()
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
