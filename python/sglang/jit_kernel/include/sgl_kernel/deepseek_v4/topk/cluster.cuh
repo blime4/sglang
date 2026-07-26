@@ -15,7 +15,17 @@ namespace device::top512 {
 
 template <uint32_t K>
 struct ClusterTopK {
+  // DL begin: kClusterSize=1 on DLIN — no Hopper cluster hardware, so each "cluster"
+  // is a single block. this_thread_block().sync() == this_cluster().sync() when
+  // cluster size = 1, making the cooperative_groups guards equivalent.
+  // kMaxLength shrinks (1 * kNumStages * kSizePerStage) but decode seq_lens are
+  // short — the plan kernel routes long items to the 2-pass small path instead.
+#ifdef SGL_ON_DLIN
+  static constexpr uint32_t kClusterSize = 1;
+#else
   static constexpr uint32_t kClusterSize = 8;
+#endif
+  // DL end
   static constexpr uint32_t kHistBits = 10;
   static constexpr uint32_t kHistBins = 1 << kHistBits;
   static constexpr uint32_t kRadixBins = 256;
