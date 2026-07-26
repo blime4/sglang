@@ -39,7 +39,10 @@ if __name__ == "__main__":
     try:
         out = engine.generate("The capital of France is", {"max_new_tokens": 16, "temperature": 0, "ignore_eos": True})
         txt = out["text"] if isinstance(out, dict) else str(out)
+        mi = out.get("meta_info", {}) if isinstance(out, dict) else {}
         print(f"[v4-smoke] GENERATED: {txt!r}", flush=True)
+        print(f"[v4-smoke] completion_tokens={mi.get('completion_tokens')} "
+              f"output_ids={str(mi.get('output_ids',''))[:100]}", flush=True)
         print("[v4-smoke] E2E OK", flush=True)
     except Exception as e:
         print(f"[v4-smoke] GENERATE FAILED ({type(e).__name__}): {str(e)[:500]}", flush=True)
