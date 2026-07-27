@@ -364,6 +364,69 @@
           "error": ""
         }
       }
+    },
+    {
+      "id": "r009",
+      "timestamp": "2026-07-27T18:44:54",
+      "sglang_commit": "d9b63d51cc",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": false,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC1",
+        "SC2",
+        "SC3",
+        "SC5",
+        "SC7",
+        "SC8",
+        "SC9",
+        "SC10"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC10_throughput_tps": 14.3,
+          "SC10_total_ms": 20168.0,
+          "SC1_cold_ms": 20715.0,
+          "SC1_speedup_x": 11.07,
+          "SC1_warm_ms": 1872.0,
+          "SC2_avg_ms": 2751.0,
+          "SC2_turn5_ms": 2090.0,
+          "SC3_per_req_ms": 1583.0,
+          "SC3_throughput_tps": 20.2,
+          "SC5_avg_turn_ms": 1512.0,
+          "SC5_total_ms": 12093.0,
+          "SC7_throughput_tps": 13.9,
+          "SC7_total_ms": 13787.0,
+          "SC8_tps": 23.4,
+          "SC9_tps": 35.8
+        },
+        "vllm_mrv1": {
+          "status": "ok",
+          "SC10_throughput_tps": 24.2,
+          "SC10_total_ms": 11884.0,
+          "SC1_cold_ms": 1620.0,
+          "SC1_speedup_x": 1.34,
+          "SC1_warm_ms": 1207.0,
+          "SC2_avg_ms": 1283.0,
+          "SC2_turn5_ms": 1201.0,
+          "SC3_per_req_ms": 763.0,
+          "SC3_throughput_tps": 41.9,
+          "SC5_avg_turn_ms": 993.0,
+          "SC5_total_ms": 7942.0,
+          "SC7_throughput_tps": 23.8,
+          "SC7_total_ms": 8064.0,
+          "SC8_tps": 51.0,
+          "SC9_tps": 36.8
+        },
+        "vllm_mrv2": {
+          "status": "fail",
+          "error": "File \"/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sglang/.venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 799, in _send_input\n    self.ensure_alive()\n  File \"/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sglang/.venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 628, in ensure_alive\n    raise EngineDeadError()\nvllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.\n\nRendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]\n/home/shaobo.xie/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 4 leaked semaphore objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n/home/shaobo.xie/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 5 leaked shared_memory objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n[W727 18:39:14.792016044 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())"
+        }
+      }
     }
   ]
 }
