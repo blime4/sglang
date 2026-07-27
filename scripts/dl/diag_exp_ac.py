@@ -17,6 +17,7 @@ os.environ.setdefault("SGLANG_DL_FP8_Q2", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED_MAX_M", "2048")
 os.environ.setdefault("SGLANG_DL_GDN_DLIN", "1")
+os.environ.setdefault("SGLANG_DL_GDN_DLIN_EXTEND", "1")  # DL: GDN prefill on DLIN dl_chunk (8x faster)
 
 MODEL = os.environ.get("MODEL_PATH",
     "/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/models/Qwen3.6-35B-A3B-FP8")

@@ -220,6 +220,12 @@ pick_model() {
       # Matches the tuned TP4 config in scripts/dl/compare_tp4.py (~27ms TPOT = ~vLLM parity):
       # FP8 Q2 GEMM, DLIN GDN op, multi-step decode, FLA pingpong/unroll.
       export SGLANG_DL_FP8_Q2=1 SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MULTI_STEP=1
+      # DL: route GDN prefill(extend) to the DLIN dl_chunk kernel (NOT the default
+      # triton chunk). The triton extend path is BOTH slow (~8x) AND less correct
+      # ("custom initial_state_indices path that diverges from vLLM -> wrong first
+      # token", gdn_backend.py:76-93). dl_chunk is 8x faster (2K prefill 41s->5.1s)
+      # and matches vLLM. Verified correct ("capital of France"->" Paris"). 2026-07-28.
+      export SGLANG_DL_GDN_DLIN_EXTEND=1
       export DLEOL_CU_ADDRESS_CHECK=0 DLEOL_FLA_ENABLE_PINGPONG=1 DLEOL_FLA_UNROLL_COUNT=8
       # TP=4 needs 4 GPUs; ensure CUDA_VISIBLE_DEVICES lists >=4 devices.
       local _ndev

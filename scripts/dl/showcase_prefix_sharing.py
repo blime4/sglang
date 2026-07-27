@@ -22,6 +22,9 @@ os.environ.setdefault("SGLANG_DL_FP8_Q2", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED_MAX_M", "2048")
 os.environ.setdefault("SGLANG_DL_GDN_DLIN", "1")
+# DL: route GDN prefill(extend) to DLIN dl_chunk (else triton chunk = 8x slower + less
+# correct, gdn_backend.py:76-93). 2K prefill 41s->5.1s, output matches vLLM. 2026-07-28.
+os.environ.setdefault("SGLANG_DL_GDN_DLIN_EXTEND", "1")
 os.environ.setdefault("SGLANG_DL_MULTI_STEP", "1")
 os.environ.setdefault("DLEOL_CACHE_SIZE", "1024")
 os.environ.setdefault("DLEOL_FLA_ENABLE_PINGPONG", "1")
