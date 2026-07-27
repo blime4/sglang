@@ -1,92 +1,91 @@
-# sglang vs vLLM on DLIN — Data-Backed Showcase (Where sglang Wins, Where It Doesn't)
+# sglang vs vLLM on DLIN —— 三引擎数据驱动的展示（sglang / MRV2 / MRV1）
 
-**Date:** 2026-07-22 · **Hardware:** DLIN KS38 (32× QUAD, 32 GiB) · **Model:** Qwen3.5-35B-A3B-**FP8** (hybrid Mamba+attention) · **TP4, GPUs 0–3**
-**Harness:** `scripts/dl/showcase_prefix_sharing.py` (same prompt, same GPUs, fresh process per engine, best-of-3, temp=0)
+**日期：** 2026-07-27 · **硬件：** DLIN KS38（32× QUAD，32 GiB）· **模型：** Qwen3.6-35B-A3B-**FP8**（混合 Mamba+attention）· **TP4**
+**框架：** `scripts/dl/showcase_prefix_sharing.py`（相同 prompt、相同 GPU、每引擎 fresh 进程、best-of-3、temp=0）
 
-> 目的：用**同模型、同卡、同 prompt、顺序跑**的实测数据，明确告诉别人 sglang 相对 vLLM **到底好在哪里、好多少、哪里不好**。不回避 sglang 输的场景。
+> 目的：用**同模型、同卡、同 prompt、顺序跑**的实测数据，回答三引擎在混合 Mamba 模型上的前缀缓存表现。sglang（默认 RadixAttention）、vLLM-MRV2（默认 APC-OFF）、vLLM-MRV1（APC+CG-on opt-in）。
 
 ---
 
 ## TL;DR — 一张图看完
 
-| 场景 | sglang | vLLM | 结论 |
-|---|---|---|---|
-| **SC1 前缀共享** warm（缓存命中） | **5.56 s** | 13.0 s | **sglang 2.3× 快** |
-| **SC1 前缀共享** 冷→暖加速比 | **16.4×** | 1.0× | **sglang 碾压** |
-| **SC2 多轮对话** 5 轮平均 | **8.74 s** | 14.4 s | **sglang 1.6× 快** |
-| **SC2 多轮** 第 5 轮（4K ctx） | **8.12 s** | 15.8 s | **sglang 1.9× 快** |
-| **SC3 并发批** 4 请求吞吐 | **6.0 tok/s** | 2.6 tok/s | **sglang 2.3× 高** |
-| **SC3 并发批** 单请求 | **5.34 s** | 12.5 s | **sglang 2.3× 快** |
-| SC4 结构化 JSON（短 prompt，预热后） | 31.7 tok/s | 34.6 tok/s | vLLM +9%（基本持平） |
-| 纯 decode TPOT（无前缀） | 35.0 tok/s | 37.9 tok/s | vLLM +8% |
-| **SC5 多用户 fork**（共享根的 2 分支 radix 树） | **13.2 s** | 108.0 s | **sglang 8.2× 快** ✅ |
-| **SC7 长 RAG 吞吐**（~2K 文档 × 8 查询） | **13.0 tok/s** | 0.8 tok/s | **sglang 16.3× 高** ✅ |
-| **SC8 best-of-N 并行采样**（n=4，temp=0.7） | **22.2 tok/s** | 3.8 tok/s | **sglang 5.8× 高** ✅ |
-| **SC10 共享 system-prompt**（12 租户） | **13.4 tok/s** | 1.9 tok/s | **sglang 7.05× 高** ✅ |
-| SC9 纯长 decode（短 prompt，128 tok，无共享） | 30.5 tok/s | **39.6 tok/s** | vLLM 1.30×（诚实控制组）⚠️ |
+| 场景 | sglang | vLLM-MRV2 | vLLM-MRV1 (APC+CG-on) | 结论 |
+|---|---|---|---|---|---|
+| **SC1 前缀共享** warm | **2.01 s** | 13.06 s | **1.21 s** | MRV1 1.67× > sglang > MRV2 6.5× |
+| **SC1 前缀共享** cold→warm | **10.4×** | 1.01× | 1.35× | sglang 碾压（radix 树） |
+| **SC2 多轮对话** 平均 | **2.87 s** | 14.50 s | **1.29 s** | MRV1 2.2× > sglang > MRV2 5.1× |
+| **SC2 多轮** 第 5 轮 | **2.19 s** | 16.00 s | **1.21 s** | MRV1 1.8× > sglang > MRV2 7.3× |
+| **SC3 并发批** 吞吐 | **20.0 tok/s** | 2.5 tok/s | **41.9 tok/s** | MRV1 2.1× > sglang > MRV2 8.0× |
+| **SC3 并发批** 单请求 | **1.60 s** | 12.68 s | **0.76 s** | MRV1 2.1× > sglang > MRV2 7.9× |
+| SC4 结构化 JSON（短 prompt） | 31.7 tok/s | 34.6 tok/s | — | vLLM +9%（基本持平） |
+| **SC5 多用户 fork** | **13.2 s** | 108.0 s | — | **sglang 8.2× 快** ✅ |
+| **SC7 长 RAG** | **13.0 tok/s** | 0.8 tok/s | — | **sglang 16.3× 高** ✅ |
+| **SC10 共享 system-prompt** | **13.4 tok/s** | 1.9 tok/s | — | **sglang 7.05× 高** ✅ |
+| SC9 纯长 decode | 30.5 tok/s | **39.6 tok/s** | — | vLLM 1.30× ⚠️ |
 
-**一句话**：sglang 在**所有"前缀/多轮/并发"缓存复用场景**全面领先 1.6–2.3×；**vLLM 的 APC（前缀缓存）在本模型上根本无法开启**（硬 assert 失败）。vLLM 仅在**无缓存复用的纯 decode / 短 JSON** 上略快 ~8–9%。
+**核心发现**：**MRV1 (APC+CG-on) 全面超过 sglang**（1.7–2.2×），因为 MRV1 有 APC + 更快的 DLIN 原生路径。但 vLLM **默认配置 MRV2 仍然 APC-OFF**（结构性不支持 Mamba → 6–8× 慢于两者）。sglang 的优势在于：它是 DLIN 上**唯一默认就有前缀缓存的引擎**（无需切换 runner）。MRV1 虽然更快，但需要显式 opt-in（`VLLM_USE_V2_MODEL_RUNNER=0` + 特殊 compilation_config）。
 
-> **2026-07-24 新增场景**（SC5/SC7/SC8/SC9/SC10）：多用户 fork 树、长 RAG 吞吐、
-> best-of-N 并行采样、纯 decode 控制、共享 system-prompt 多租户。SC5/SC7/SC10 把
-> sglang 的领先从 1.6–2.3× 拉到 **7–16×**（前缀越长/复用越多，vLLM 重 prefill 越惨）。
-> 详见 [`sglang-vs-vllm-new-scenarios.md`](sglang-vs-vllm-new-scenarios.md)。运行：
-> `./run_sglang.sh compare --scenarios SC5,SC7,SC8,SC9,SC10`。
+> **注**：SC5/SC7/SC8/SC9/SC10 等扩展场景尚未用 MRV1 测试。
+> 详见 [`sglang-vs-vllm-new-scenarios.md`](sglang-vs-vllm-new-scenarios.md)。
 
 ---
 
 ## 1. 实验设置（公平性保证）
 
-- **同模型**：`/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/`（FP8，两引擎都用）
-- **同卡**：GPU 0–3，TP4，顺序跑（每个引擎 fresh 进程，避免 PCIe/compile 互相干扰）
+- **同模型**：`/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/models/Qwen3.6-35B-A3B-FP8/`（FP8，三引擎都用）
+- **同卡**：GPU 8–11，TP4，顺序跑（每个引擎 fresh 进程，避免互相干扰）
 - **同 prompt**：~2K token 共享系统 prompt + 技术文档 + few-shot（见 `SHARED_PREFIX`）
 - **温度 0，best-of-3**，max_new=32（SC1–3）/ 48（SC4）
-- **关键修正**：vLLM 用 `.venv` 的 0.21.1.dev2（原生，**无 overlay**），FP8+CG+MRV2；旧 `../venv-vllm021`+overlay 配置是坏的（见 [`dlin-vllm-correct-package-and-env-gotchas`](../../../home/shaobo.xie/.claude/projects/-LocalRun-shaobo-xie-2-Pytorch-docker-test-debug-sglang/memory/dlin-vllm-correct-package-and-env-gotchas.md)）
-- sglang：FP8 + CG + RadixAttention + fa3 + page_size=16，`mem_fraction_static=0.55`
+- **三引擎**：
+  - **sglang**：FP8 + CG + RadixAttention + fa3 + page_size=16，`mem_fraction_static=0.55`
+  - **vLLM-MRV2**（默认）：FP8 + CG + **APC-OFF**（Mamba 结构性限制）
+  - **vLLM-MRV1**（opt-in）：FP8 + CG + **APC-ON** + `compilation_config={"mode":"NONE", "cudagraph_capture_sizes":[1,2,4,528]}`
+- vLLM 版本：0.21.1.dev2（`.venv` 原生）
 
 ---
 
-## 2. SC1 前缀共享 —— sglang 的主场 ⭐
+## 2. SC1 前缀共享 —— 三引擎对比 ⭐
 
 **场景**：8 个请求共享同一个 2K-token 前缀，每个只换最后一句问题。
 **测量**：第 1 个请求 = cold（前缀首次 prefill）；第 2–8 个 = warm（前缀已缓存，只需 prefill 新问题）。
 
 ```
-sglang:  cold=91194ms  warm_median=5564ms  warm_min=5493ms  speedup=16.4×
-vLLM:    cold=13068ms  warm_median=13002ms warm_min=12969ms speedup=1.0×
+sglang:   cold=20876ms  warm_median=2010ms  speedup=10.4×
+vLLM-MRV2: cold=13178ms  warm_median=13058ms speedup=1.0×
+vLLM-MRV1: cold=1628ms   warm_median=1206ms  speedup=1.4×
 ```
 
-### 为什么 sglang 16.4× 而 vLLM 1.0×？
+### 为什么 MRV1 比 sglang 还快（1206 vs 2010 ms）？
 
-- **sglang RadixAttention**：token 级基数树。第 2 个请求进来时，2K 前缀的 KV **全部命中**，只需 prefill 最后 ~10 个新 token → 91 s → **5.6 s**。
-- **vLLM**：每个请求都 **重新 prefill 整个 2K 前缀**（warm 13 s ≈ cold 13 s，1.0×）。原因见 §5：vLLM 的前缀缓存（APC）在本模型上**无法开启**。
+- **MRV1 (APC+CG-on)** 的前缀缓存**确实生效**了：warm 1206 < cold 1628（1.4×），说明 APC 命中后减少了 prefill 量。而且 MRV1 的 decode CG 路径和 DLIN 原生算子路径比 sglang 更高效（无多进程 IPC 开销）。
+- **sglang RadixAttention**：warm 2010 ms（cold→warm 加速比 10.4×），但是**绝对延迟**更高——因为 sglang 的 prefill 路径在 DLIN 上更慢（见 §7）且伴有 JIT 抖动。
+- **MRV2**：APC 结构性不支持 Mamba（MRV1 才能开），每个请求完整 prefill 2K 前缀。
 
-### 注意：sglang cold=91s 的诚实说明
+### cold 的诚实说明
 
-sglang 的 cold（91 s）比 vLLM cold（13 s）慢 7×。这是 sglang **大-M prefill 路径未充分融合**（`SGLANG_DL_MOE_FUSED_MAX_M=32`，而 prefill chunk M=512 > 32 走慢路径）+ 首次 JIT 的叠加，**不是 RadixAttention 的问题**。把 `FUSED_MAX_M` 提到 512 可大幅降低 cold（待验证）。warm 5.6 s 才是缓存命中的稳态代表值——而它比 vLLM 的**每一次**请求（13 s）都快。
+sglang cold（20.9 s）仍含首次 JIT；MRV1 的 CG 初始化也含 warmup 但无 compile JIT。MRV1 cold 1.63 s ≈ sglang warm 2.01 s——这说明 MRV1 的 prefill+decode 原生路径确实比 sglang 高效。
 
-**净效果（8 请求总量，剔除一次性 JIT 后）**：sglang ≈ 15 + 7×5.6 ≈ 54 s vs vLLM 8×13 = 104 s → **sglang ~1.9× 总更快**。
+**净效果（8 请求总量）**：
+- sglang: 20.9 + 7×2.0 ≈ **34.9 s**
+- MRV1: 1.6 + 7×1.2 ≈ **10.0 s**
+- MRV2: 13.2 + 7×13.1 ≈ **104.9 s**
 
 ---
 
-## 3. SC2 多轮对话 —— sglang 越聊越省
+## 3. SC2 多轮对话 —— 三引擎对比
 
 **场景**：5 轮对话，每轮把前面所有历史拼上，再问新问题。
 **测量**：每轮 wall time。理想情况：只有新 token 被 prefill，历史 KV 复用。
 
-| 轮次 | prompt_len | sglang | vLLM |
+| 指标 | sglang | MRV2 | MRV1 (APC+CG-on) |
 |---|---|---|---|
-| turn1 | ~3.4K | 6.2 s | 13.1 s |
-| turn2 | ~3.5K | 10.9 s | 13.7 s |
-| turn3 | ~3.7K | 9.9 s | 14.4 s |
-| turn4 | ~3.9K | 8.6 s | 15.0 s |
-| turn5 | ~4.0K | 8.1 s | **15.8 s** |
+| 5 轮平均 | **2.87 s** | 14.50 s | **1.29 s** |
+| 第 5 轮 | **2.19 s** | 16.00 s | **1.21 s** |
 
 **关键现象**：
-- **vLLM 单调上升**：13.1 → 15.8 s。每轮把**整个变长的历史**重新 prefill（无缓存），轮次越多越慢。
-- **sglang 基本持平**：6.2–10.9 s。RadixAttention 复用前几轮的 KV，每轮只 prefill **新增**的问答。
-
-到第 5 轮（4K context），**sglang 8.1 s vs vLLM 15.8 s = 1.9× 快**，且差距随轮次增大。
+- **MRV2 全线最慢**：每轮重新 prefill 整个增长的对话历史，越聊越慢。
+- **MRV1 最快**（1.2–1.3 s/轮）：APC 命中历史前缀 + CG 加速 decode → 比 sglang 快约 2×。
+- **sglang 居中**：RadixAttention 复用历史 KV，但 prefill 路径在 DLIN 上较慢，绝对延迟高于 MRV1。
 
 ---
 
@@ -96,37 +95,60 @@ sglang 的 cold（91 s）比 vLLM cold（13 s）慢 7×。这是 sglang **大-M 
 **测量**：整批 wall time，3 次取最优。
 
 ```
-sglang:  batch_time=21341ms  total_tokens=128  throughput=6.0 tok/s  per_req=5335ms
-vLLM:    batch_time=50163ms  total_tokens=128  throughput=2.6 tok/s  per_req=12541ms
+sglang:   throughput=20.0 tok/s  per_req=1601ms
+MRV2:     throughput=2.5 tok/s   per_req=12678ms
+MRV1:     throughput=41.9 tok/s  per_req=764ms
 ```
 
-sglang 的 RadixAttention 在 batch 内部**去重共享前缀**（4 个请求的 2K 前缀只 prefill 一次），vLLM 无缓存则 4 份各 prefill 一遍 → **sglang 2.3× 吞吐 / 2.3× 单请求更快**。
+MRV1 的 APC 在 batch 内部**去重共享前缀**（类似 RadixAttention），加上更快的 DLIN 路径，取得最高吞吐（41.9 tok/s）。sglang 居中，MRV2 最慢（无缓存，4 份各 prefill 一遍 2K 前缀）。
 
 ---
 
-## 5. 为什么 vLLM 缓存"开不了"—— 这是本 showcase 最硬的一条 ⭐⭐
+## 5. 为什么 vLLM 缓存"开不了"—— MRV2 不能，但 MRV1 能 ⭐⭐
 
-试着给 vLLM 开 `enable_prefix_caching=True`，**EngineCore 直接 init 失败**：
+### MRV2（默认）—— APC 结构性不支持
+
+给 vLLM 默认 runner（MRV2）开 `enable_prefix_caching=True`，**EngineCore 直接 init 失败**：
 
 ```
-WARNING [config.py:367] Mamba cache mode is set to 'align' for
-  Qwen3_5MoeForConditionalGeneration by default when prefix caching is enabled
-INFO    [config.py:387] Warning: Prefix caching in Mamba cache 'align' mode is
-  currently enabled. Its support for Mamba layers is EXPERIMENTAL.
-
 AssertionError: Model Runner V2 has not yet supported mamba_cache_mode='align'.
 ```
 
-### 根因链
-1. Qwen3.5-35B-A3B 是**混合 Mamba+Attention 架构**。
-2. 一旦开 APC，vLLM 强制 Mamba cache 进入 `'align'` 模式（block_size=528，按 Mamba 状态对齐）。
-3. vLLM **Model Runner V2（MRV2）硬性拒绝** `mamba_cache_mode='align'`（assert 直接挂）。
-4. 而 DLIN 上**只能用 MRV2**（MRV1 撞 `ConstraintViolationError`，见 skill 坑③）。
-5. ⇒ **vLLM 在本模型/本平台上没有任何可用的前缀缓存路径**。只能 APC-OFF（即 §2–4 的 1.0× / 单调上升 / 重新 prefill）。
+**根因**：
+1. Qwen3.6-35B 是**混合 Mamba+Attention 架构**。
+2. 开 APC 后，vLLM 强制 Mamba cache 进入 `'align'` 模式（block_size=528）。
+3. **MRV2 硬性拒绝** `mamba_cache_mode='align'`（assert 直接挂）。
+4. DLIN 上 MRV2 是**默认** runner。⇒ **MRV2 在这模型上永远无法用 APC**。
 
-> 即便绕过 MRV2（用 MRV1），CG 路径又会触发 `block_size(528) <= max_num_batched_tokens(4)` 的另一条 assert（V2 CG 把 max_num_batched_tokens 钳到 max_cudagraph_capture_size=4）。两条路都堵死。
+### MRV1（opt-in）—— APC + CG 可以跑通
 
-**这条结论的重要性**：混合 Mamba 架构是当前前沿（Qwen3.5、Jamba、Zamba…）。sglang 的 RadixAttention **原生支持**这类模型的前缀复用，vLLM 的 APC **结构性地不支持**。这不是调参能补的差距。
+绕过 MRV2 限制（`VLLM_USE_V2_MODEL_RUNNER=0`），MRV1 可以开 APC。但有两个坑：
+
+**坑① ConstraintViolationError**：DLIN 上 torch.compile 对 MRV1 的动态形状断言失败。→ 解决：`compilation_config={"mode": "NONE"}` 关闭 compile。
+
+**坑② block_size vs max_num_batched_tokens**：DL 补丁（`dl_config.py:199-201`）把 `max_num_batched_tokens` 钳到 `max(cudagraph_capture_sizes)`。如果只传 `[1,2,4]`，则 `max_num_batched_tokens=4`，Mamba APC 需要 `block_size=528` → `assert 528 <= 4` 崩。→ 解决：capture sizes 里包含一个 ≥528 的值（如 `[1,2,4,528]`），让 DL 补丁设 `max_num_batched_tokens=528` 绕过断言。CG 实际运行时只 capture 前三个（内存预算限制），528 只占位用。
+
+**修复后的 MRV1 配置**：
+```python
+llm_kwargs["enable_prefix_caching"] = True
+llm_kwargs["compilation_config"] = {"mode": "NONE",
+                                     "cudagraph_capture_sizes": [1, 2, 4, 528],
+                                     "max_cudagraph_capture_size": 528}
+```
+
+### 三引擎缓存能力对比
+
+| 引擎 | 前缀缓存 | CG | DLIN 默认 |
+|---|---|---|---|
+| sglang (RadixAttention) | ✅ 原生 | ✅ | ✅ 默认 |
+| vLLM-MRV2 | ❌ 结构限制 | ✅ | ✅ 默认 |
+| vLLM-MRV1 (APC+CG-on) | ✅ 可用 | ✅ 可用 | ❌ 需 opt-in |
+
+**结论**：vLLM 的 APC 在 Mamba 模型上**不是完全不可用**——MRV1 配合特殊配置可以跑通且性能很好。但 **MRV2（vLLM 默认 runner）硬限制无法绕过**。这意味着 vLLM 用户要么：
+- 接受 MRV2 APC-OFF（慢 6–8×）
+- 或显式切换到 MRV1（更快但非默认路径，需自行处理配置坑）
+
+sglang 在 DLIN 上**开箱即用**就有 RadixAttention 前缀缓存，无需任何特殊配置。
 
 ---
 
@@ -148,7 +170,7 @@ sglang JSON 的真正优势在**复杂 schema / 长输出 / 与前缀共享叠�
 
 ---
 
-## 7. 纯 decode TPOT —— vLLM 略快（已另文详述）
+## 7. 纯 decode TPOT —— sglang 解码落后
 
 无前缀共享、单请求长 decode 的稳态吞吐：sglang **35.0** vs vLLM **37.9 tok/s**（vLLM +8%）。
 
@@ -159,17 +181,19 @@ sglang JSON 的真正优势在**复杂 schema / 长输出 / 与前缀共享叠�
 ## 8. 给"说服别人"用的一页结论
 
 ### sglang 明确赢的（数据支撑）
-1. **前缀共享**：16.4× 加速（warm 5.6 s vs vLLM 13.0 s 每次）。vLLM 1.0×。
-2. **多轮对话**：越聊差距越大，第 5 轮 sglang 1.9× 快；vLLM 线性变慢。
-3. **并发批（共享前缀）**：吞吐 2.3× 高。
-4. **架构适配**：sglang RadixAttention **原生支持混合 Mamba 模型**；**vLLM APC 在本模型上硬 assert 挂掉，无法开启**。⭐ 这是最硬的一条。
+1. **默认配置的直接对比**：sglang vs vLLM-MRV2（DLIN 上两者的默认 runner）——sglang **6–8× 快**（MRV2 无法开 APC）。
+2. **架构适配**：sglang RadixAttention **开箱即用**支持混合 Mamba 模型；vLLM 需要**切换到 MRV1 + 特殊配置**才能开 APC。
 
-### vLLM 赢的（诚实标注）
-1. 纯 decode TPOT：+8%（6.2 ms IPC 往返，结构性，已定位）。
-2. 短 prompt JSON：+9%（基本持平）。
+### sglang 需要注意的
+1. **MRV1 (APC+CG-on) 比 sglang 还快**（1.7–2.2×）：vLLM 非默认的 MRV1 路径配置好后，DCG + DLIN 原生算子比 sglang 更高效。这不是 sglang 的劣势，而是"默认 vs opt-in"的公平性问题。
+
+### vLLM（MRV1 opt-in）赢的
+1. MRV1 APC+CG-on：前缀场景比 sglang **快 1.7–2.2×**（需 `VLLM_USE_V2_MODEL_RUNNER=0` + 特殊 compilation_config）。
+2. 纯 decode TPOT：+8%（6.2 ms IPC 往返，结构性，已定位）。
+3. 短 prompt JSON：+9%（基本持平）。
 
 ### 一句话电梯版
-> 在 Qwen3.5-35B（混合 Mamba）这个前沿架构上，**所有需要 KV 复用的真实负载（RAG、多轮、Agent、few-shot、并发）sglang 快 1.6–2.3×**，而且 **vLLM 的前缀缓存根本跑不起来**；sglang 只在"无复用的纯 decode"上慢 8%（已知 IPC 根因，可优化）。
+> 在 Qwen3.6-35B（混合 Mamba）上：**sglang 开箱即用 RadixAttention，比 vLLM 默认（MRV2 APC-OFF）快 6–8×**。如果用户愿意切换到 vLLM 的 MRV1 非默认路径（APC+CG-on），则 MRV1 还能再比 sglang 快 1.7–2.2×——但 MRV1 不是默认配置，需要手动处理两个配置坑。**sglang 的优势在于"零配置就有前缀缓存"**。
 
 ---
 
@@ -180,15 +204,16 @@ cd /LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sglang
 source sdk-dlop-07-13-20-30/env.sh
 
 # sglang（RadixAttention）
-CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine sglang --mem-frac 0.55
+CUDA_VISIBLE_DEVICES=8,9,10,11 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine sglang --mem-frac 0.55
 
-# vLLM（APC 无法开启，唯一可用配置 = APC-OFF + CG）
-CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine vllm  --mem-frac 0.55
-# 验证 APC 崩溃：在脚本里给 LLM() 加 enable_prefix_caching=True →
-#   AssertionError: Model Runner V2 has not yet supported mamba_cache_mode='align'.
+# vLLM MRV2（APC 无法开启，DLIN 默认 runner）
+CUDA_VISIBLE_DEVICES=8,9,10,11 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine vllm --vllm-runner mrv2 --mem-frac 0.55
+
+# vLLM MRV1（APC+CG-on，opt-in）
+CUDA_VISIBLE_DEVICES=8,9,10,11 COMPARE_RUN_MRV1=1 ./run_sglang.sh compare --no-record
+# 或直接：
+CUDA_VISIBLE_DEVICES=8,9,10,11 .venv/bin/python scripts/dl/showcase_prefix_sharing.py --engine vllm --vllm-runner mrv1 --mem-frac 0.55
 ```
-
-日志：`/tmp/sc_sglang.log`、`/tmp/sc_vllm_fixed.log`（APC-OFF 可用）、`/tmp/sc_vllm_apc2.log`（APC-ON 崩溃链）。
 
 ---
 

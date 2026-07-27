@@ -643,6 +643,54 @@
           "error": ""
         }
       }
+    },
+    {
+      "id": "r017",
+      "timestamp": "2026-07-27T15:14:41",
+      "sglang_commit": "055e35d24f",
+      "sglang_branch": "dl-main",
+      "sglang_dirty": true,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC1",
+        "SC2",
+        "SC3"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC1_cold_ms": 20863.0,
+          "SC1_speedup_x": 10.38,
+          "SC1_warm_ms": 2010.0,
+          "SC2_avg_ms": 2872.0,
+          "SC2_turn5_ms": 2192.0,
+          "SC3_per_req_ms": 1601.0,
+          "SC3_throughput_tps": 20.0
+        },
+        "vllm_mrv2": {
+          "status": "ok",
+          "SC1_cold_ms": 13207.0,
+          "SC1_speedup_x": 1.01,
+          "SC1_warm_ms": 13058.0,
+          "SC2_avg_ms": 14504.0,
+          "SC2_turn5_ms": 15998.0,
+          "SC3_per_req_ms": 12678.0,
+          "SC3_throughput_tps": 2.5
+        },
+        "vllm_mrv1": {
+          "status": "ok",
+          "SC1_cold_ms": 1629.0,
+          "SC1_speedup_x": 1.35,
+          "SC1_warm_ms": 1206.0,
+          "SC2_avg_ms": 1290.0,
+          "SC2_turn5_ms": 1205.0,
+          "SC3_per_req_ms": 764.0,
+          "SC3_throughput_tps": 41.9
+        }
+      }
     }
   ]
 }

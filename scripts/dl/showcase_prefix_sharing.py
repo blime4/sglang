@@ -755,20 +755,10 @@ def main():
             engine.shutdown()
     else:
         from vllm import LLM, SamplingParams
-        # NOTE: enable_prefix_caching (APC) CANNOT be enabled on the compare's runner
-        # (MRV2) for this hybrid Mamba model — vLLM forces mamba_cache_mode='align',
-        # which MRV2 hard-rejects ("Model Runner V2 has not yet supported
-        # mamba_cache_mode='align'", vllm/config/vllm.py:2030). MRV1 can enable APC
-        # (eager) but is unstable on DLIN (this compare skips it). So vLLM runs
-        # APC-OFF here (its only stable config) — re-prefilling shared prefixes.
-        # Proven 2026-07-25 by scripts/dl/apc_failure_probe.py (MRV2+APC fails under
-        # both CG and eager; MRV1+APC+eager works but MRV1 crashes on DLIN). Contrast:
-        # sglang RadixAttention works natively + with CG. See fairness-defense doc.
-        #
-        # MRV1 vs MRV2: MRV2 (VLLM_USE_V2_MODEL_RUNNER=1 + CG) is the only
-        # config that works on DLIN; MRV1 historically hits a torch.compile
-        # dynamic-shape ConstraintViolationError, so we enforce_eager for MRV1
-        # to give it a chance (still often fails — recorded as status=fail).
+        # NOTE: MRV1 supports APC (enable_prefix_caching) + CG via mode=NONE
+        # (avoids torch.compile ConstraintViolationError on DLIN).
+        # MRV2 does NOT support APC (Model Runner V2 rejects
+        # mamba_cache_mode='align'), but its CG works without mode=NONE.
         mrv2 = (runner == "mrv2")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if mrv2 else "0"
         llm_kwargs = dict(
@@ -777,11 +767,22 @@ def main():
             trust_remote_code=True, max_num_seqs=4, disable_log_stats=True,
         )
         if mrv2:
-            llm_kwargs["enforce_eager"] = False
+            # MRV2: APC unsupported (mamba_cache_mode='align' assertion);
+            # CG works with default compilation mode.
             llm_kwargs["compilation_config"] = {"cudagraph_capture_sizes": [1, 2, 4],
-                                                "max_cudagraph_capture_size": 4}
-        else:  # MRV1: dodge the torch.compile crash with eager
-            llm_kwargs["enforce_eager"] = True
+                                                 "max_cudagraph_capture_size": 4}
+        else:
+            # MRV1: APC supported + CG via mode=NONE (avoids torch.compile crash).
+            # Must include a value >= 528 in capture_sizes so DL patch
+            # (dl_config.py:199-201) sets max_num_batched_tokens >= block_size=528
+            # (Mamba align mode), avoiding assert block_size <=
+            # max_num_batched_tokens failure.  CG will skip batch=528 at runtime
+            # (memory budget caps it at max_num_seqs=4); it just needs to be in
+            # the list to keep max_num_batched_tokens high enough.
+            llm_kwargs["enable_prefix_caching"] = True
+            llm_kwargs["compilation_config"] = {"mode": "NONE",
+                                                 "cudagraph_capture_sizes": [1, 2, 4, 528],
+                                                 "max_cudagraph_capture_size": 528}
         llm = LLM(**llm_kwargs)
         raw = llm
         def generate(prompt, max_new=32, temperature=0.0, ignore_eos=False, n=1):
