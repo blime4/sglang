@@ -1949,7 +1949,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
                     moe_align_block_size as _mabs,
                 )
-                _G = torch.ops._dl_C.invoke_fused_moe_opt  # DL: native (CG-capturable, correct)
+                _G = torch.ops._dl_C.invoke_fused_moe_opt_v3  # DL: v3 (dlablas GEMM, CG-capturable)
                 from sglang.jit_kernel.activation import silu_and_mul as _silu_and_mul
                 # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
                 # not every forward step — was 80 redundant copy kernels/step × ~0.04ms
@@ -2136,14 +2136,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if _os.environ.get("SGLANG_DL_SKIP_MOE") == "1":
                     return StandardCombineInput(hidden_states=torch.zeros_like(x))
                 c13 = torch.empty(M, topk, 2 * inter, dtype=x.dtype, device=x.device)
-                if not hasattr(layer, "_dl_moecu_srt"):
-                    _PAD = 4096
-                    layer._dl_moecu_srt = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
-                    layer._dl_moecu_eid = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
-                    layer._dl_moecu_npp = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
-                _srt = layer._dl_moecu_srt
-                _eid = layer._dl_moecu_eid
-                _npp = layer._dl_moecu_npp
+                # DL: v3 (dlablas) requires real moe_align_block_size dispatch tensors
+                # (vLLM always calls mabs before v3). The trivial size-1 tensors work with
+                # the cuDNN invoke_fused_moe_opt (use_moe_cu mode) but cause v3 to hang.
+                _srt, _eid, _npp = _mabs(_ti, _BM, num_experts)
                 # DL: V4 MoE is mxfp4/FP4 (int8=2×FP4 packed). The fused op was called with
                 # use_fp8_w8a8=True (FP8 mode), which interprets FP4-packed bytes as FP8 ->
                 # 9000× garbage explosion -> gibberish (the V4 gibberish ROOT CAUSE). Switch
@@ -2151,11 +2147,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # self.is_fp4_expert; SGLANG_DL_MOE_FP4=1 forces it on (V4 config mislabels
                 # quant_method=fp8). Verified: "The capital of France is"->" Paris", "1+1="->"2".
                 _use_mxfp4 = getattr(self, "is_fp4_expert", False) or _os.environ.get("SGLANG_DL_MOE_FP4") == "1"
-                _qf = (False, False, False, True) if _use_mxfp4 else (True, False, False, False)
+                _weight_bits = 4 if _use_mxfp4 else 8
+                # DL: v3 signature replaces 4 quant bools + trailing M with weight_bits.
                 _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
                    _tw, _ti,
                    _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
-                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
+                   _weight_bits, [128, 128])
                 he = _silu_and_mul(c13.reshape(-1, 2 * inter)).reshape(M, topk, inter)
                 _M2 = M * topk
                 _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
@@ -2164,7 +2161,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
                    _tw_w2, _ti_w2.to(torch.int32),
                    _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
-                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
+                   _weight_bits, [128, 128])
                 out = c2.reshape(M, topk, hidden).sum(dim=1)
                 return StandardCombineInput(hidden_states=out)
                 # DL end (use_moe_cu)
