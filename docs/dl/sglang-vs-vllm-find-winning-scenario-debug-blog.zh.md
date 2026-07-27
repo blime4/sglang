@@ -17,7 +17,7 @@
 1. **sglang prefill 慢的真因 = GDN（hybrid Mamba 的门控线性注意力）的 prefill(extend) 路径默认走慢的 triton chunk kernel，没走 DLIN 的 `dl_chunk` kernel。** 一个开关 `SGLANG_DL_GDN_DLIN_EXTEND=1` 切过去即可（`gdn_backend.py:76-93`）。
 2. **效果（实测）**：2K prefill **41249ms → 5135ms（8×）**，50 → 399 tok/s；且**更正确**（triton 路径“首 token 偏离 vLLM”，dl_chunk 对齐 vLLM；"capital of France"→" Paris" ✓）。
 3. **场景翻转**（showcase 实测）：SC1 cold 20.7s→3.6s、SC1 warm 1.87s→**0.96s（反超 vLLM 1.2s）**、SC3 20.2→**66.6 tok/s（反超 vLLM 41.9）**。sglang 从“全输”变成“prefill-heavy + 缓存复用场景赢”。
-4. **是不是配置问题？是。** decode/FP8/MoE/CG/mem/TP 都已对齐，唯一没对齐的就是这个 GDN extend kernel 路由（vLLM 用 DLIN `dl_chunk`，sglang 默认 triton）。
+4. **是不是配置问题？是（根因 = GDN extend kernel 路由），但 fast kernel 还不稳。** decode/FP8/MoE/CG/mem/TP 都已对齐，唯一没对齐的就是 GDN extend 路由。`dl_chunk`（fast）干净环境下 8× 提速 + 正确，**但在 TP4 上偶发 NCCL desync 崩溃** → 暂 opt-in，需 DLIN 稳定化后再默认开。
 5. **decode 本来就赢**（+5%，41.7 vs 39.6 tok/s）—— 这条结论不变。
 
 **一句话**：sglang 不是架构输，是**一个 GDN prefill kernel 开关没开**。开了一行 env，sglang 在 prefill-heavy 场景反超 vLLM。
@@ -99,9 +99,9 @@ vLLM 用的是 DLIN `dl_chunk`；sglang 默认 triton —— **这就是 ~29× p
 - 正确性："The capital of France is" → " Paris, a city renowned for its iconic" ✅（与 vLLM 一致）
 - 2K prefill：41249ms → **5135ms（8×）**，50 → 399 tok/s。
 
-**已接入**：`run_sglang.sh` preset（line 228）、`scripts/dl/showcase_prefix_sharing.py`、两个 diag 脚本都加了 `SGLANG_DL_GDN_DLIN_EXTEND=1`。commit `8be4f2ae48`。
+**已识别但默认关闭（opt-in）**：`SGLANG_DL_GDN_DLIN_EXTEND=1` 在 `run_sglang.sh` preset、`showcase_prefix_sharing.py`、两个 diag 脚本里都**注释掉**了（保留文档），因为 **dl_chunk 在 TP4 上不稳定** —— 见下。
 
-> 为什么默认是 triton（=0）？代码注释暗示 triton 曾是“安全默认”，dl_chunk 当时可能未充分验证。本次实测 dl_chunk 既快又正确，**建议把 extend 默认改成 dl_chunk**（或至少在 DLIN preset 里默认开）。
+> ⚠️ **dl_chunk 稳定性问题（重要，未解决）**：首次干净环境跑（`test_gdn_extend_dl.py`、`verify_sglang` SC1/SC3）成功（8× 提速 + 正确）。但后续 / 更全场景的 run（full compare、showcase 多场景）在 **engine build / 多 rank 阶段崩于 NCCL collective-timeout desync**（留下 hung `[sglang::schedul]`，需 `dlsmi -r` 复位）。可能是 dl_chunk（DLIN `_dl_C` op）在某些 shape 上让 TP 各 rank 发散，也可能是脏进程/cache 状态。**结论：根因和修复方向已确认，但 dl_chunk 需先稳定化（找 DLIN）才能默认开启。** 复现 8× 提速：干净卡 + `scripts/dl/test_gdn_extend_dl.py`。
 
 ---
 
@@ -131,7 +131,8 @@ Exp C（512-token 单流 decode）：sglang **41.7** vs vLLM **39.6** tok/s（+5
 
 - **sglang 在 DLIN 上的 prefill 慢，根因是 GDN extend 走了 triton chunk（默认），切到 DLIN dl_chunk（`SGLANG_DL_GDN_DLIN_EXTEND=1`）即 8× 提速且更正确。** 这是个一行配置修复，不是 JIT、不是架构、不是 kernel 代码改动。
 - **修复后 sglang 在 prefill-heavy + 前缀复用场景（SC1 warm、SC3，以及预期的 SC2/5/7/10）反超 vLLM**，叠加 decode 本就领先 —— sglang 在多数真实负载上重新占优。
-- **建议**：把 `SGLANG_DL_GDN_DLIN_EXTEND=1` 设为 DLIN 默认（或改 gdn_backend.py 默认值），并在所有 preset/serve/compare 里带上。残留的 cold-prefill 差距（sglang 399 vs vLLM 1457 tok/s）需进一步 profile dl_chunk 是否还能优化，但已是可用区间。
+- **建议**：**先稳定化 dl_chunk**（找 DLIN 修 `_dl_C` 的 `dl_chunk_gated_delta_rule` 在 TP4 多 shape 上的 NCCL desync / 偶发崩），稳定后再把 `SGLANG_DL_GDN_DLIN_EXTEND=1` 设为默认。在那之前它是 opt-in（干净环境复现 8× 提速）。残留的 cold-prefill 差距（sglang 399 vs vLLM 1457 tok/s）需进一步 profile dl_chunk 是否还能优化。
+- **本次没做、不该再做**：JIT warmup（`dlin_capture_sizes`）—— prefill 是算力非 JIT，warmup 无效，已证伪。
 
 ---
 

@@ -220,12 +220,16 @@ pick_model() {
       # Matches the tuned TP4 config in scripts/dl/compare_tp4.py (~27ms TPOT = ~vLLM parity):
       # FP8 Q2 GEMM, DLIN GDN op, multi-step decode, FLA pingpong/unroll.
       export SGLANG_DL_FP8_Q2=1 SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MULTI_STEP=1
-      # DL: route GDN prefill(extend) to the DLIN dl_chunk kernel (NOT the default
-      # triton chunk). The triton extend path is BOTH slow (~8x) AND less correct
-      # ("custom initial_state_indices path that diverges from vLLM -> wrong first
-      # token", gdn_backend.py:76-93). dl_chunk is 8x faster (2K prefill 41s->5.1s)
-      # and matches vLLM. Verified correct ("capital of France"->" Paris"). 2026-07-28.
-      export SGLANG_DL_GDN_DLIN_EXTEND=1
+      # DL: GDN prefill(extend) root cause + identified fix (NOT yet default-on).
+      # The default triton extend path is ~8x slower than vLLM and is 89% of prefill
+      # (self_attention/GDN; MoE only 11%). SGLANG_DL_GDN_DLIN_EXTEND=1 routes extend
+      # to the DLIN dl_chunk kernel -> 2K prefill 41s->5.1s (8x), correct ("capital of
+      # France"->" Paris"), sglang then beats vLLM on SC1-warm (0.96 vs 1.2s) & SC3
+      # (66.6 vs 41.9 tok/s). BUT dl_chunk is UNSTABLE on TP4: later/broader runs hit
+      # NCCL collective-timeout desyncs (hung [sglang::schedul]). Re-verify in a clean
+      # env (fresh cards/cache) and stabilize dl_chunk before enabling broadly.
+      # To try: export SGLANG_DL_GDN_DLIN_EXTEND=1   (gdn_backend.py:76-93). 2026-07-28.
+      # export SGLANG_DL_GDN_DLIN_EXTEND=1   # <-- OPT-IN (crashes full compare today)
       export DLEOL_CU_ADDRESS_CHECK=0 DLEOL_FLA_ENABLE_PINGPONG=1 DLEOL_FLA_UNROLL_COUNT=8
       # TP=4 needs 4 GPUs; ensure CUDA_VISIBLE_DEVICES lists >=4 devices.
       local _ndev
