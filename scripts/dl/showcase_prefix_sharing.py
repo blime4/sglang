@@ -20,7 +20,7 @@ import os, time, statistics, argparse
 # DLIN env defaults
 os.environ.setdefault("SGLANG_DL_FP8_Q2", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED", "1")
-os.environ.setdefault("SGLANG_DL_MOE_FUSED_MAX_M", "32")
+os.environ.setdefault("SGLANG_DL_MOE_FUSED_MAX_M", "2048")
 os.environ.setdefault("SGLANG_DL_GDN_DLIN", "1")
 os.environ.setdefault("SGLANG_DL_MULTI_STEP", "1")
 os.environ.setdefault("DLEOL_CACHE_SIZE", "1024")
@@ -697,10 +697,11 @@ def main():
         # the shared prefix every request (SC1 speedup = 1.0x). Contrast: sglang
         # RadixAttention works on this model and gives 16x+. See blog.
         #
-        # MRV1 vs MRV2: MRV2 (VLLM_USE_V2_MODEL_RUNNER=1 + CG) is the only
-        # config that works on DLIN; MRV1 historically hits a torch.compile
-        # dynamic-shape ConstraintViolationError, so we enforce_eager for MRV1
-        # to give it a chance (still often fails — recorded as status=fail).
+        # MRV1 vs MRV2: MRV2 (VLLM_USE_V2_MODEL_RUNNER=1 + CG) runs CG on DLIN.
+        # MRV1 (V1) runs CG + APC (enable_prefix_caching=True). Previous versions
+        # forced enforce_eager for MRV1 due to a torch.compile dynamic-shape crash;
+        # this is now fixed (DLIN triton 3.3.0). MRV1+CG+APC is the fair baseline
+        # — it closes the gap with sglang's RadixAttention (APC equivalent).
         mrv2 = (runner == "mrv2")
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if mrv2 else "0"
         llm_kwargs = dict(
@@ -712,8 +713,12 @@ def main():
             llm_kwargs["enforce_eager"] = False
             llm_kwargs["compilation_config"] = {"cudagraph_capture_sizes": [1, 2, 4],
                                                 "max_cudagraph_capture_size": 4}
-        else:  # MRV1: dodge the torch.compile crash with eager
-            llm_kwargs["enforce_eager"] = True
+        else:  # MRV1: CG + APC
+            llm_kwargs["enforce_eager"] = False
+            llm_kwargs["enable_prefix_caching"] = True
+            llm_kwargs["compilation_config"] = {"mode": "none",
+                                                "cudagraph_capture_sizes": [1, 2, 4, 528],
+                                                "max_cudagraph_capture_size": 528}
         llm = LLM(**llm_kwargs)
         raw = llm
         def generate(prompt, max_new=32, temperature=0.0, ignore_eos=False, n=1):
