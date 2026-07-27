@@ -94,16 +94,28 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
-    # DL begin — DLIN sgl_kernel has gemma_rmsnorm + standard rmsnorm since Phase 4a/4b.
-    # No need to load vLLM _dl_C.so anymore.
+    # DL begin — DLIN: load native _dl_C ops (CG-capturable, vLLM's path). sgl_kernel's
+    # gemma_rmsnorm is a cuDNN reimpl that's CG-incompatible (DL error 900).
+    try:
+        if not hasattr(torch.ops, '_dl_C') or not hasattr(torch.ops._dl_C, 'gemma_rms_norm'):
+            import glob as _glob, os as _os
+            _repo = _os.path.dirname(_os.path.abspath(__file__))
+            for _ in range(4):
+                _repo = _os.path.dirname(_repo)
+            _so = _glob.glob(_os.path.join(_repo, '.venv', 'lib', '*', 'site-packages', 'vllm', '_dl_C*.so'))
+            if _so:
+                torch.ops.load_library(_so[0])
+    except Exception:
+        pass
+
     def _dl_has_op(_n):
         try:
-            getattr(torch.ops.sgl_kernel, _n)
+            getattr(torch.ops._dl_C, _n)
             return True
         except Exception:
             return False
 
-    _dl_C_ok = True  # Phase 4e: sgl_kernel always has the gemma ops
+    _dl_C_ok = _dl_has_op('gemma_rms_norm')
 
     def _dl_rms(input, weight, eps=1e-6, out=None, shift=0.0):
         o = torch.empty_like(input) if out is None else out
@@ -124,13 +136,13 @@ if _is_cuda or _is_xpu or _is_musa:
         def _dl_gemma_rmsnorm(i, w, eps=1e-6, out=None, enable_pdl=None):
             i = i.contiguous()
             o = out if out is not None else torch.empty_like(i)
-            torch.ops.sgl_kernel.gemma_rmsnorm(o, i, w, eps)
+            torch.ops._dl_C.gemma_rms_norm(o, i, w, eps)
             return o
 
         def _dl_gemma_fused_add_rmsnorm(i, r, w, eps=1e-6, enable_pdl=None):
             i = i.contiguous()
             r = r.contiguous()
-            torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(i, r, w, eps)
+            torch.ops._dl_C.fused_add_gemma_rms_norm(i, r, w, eps)
             return i, r
 
         gemma_rmsnorm = _dl_gemma_rmsnorm

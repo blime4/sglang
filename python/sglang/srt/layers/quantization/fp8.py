@@ -1949,7 +1949,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
                     moe_align_block_size as _mabs,
                 )
-                _G = torch.ops.sgl_kernel.invoke_fused_moe_opt  # DL: ported from _dl_C
+                _G = torch.ops._dl_C.invoke_fused_moe_opt  # DL: native (CG-capturable, correct)
                 from sglang.jit_kernel.activation import silu_and_mul as _silu_and_mul
                 # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
                 # not every forward step — was 80 redundant copy kernels/step × ~0.04ms

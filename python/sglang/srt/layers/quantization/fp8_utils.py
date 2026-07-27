@@ -544,7 +544,7 @@ def dlblas_w8a8_block_fp8_linear(
         # seen on .cpu() sync / CUDA_LAUNCH_BLOCKING is a spurious DLIN runtime
         # quirk (surfaces during init_model_parallel_group under blocking), NOT
         # a q2 op error. Wrong output ("a majorly") is upstream GDN extend bug.
-        out = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
+        out = torch.ops._dl_C.gptq_dlblas_gemmex(
             input.view(-1, input.shape[-1]), weight.t(),
             weight_scale, weight_scale, quant_type=2, bit=8
         )
@@ -584,14 +584,14 @@ def dlblas_w8a8_block_fp8_linear(
             torch.ops._C.dynamic_per_token_scaled_fp8_quant(
                 a_fp8, input_2d.contiguous(), a_scale, None
             )
-            w8a8_out = torch.ops.sgl_kernel.w8a8_matmul(
+            w8a8_out = torch.ops._dl_C.w8a8_matmul(
                 a_fp8, w_pc_t, a_scale, pc_scale, True
             )
             if bias is not None:
                 w8a8_out = w8a8_out + bias
             return w8a8_out.to(dtype=input.dtype).view(*input.shape[:-1], N)
         # DL end
-        out = torch.ops.sgl_kernel.gptq_dlblas_gemmex(  # DL: ported from _dl_C
+        out = torch.ops._dl_C.gptq_dlblas_gemmex(  # DL: ported from _dl_C
             input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
         )
     if bias is not None:
