@@ -967,8 +967,14 @@ class DeepseekV4AttnBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_sum = int(seq_lens.sum().item())
-            seq_lens_cpu = seq_lens.cpu()
+            # DL: CG capture can't do GPU→CPU syncs (.item()/.cpu()). The CG runner
+            # pre-sets seq_lens_sum/seq_lens_cpu on the batch (decode_cuda_graph_runner.py:149-155).
+            # Use those instead of syncing from the GPU tensor.
+            seq_lens_sum = getattr(forward_batch, "seq_lens_sum", None)
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_sum is None or seq_lens_cpu is None:
+                seq_lens_sum = int(seq_lens.sum().item())
+                seq_lens_cpu = seq_lens.cpu()
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
