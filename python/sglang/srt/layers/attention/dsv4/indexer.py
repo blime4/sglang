@@ -547,7 +547,7 @@ class C4IndexerBackendMixin:
             from sglang.srt.utils.common import is_dlin as _is_dlin
             if _is_dlin():
                 def fn(q_values, kv_cache, weights, context_lens, block_tables, sched_meta, max_len, clean):
-                    return torch.ops.sgl_kernel.fp8_fp4_paged_mqa_logits(
+                    return torch.ops._dl_C.fp8_fp4_paged_mqa_logits(
                         q_values, None, kv_cache, weights, context_lens, block_tables,
                         sched_meta if sched_meta is not None else torch.empty(0, dtype=torch.int32, device=q_values.device),
                         int(max_len), clean

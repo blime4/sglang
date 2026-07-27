@@ -110,27 +110,39 @@ class PagedIndexerMetadata:
         ):
             self.deep_gemm_metadata = None
         else:
-            import deep_gemm
-
-            use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+            # DL begin: deep_gemm not importable on DLIN. Build schedule_metadata
+            # as torch.zeros(num_sms+1, 2) matching vLLM's DL platform patch
+            # (deep_gemm_patch.py:320, get_num_sms()->1 → [2,2]). The _dl_C op
+            # computes scheduling internally; this is just a zero-initialized buffer.
+            from sglang.srt.utils.common import is_dlin as _is_dlin
+            if _is_dlin():
+                self.deep_gemm_metadata = torch.zeros(
+                    2, 2, dtype=torch.int32,
+                    device=self.page_table.device,
+                )
             else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+                import deep_gemm
 
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
+                use_jit_indexer = (
+                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                    or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                )
+                if use_jit_indexer:
+                    from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+                else:
+                    from deep_gemm import get_paged_mqa_logits_metadata
 
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+                _c4 = self.c4_seq_lens.to(torch.int32)
+                if _c4.dim() == 1:
+                    _c4 = _c4.unsqueeze(-1)
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
+
+                assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            # DL end
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
