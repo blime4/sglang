@@ -76,6 +76,23 @@ _is_sm120 = is_sm120_supported()
 _is_dlin = _is_dlin_check()
 # DL end
 
+# DL begin: load native _dl_C ops (CG-capturable). sgl_kernel.flash_mla_with_kvcache
+# is a cuDNN reimpl (CG-incompatible, DL error 900 during stream capture). The native
+# _dl_C op IS capturable (vLLM captures it). Load the .so standalone (no vLLM import).
+if _is_dlin:
+    try:
+        if not hasattr(torch.ops, '_dl_C') or not hasattr(torch.ops._dl_C, 'flash_mla_with_kvcache'):
+            import glob as _glob, os as _os
+            _repo = _os.path.dirname(_os.path.abspath(__file__))
+            for _ in range(5):
+                _repo = _os.path.dirname(_repo)
+            _so = _glob.glob(_os.path.join(_repo, '.venv', 'lib', '*', 'site-packages', 'vllm', '_dl_C*.so'))
+            if _so:
+                torch.ops.load_library(_so[0])
+    except Exception:
+        pass
+# DL end
+
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
@@ -1452,7 +1469,7 @@ class DeepseekV4AttnBackend(
             # internally (no tile_scheduler_metadata arg); the rest of the signature
             # matches the V4 backend's NVIDIA call.
             elif _is_dlin:
-                o = torch.ops.sgl_kernel.flash_mla_with_kvcache(
+                o = torch.ops._dl_C.flash_mla_with_kvcache(
                     q=q,
                     k_cache=swa_k_cache,
                     block_table=None,
