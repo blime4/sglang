@@ -167,8 +167,9 @@ COMPARE_SHOW="${COMPARE_SHOW:-0}"               # --show: re-render table from c
 COMPARE_HISTORY="${COMPARE_HISTORY:-0}"         # --history: print the results log, no GPU run
 COMPARE_LIST="${COMPARE_LIST:-0}"               # --list: print all scenarios + ASCII diagrams, no GPU run
 COMPARE_RECORD="${COMPARE_RECORD:-1}"           # --no-record: don't append to the JSON store
-COMPARE_RUN_MRV1="${COMPARE_RUN_MRV1:-0}"       # DL: MRV1 skipped by default (fails on DLIN, +10min)
+COMPARE_RUN_MRV1="${COMPARE_RUN_MRV1:-0}"       # DL: MRV1 opt-in (APC+CG-off, runs but +10min)
 COMPARE_BASELINE="${COMPARE_BASELINE:-}"        # --baseline <id|commit>: diff vs this (else previous run)
+COMPARE_VERBOSE="${COMPARE_VERBOSE:-0}"         # --verbose: print engine commands
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.55}"
 COMPARE_METRICS_DIR="${COMPARE_METRICS_DIR:-/tmp/sglang_compare}"
 COMPARE_STORE="${COMPARE_STORE:-$SGLANG_DIR/docs/dl/compare_results.json}"
@@ -554,6 +555,8 @@ sglang vs vLLM showcase (one-click gap tracker; Qwen3.5-35B-A3B-FP8 TP4):
   ./run_sglang.sh compare --history              # print the commit-keyed results log (no GPU run)
   ./run_sglang.sh compare --no-record            # run but don't append to the JSON store
   ./run_sglang.sh compare --baseline r001        # diff the new run vs run r001 (else vs previous)
+  ./run_sglang.sh compare --verbose              # print the exact engine commands being executed
+  ./run_sglang.sh compare --list --verbose       # list scenarios + show engine commands
   # FULL showcase (all 8 scenarios, ~25-30 min; vLLM re-prefills so it is slow):
   ./run_sglang.sh compare --scenarios SC1,SC2,SC3,SC5,SC7,SC8,SC9,SC10
   ./run_sglang.sh chat                           # interactive chat (connect to existing server on :30000)
@@ -665,6 +668,7 @@ parse_test_args() {
       --list)              COMPARE_LIST=1; shift;;
       --no-record)         COMPARE_RECORD=0; shift;;
        --baseline)          COMPARE_BASELINE="$2"; shift 2;;
+       --verbose)           COMPARE_VERBOSE=1; shift;;
       # chat
       -q|--quick)           CHAT_QUICK="$2"; shift 2;;
       --url)                CHAT_URL="$2"; shift 2;;
@@ -1116,8 +1120,93 @@ Full docs: docs/dl/sglang-vs-vllm-showcase-dlin.md (SC1-4),
 COMPARE_EOF
 }
 
+_print_compare_commands() {
+  local script="$SGLANG_DIR/scripts/dl/showcase_prefix_sharing.py"
+  local py="${VENV_DIR:-.venv}/bin/python"
+  echo ""
+  echo "========================================================================="
+  echo "  FULL engine launch commands (inside showcase_prefix_sharing.py)"
+  echo "========================================================================="
+  echo ""
+  echo "# 1) Env vars set by the script (os.environ.setdefault):"
+  echo "  SGLANG_DL_FP8_Q2=1"
+  echo "  SGLANG_DL_MOE_FUSED=1"
+  echo "  SGLANG_DL_MOE_FUSED_MAX_M=32"
+  echo "  SGLANG_DL_GDN_DLIN=1"
+  echo "  SGLANG_DL_MULTI_STEP=1"
+  echo "  DLEOL_CACHE_SIZE=1024"
+  echo "  DLEOL_FLA_ENABLE_PINGPONG=1"
+  echo "  DLEOL_FLA_UNROLL_COUNT=8"
+  echo "  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+  echo "  HF_HUB_OFFLINE=1"
+  echo "  TRANSFORMERS_OFFLINE=1"
+  echo "  DLEOL_USE_CU_MQA_TILEKV=1"
+  echo "  VLLM_MAX_MOE_CU_TOKENS=128"
+  echo ""
+  echo "# 2) Wrapper command (what run_sglang.sh executes):"
+  echo "  $py $script \\"
+  echo "      --engine <sglang|vllm> \\"
+  echo "      --vllm-runner <mrv2|mrv1> \\"
+  echo "      --mem-frac $COMPARE_MEM_FRAC \\"
+  echo "      --scenarios $COMPARE_SCENARIOS"
+  echo ""
+  echo "# 3) Internal engine launch (Python API calls inside the script):"
+  echo ""
+  echo "  --- sglang (sgl.Engine) ---"
+  echo "  engine = sgl.Engine("
+  echo "      model_path=${MODEL_PATH:-<MODEL_PATH>},"
+  echo "      tp_size=${DLIN_TP_SIZE:-4},"
+  echo "      dtype=bfloat16,"
+  echo "      context_length=4096,"
+  echo "      mem_fraction_static=$COMPARE_MEM_FRAC,"
+  echo "      max_running_requests=4,"
+  echo "      disable_cuda_graph=False,"
+  echo "      cuda_graph_max_bs_decode=4,"
+  echo "      attention_backend=${ATTN_BACKEND:-fa3},"
+  echo "      page_size=16,"
+  echo "      disable_custom_all_reduce=True,"
+  echo "      trust_remote_code=True,"
+  echo "      chunked_prefill_size=512,"
+  echo "  )"
+  echo ""
+  echo "  --- vLLM MRV2 (LLM + CG, APC-OFF) ---"
+  echo "  llm = LLM("
+  echo "      model=${MODEL_PATH:-<MODEL_PATH>},"
+  echo "      tensor_parallel_size=${DLIN_TP_SIZE:-4},"
+  echo "      dtype=bfloat16,"
+  echo "      max_model_len=4096,"
+  echo "      gpu_memory_utilization=$COMPARE_MEM_FRAC,"
+  echo "      trust_remote_code=True,"
+  echo "      max_num_seqs=4,"
+  echo "      disable_log_stats=True,"
+  echo "      compilation_config={cudagraph_capture_sizes: [1,2,4],"
+  echo "                           max_cudagraph_capture_size: 4},"
+  echo "  )"
+  echo "  env: VLLM_USE_V2_MODEL_RUNNER=1"
+  echo "  NOTE: MRV2 does NOT support APC (mamba_cache_mode='align' assertion)."
+  echo ""
+  echo "  --- vLLM MRV1 (LLM + CG + APC) ---"
+  echo "  llm = LLM("
+  echo "      model=${MODEL_PATH:-<MODEL_PATH>},"
+  echo "      tensor_parallel_size=${DLIN_TP_SIZE:-4},"
+  echo "      dtype=bfloat16,"
+  echo "      max_model_len=4096,"
+  echo "      gpu_memory_utilization=$COMPARE_MEM_FRAC,"
+  echo "      trust_remote_code=True,"
+  echo "      max_num_seqs=4,"
+  echo "      disable_log_stats=True,"
+  echo "      enable_prefix_caching=True,"
+  echo "      compilation_config={mode: NONE,"
+  echo "                           cudagraph_capture_sizes: [1,2,4],"
+  echo "                           max_cudagraph_capture_size: 4},"
+  echo "  )"
+  echo "  env: VLLM_USE_V2_MODEL_RUNNER=0"
+  echo "========================================================================="
+  echo ""
+}
+
 phase_compare() {
-  [ "$COMPARE_LIST" = "1" ] && { _compare_list; return 0; }
+  [ "$COMPARE_LIST" = "1" ] && { _compare_list; [ "$COMPARE_VERBOSE" = "1" ] && _print_compare_commands; return 0; }
   log "Phase [compare]: sglang vs vLLM (MRV2 + MRV1) showcase ($COMPARE_SCENARIOS)"
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
   # Source the SDK env.sh so TP-worker subprocesses inherit PYTHONPATH (SDK
@@ -1161,6 +1250,66 @@ phase_compare() {
     cmd="python $script --engine $eng $vllm_args --mem-frac $COMPARE_MEM_FRAC --scenarios $COMPARE_SCENARIOS"
     log "[compare] running $tag (scenarios=$COMPARE_SCENARIOS, log: $logf)"
     log "[compare] COMMAND: $cmd"
+    if [ "$COMPARE_VERBOSE" = "1" ]; then
+      echo ""
+      echo "============================================================"
+      echo "  Running: $tag"
+      echo "============================================================"
+      echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+      echo "  MODEL_PATH=${MODEL_PATH:-}"
+      echo "  TP_SIZE=${DLIN_TP_SIZE:-4}"
+      echo "  ATTN_BACKEND=${ATTN_BACKEND:-fa3}"
+      echo "  MEM_FRAC=$COMPARE_MEM_FRAC"
+      echo "  SCENARIOS=$COMPARE_SCENARIOS"
+      echo ""
+      echo "  \$ $cmd"
+      echo ""
+      if [ "$eng" = "sglang" ]; then
+        echo "  Internal engine launch:"
+        echo "  engine = sgl.Engine("
+        echo "      model_path=${MODEL_PATH:-<MODEL_PATH>},"
+        echo "      tp_size=${DLIN_TP_SIZE:-4},"
+        echo "      dtype=bfloat16,"
+        echo "      context_length=4096,"
+        echo "      mem_fraction_static=$COMPARE_MEM_FRAC,"
+        echo "      max_running_requests=4,"
+        echo "      disable_cuda_graph=False,"
+        echo "      cuda_graph_max_bs_decode=4,"
+        echo "      attention_backend=${ATTN_BACKEND:-fa3},"
+        echo "      page_size=16,"
+        echo "      disable_custom_all_reduce=True,"
+        echo "      trust_remote_code=True,"
+        echo "      chunked_prefill_size=512,"
+        echo "  )"
+      else
+        local _mrv2="1"; [ "$runner" = "mrv1" ] && _mrv2="0"
+        echo "  env: VLLM_USE_V2_MODEL_RUNNER=$_mrv2"
+        echo "  Internal engine launch:"
+        echo "  llm = LLM("
+        echo "      model=${MODEL_PATH:-<MODEL_PATH>},"
+        echo "      tensor_parallel_size=${DLIN_TP_SIZE:-4},"
+        echo "      dtype=bfloat16,"
+        echo "      max_model_len=4096,"
+        echo "      gpu_memory_utilization=$COMPARE_MEM_FRAC,"
+        echo "      trust_remote_code=True,"
+        echo "      max_num_seqs=4,"
+        echo "      disable_log_stats=True,"
+        if [ "$runner" = "mrv1" ]; then
+          echo "      enable_prefix_caching=True,   # MRV1 only (APC)"
+          echo "      compilation_config={mode: NONE,"
+          echo "                           cudagraph_capture_sizes: [1,2,4,528],"
+          echo "                           max_cudagraph_capture_size: 528,"
+        else
+          echo "      # enable_prefix_caching not set (MRV2: APC unsupported)"
+          echo "      compilation_config={"
+        fi
+        echo "                           cudagraph_capture_sizes: [1,2,4],"
+        echo "                           max_cudagraph_capture_size: 4},"
+        echo "  )"
+      fi
+      echo "============================================================"
+      echo ""
+    fi
     if ! { echo "[showcase] === COMMAND: $cmd ===";
            echo "[showcase] === CONFIG: model=$(basename ${MODEL_PATH%/}) tp=${DLIN_TP_SIZE:-4} mem-frac=$COMPARE_MEM_FRAC backend=${ATTN_BACKEND:-fa3} temp=0(SC8/SC8b=0.7) scenarios=$COMPARE_SCENARIOS ===";
            python "$script" --engine "$eng" $vllm_args --mem-frac "$COMPARE_MEM_FRAC" \
@@ -1184,16 +1333,15 @@ phase_compare() {
     case "$COMPARE_ONLY" in
       sglang)      _compare_run_one sglang     || die "sglang run failed (cannot compare without it)" ;;
       vllm-mrv2)   _compare_run_one vllm mrv2  || warn "vllm-mrv2 failed (will be recorded as fail)" ;;
-      vllm-mrv1)   _compare_run_one vllm mrv1  || warn "vllm-mrv1 failed (expected on DLIN; recorded)" ;;
+      vllm-mrv1)   _compare_run_one vllm mrv1  || warn "vllm-mrv1 failed (recorded as fail)" ;;
       "")
         _compare_run_one sglang    || die "sglang run failed (cannot compare without it)"
         _compare_run_one vllm mrv2 || warn "vllm-mrv2 failed (recorded as fail)"
-        # DL: MRV1 skipped by default — it usually FAILs on DLIN (assert num_cache_lines)
-        # and adds ~10min. Opt in with COMPARE_RUN_MRV1=1 (or --only vllm-mrv1).
+        # DL: MRV1 opt-in (APC+CG-off, works but adds ~10min to runtime).
         if [ "$COMPARE_RUN_MRV1" = "1" ]; then
-          _compare_run_one vllm mrv1 || warn "vllm-mrv1 failed (expected on DLIN; recorded as fail)"
+          _compare_run_one vllm mrv1 || warn "vllm-mrv1 failed (recorded as fail)"
         else
-          log "[compare] skipping vllm-mrv1 (default; fails on DLIN). Set COMPARE_RUN_MRV1=1 to include."
+          log "[compare] skipping vllm-mrv1 (default; adds ~10min). Set COMPARE_RUN_MRV1=1 to include."
         fi
         ;;
     esac
@@ -1231,10 +1379,10 @@ phase_compare() {
   [ -z "$model_tag" ] && model_tag=$(basename "${MODEL_PATH%/}")
   echo  "  model=$model_tag  tp=${DLIN_TP_SIZE:-4}  scenarios=$COMPARE_SCENARIOS"
   echo  "  (same GPUs, FP8, fresh process each; vLLM APC-OFF (structurally unsupported on"
-  echo  "   hybrid-Mamba -> re-prefills shared prefixes); MRV1 skipped by default on DLIN)"
+  echo  "   hybrid-Mamba -> re-prefills shared prefixes); MRV1 APC+CG-on opt-in)"
   echo  "  fairness audit: same model/TP/temp/warmup; see each {tag}.log COMMAND+CONFIG header."
-  echo  "  win source: sglang KV-reuse wins = RadixAttention cache, NOT raw speed (SC6 raw-"
-  echo  "   prefill parity proves sglang 49 < vLLM 76 tok/s); vLLM wins raw decode IPC (SC9)."
+  echo  "  win source: sglang KV-reuse > MRV2 (default) via RadixAttention, NOT raw speed;"
+  echo  "   MRV1 APC+CG-on has faster DLIN native path and can outrun sglang."
   echo  "  $(date '+%Y-%m-%d %H:%M:%S')"
   echo  "  -----------------------------------------------------------------------"
   echo  "  metric                   | sglang    | vLLM-MRV2 | vLLM-MRV1 | sglang vs MRV2"
