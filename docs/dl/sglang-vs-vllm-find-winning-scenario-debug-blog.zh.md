@@ -16,7 +16,10 @@
 
 1. **sglang prefill 慢的真因 = GDN（hybrid Mamba 门控线性注意力）的 prefill(extend) 默认走慢的 triton chunk kernel（占 prefill 89%）。** 开关 `SGLANG_DL_GDN_DLIN_EXTEND=1` 切到 DLIN `dl_chunk`（`gdn_backend.py:76-93`）。
 2. **效果**：2K prefill **41s → 5.1s（8×）**，且更正确（triton “首 token 偏离 vLLM”，dl_chunk 对齐）。**已默认开启**（run_sglang.sh preset + showcase）。
-3. **sglang 反超 vLLM（同 session 实测，TP4 FP8）**：**9 项里赢 6 项**——SC1-warm 1.14×、SC3 1.45×、SC5 1.01×、SC7 1.12×、SC8 1.25×、SC10 1.13×（全是 prefill-heavy / 前缀复用）。vLLM 仅在纯 decode（SC9，+8%）、一次性 cold prefill、多轮 SC2（+17%）上赢。
+3. **sglang 反超 vLLM（同 session 实测，TP4 FP8）**：
+   - **离线**：**9 项里赢 6 项**——SC1-warm 1.14×、SC3 1.45×、SC5 1.01×、SC7 1.12×、SC8 1.25×、SC10 1.13×（全是 prefill-heavy / 前缀复用）。
+   - **在线 serving（最贴近生产）**：并发 ≥4 时 **sglang 全胜**，conc 16 = 128 vs 82（1.57×），conc 32 = 142 vs 88（1.61×）。这是没开 flag 时 sglang 反输 1.9× 的场景——flag 把 serving 翻成 sglang 赢。
+   - vLLM 仅在纯 decode（SC9，+8%）、一次性 cold prefill、多轮 SC2（+17%）上赢。
 4. **关键坑（已解决）**：dl_chunk 的 triton cache 会被**崩溃的 run 写坏**→ 后续每次都 NCCL desync 崩。根因不是 dl_chunk 本身，是 **cache 污染**。修法：备份好 cache，崩了就恢复（`rm -rf ~/.triton/cache && cp -a ~/.triton/cache.good_backup ~/.triton/cache`）。
 5. **decode 其实是 vLLM 赢**（sglang 35.6 vs vLLM 40.7 tok/s，公平测 ignore_eos）。之前 blog 说的 “sglang decode +5%” 是没设 ignore_eos、早停 EOS 导致的假象——已更正。
 
@@ -133,6 +136,25 @@ sglang（`SGLANG_DL_GDN_DLIN_EXTEND=1`，好 cache）vs vLLM MRV1+CG+APC，同 4
 
 > 为什么 SC2 输、SC1-warm 赢？SC2 每轮新增 token 多（生成的 assistant text + 新问题），suffix 较大、每轮都要 prefill 一段；SC1-warm 是前缀全命中、只 prefill 极短 suffix，RadixAttention 优势最大化。多轮场景 sglang 仍略输，是 prefill 绝对速度（sglang 399 vs vLLM ~1457 tok/s 稳态）还落后。
 > 为什么 SC9 输？纯 decode 无 prefill，sglang 多进程 IPC（~3.5ms/tok）把它压在 vLLM 之下。
+
+---
+
+## 5b. 并发 serving 吞吐（最贴近生产）：sglang 高并发大幅领先 vLLM
+
+在线 HTTP serving，N 个并发客户端共享同一个 1K-token 前缀 + 各自唯一短问题，聚合 tok/s（两引擎都捕获 decode CG bs≤32，**公平**，同 session TP4 FP8）：
+
+| 并发 | sglang(flag) | vLLM MRV1 | 胜者 |
+|---|---|---|---|
+| 1 | 30.5 | 31.7 | 持平 |
+| 4 | **66.7** | 55.8 | **sglang 1.20×** ✅ |
+| 8 | **101.6** | 70.9 | **sglang 1.43×** ✅ |
+| 16 | **128.2** | 81.6 | **sglang 1.57×** ✅ |
+| 32 | **141.5** | 87.6 | **sglang 1.61×** ✅ |
+
+**sglang 在并发 ≥4 时全部领先，最高 1.61×**。这是最贴近生产的指标（多用户共享 system-prompt / RAG 文档）。对照没开 flag 时（旧 Exp B）sglang 反输 vLLM 1.9× —— flag 把 serving 从“输”翻成“赢”。
+
+**为什么 sglang 高并发赢**：(1) RadixAttention 把共享前缀缓存成基数树，N 个客户端复用，只 prefill 极短 unique suffix；(2) flag 让 suffix prefill 也快；(3) sglang decode CG bs≤32 + continuous batching 在高并发下扩展更好（conc 1→32：sglang 30→141 即 4.6×；vLLM 32→88 即 2.8×）。
+**边界**：前缀高度共享时 sglang 赢；若每个请求前缀都不同（无复用），vLLM 的绝对 prefill 更快（sglang 稳态 399 vs vLLM ~1457 tok/s）会反超。复现：`scripts/dl/exp_b_serving_client.py` + `scripts/dl/dl_safe_reset.sh`（每次跑前复位，避免 cache 污染崩）。
 
 ---
 
