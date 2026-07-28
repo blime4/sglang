@@ -156,9 +156,13 @@ def unified_linear_attention_with_output(
     return
 
 
-# DL begin — conditionally disable break points on DLIN (see radix_attention.py for rationale).
+# DL begin — conditionally disable GDN/linear-attention break points on DLIN.
+# GDN layers may not need per-request metadata recomputation (unlike attention layers),
+# so their break points can be removed to reduce sync cudaGraphLaunch calls.
+# SGLANG_DL_BCG_NO_BREAK=1 → remove ALL breaks (incl attention; produces garbled output).
+# SGLANG_DL_BCG_NO_GDN_BREAK=1 → remove ONLY GDN breaks (keep attention breaks; safe).
 import os as _dl_os
-if _dl_os.environ.get("SGLANG_DL_BCG_NO_BREAK") == "1":
+if _dl_os.environ.get("SGLANG_DL_BCG_NO_BREAK") == "1" or _dl_os.environ.get("SGLANG_DL_BCG_NO_GDN_BREAK") == "1":
     bcg_unified_linear_attention_with_output = unified_linear_attention_with_output
 else:
     bcg_unified_linear_attention_with_output = eager_on_graph(True)(
