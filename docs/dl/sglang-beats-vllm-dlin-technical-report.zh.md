@@ -58,9 +58,63 @@
 
 每次引擎启动前跑 `scripts/dl/dl_safe_reset.sh`：恢复已知好的 triton cache + 复位 4 张卡 + 杀 hung scheduler。decode 测量用 `gen(≥512)` 充分预热 + `ignore_eos=True` + 5 reps 取分布。
 
----
+### 2.4 技术背景（理解后续章节的基础）
 
-## 3. 调试历程（含三次走错的纠正）
+#### 2.4.1 什么是 hybrid-Mamba 模型，什么是 GDN
+
+Qwen3.6-35B-A3B 是**混合架构**：它的 Transformer 层分为两类，交替排列：
+
+```
+layer 0   →  GDN / 线性注意力层（"Mamba 风格"，状态递推）
+layer 1   →  标准 attention 层（QKV + softmax）
+layer 2   →  GDN
+layer 3   →  attention
+...        （~48 层交替）
+```
+
+- **标准 attention 层**：经典 self-attention（O(N²) 关系建模，可用 KV-cache 复用）。
+- **GDN 层（Gated Delta Network）**：一种**线性注意力变体**，核心是 **gated delta rule**（门控增量规则）——不像 softmax attention 那样对全序列做 O(N²) 点积，而是维护一个**递推状态矩阵**（per-head），每个 token 来了就 `state = state * gate + delta`，O(N) 线性扫描。
+
+**关键**：GDN 的递推状态**不能像 attention KV 那样按块缓存/复用**——它是一个**累加的状态**，必须从头扫描到当前位置才能得到正确的 state。这直接影响：
+- **prefill 慢**：GDN 要跑 chunked parallel scan（分块并行前缀和），比标准 attention 的矩阵乘更耗时（§3.2 的 89%）。
+- **缓存复用受限**：标准 attention 的 KV-cache 可以按 token 块复用（RadixAttention/APC 的基础）；GDN 的递推状态**不能简单复用**——这是 sglang RadixAttention 和 vLLM APC 在 hybrid-Mamba 上表现差异的根因（§3.6）。
+
+#### 2.4.2 代码里的 GDN 调度器
+
+`python/sglang/srt/layers/attention/linear/gdn_backend.py` 是 GDN 的 kernel 调度器，三类 kernel：
+- **decode_kernel**：单步递推（`dl_recurrent_gated_delta_rule`，DLIN），每生成一个 token 更新 state。
+- **extend_kernel**（= prefill）：分块并行扫描。**这是本报告的核心战场**——慢的 triton chunk vs 快的 DLIN `dl_chunk_gated_delta_rule`。
+- **verify_kernel**：spec-decode verify 路径（用 triton）。
+
+一个 env flag `SGLANG_DL_GDN_DLIN_EXTEND=1` 控制 extend 走哪个 kernel——这个 flag 之前默认关着，导致 sglang prefill 慢 8 倍（§3.3）。
+
+#### 2.4.3 RadixAttention vs APC：两种前缀缓存机制
+
+| 机制 | sglang RadixAttention | vLLM APC |
+|---|---|---|
+| 数据结构 | **token 级基数树**（radix tree）：共享前缀到分叉处精确复用 | **block-hash 匹配**：按固定大小 block 的 hash 匹配 |
+| 粒度 | token 级（前缀可以在任意 token 分叉/合并） | block 级（block 边界对齐才能命中） |
+| hybrid-Mamba 状态 | **原生支持完整状态复用**（attention KV + GDN state 一体化管理） | **只能缓存 attention KV**，GDN 的递推 state 无法 block-cache（每请求重算） |
+| 效果 | 高并发 / 前缀高度共享场景大幅领先（§3.5 serving 1.2–1.6×） | 并发越高差距越大（APC 的 mamba_cache_mode='align' 开销 + 不能复用 Mamba state） |
+
+**这是 sglang 在 hybrid-Mamba 上反超 vLLM 的架构级根因**：RadixAttention 能复用完整状态（含 GDN），APC 不能。
+
+#### 2.4.4 `_dl_C`：DLIN 的原生算子库
+
+DLIN GPU 不用 NVIDIA 的 CUDA toolkit，而是用自己的编译器 `dlcc`（类似 nvcc 的角色）+ 运行时算子库 `_dl_C.so`（类似 cuDNN/cuBLAS 的角色）。关键特征：
+- **CG-capturable**：`_dl_C` 的 op 是原生 DLIN 编译的，可以在 CUDA graph 里 capture（关键——decode CG 需要）。
+- 对比：sglang 的 `sgl_kernel.*` 算子部分是 cuDNN-descriptor 的 Python 封装，**CG-incompatible**（在 DLIN 上会 DL error 900）。所以 sglang DLIN 适配的核心工作之一是把 CG-critical 的 op 路由到 `_dl_C`。
+
+#### 2.4.5 进程架构：sglang 多进程 vs vLLM 单进程
+
+| | sglang | vLLM |
+|---|---|---|
+| 进程模型 | **3 进程**：scheduler（GPU 推理）+ tokenizer_manager（HTTP/IO）+ detokenizer（token→text） | **1 进程**：engine_core 在同进程内 |
+| 通信 | ZMQ Unix socket（进程间） | 进程内函数调用 |
+| decode per-step 开销 | 多了 ZMQ 往返，但 **overlap scheduler** 把 CPU 工作（sampling/result）藏到 GPU 后面 | 单进程无 IPC，但 **APC/mamba-align 每步有额外开销** |
+| 结果 | 干净测量下 sglang host 开销 ≈ vLLM（§3.7/§3.8），甚至略低 | — |
+
+---
 
 ### 3.1 第一次假设：prefill 慢 = dlcc JIT（**错误**）
 
@@ -110,6 +164,29 @@ if _is_dlin() and SGLANG_DL_GDN_DLIN == "1":
 **验证**（`scripts/dl/test_gdn_extend_dl.py`，`SGLANG_DL_GDN_DLIN_EXTEND=1`）：
 - 正确性："The capital of France is" → " Paris, a city renowned for its iconic" ✅（与 vLLM 一致）
 - 2K prefill：41249ms → **5135ms（8×）**，50 → 399 tok/s。
+
+#### 深入：triton chunk 为什么慢 8×，dl_chunk 做了什么
+
+GDN 的 extend（prefill）要算的是**分块并行前缀扫描**（chunked parallel prefix scan of the gated delta recurrence）——给定 N 个 token，算出每个位置的 state 矩阵。两种 kernel 的区别：
+
+- **triton chunk（sglang 默认，慢）**：sglang 自己用 Triton DSL 写的 kernel。Triton 在 DLIN 上通过 `dlcc` JIT 编译成 DLIN GPU 指令。**问题**：(1) Triton 自动生成的 tiling / 并行策略对 DLIN GPU 架构（KS38 的 SM/CU 拓扑）不是最优的 → 算力利用率低；(2) Triton DSL 限制了一些 DLIN 特有的优化（如 warp-specialized 通道、PingPong 双缓冲）无法表达；(3) 还有一个 **`initial_state_indices` 自定义路径**——sglang 为了处理 prefill 的初始 state（从前一个 chunk 继承），走了一条与 vLLM 不同的实现路径，导致**首 token 的 state 初始化不一致 → "首 token 偏离 vLLM"**（正确性 bug）。
+
+- **DLIN dl_chunk（`DLinGDNKernel`，快）**：登临团队手写的 DLIN 原生 kernel（在 `_dl_C.so` 里），直接用 DLIN GPU 的底层优化：
+  - 手动 tiling，匹配 KS38 的 CU/SRAM 拓扑
+  - **PingPong 双缓冲**（`DLEOL_FLA_ENABLE_PINGPONG=1`）：一个 buffer 算时另一个 buffer 预取下一 chunk → 访存与计算重叠
+  - **展开优化**（`DLEOL_FLA_UNROLL_COUNT=8`）：循环展开减分支开销
+  - initial_state 处理与 vLLM 对齐（消除了 "首 token 偏离" bug）
+
+**大白话**：triton chunk 像一个自动翻译的"英式英语"——语法对但口音不地道（效率低 + 个别词用错）；dl_chunk 像登临母语者写的——地道、快、准确。两者算法相同（都是 gated delta rule 的 chunked scan），但**实现质量差 8 倍**。
+
+#### 正确性验证（12 prompt 正确性探针）
+
+不只是 prefill 快了，输出也**正确**（12 个中英文 / 代码 / 数学 prompt 全部连贯，无乱码）：
+- `"The capital of France is"` → `" Paris, a city renowned for its iconic landmarks..."` ✅
+- `"中国的首都是哪里？一个词"` → `"北京"` ✅（中文完美无乱码）
+- `"def fibonacci(n):"` → `if n <= 1: return n else: return fibonacci(n-1)+fibonacci(n-2)` ✅
+
+（triton 路径有 "首 token 偏离 vLLM" 的正确性 bug；dl_chunk 与 vLLM 对齐 → flag 既是性能修复也是正确性修复。）
 
 ### 3.4 崩溃迷局：triton-cache 污染（不是 dl_chunk bug）
 
@@ -281,7 +358,119 @@ CUDA_VISIBLE_DEVICES=24,25,26,27 .venv/bin/python scripts/dl/test_decode_vllm_fw
 
 ---
 
-## 附录：脚本与日志索引
+## 附录 A：完整代码调用链（从 HTTP 请求到 GPU kernel）
+
+```
+用户 HTTP POST /v1/completions
+  │
+  ▼
+TokenizerManager (http_server.py:1025)          ← sglang 进程 1（IO + tokenizer）
+  │  ZMQ PUSH → scheduler_ipc_name
+  ▼
+Scheduler.event_loop (scheduler.py:1545)        ← sglang 进程 2（GPU 推理）
+  │  recv_requests → get_next_batch → run_batch
+  ▼
+Scheduler.run_batch (scheduler.py:3182)          ← 每个 decode/prefill step
+  │  overlap_scheduler: CPU work(N-1步) ∥ GPU forward(N步)
+  ▼
+ModelRunner.forward (model_runner.py)
+  │  [decode] → cuda_graph replay (captured at startup)
+  │  [prefill] → eager forward
+  ▼
+Qwen3_5ForCausalLM.forward (qwen3_5.py)
+  │  for each layer:
+  │    ├─ attention 层 → self.self_attention (fa3 / dl_flash_attn)
+  │    └─ GDN 层      → self.self_attention → linear attention backend
+  ▼
+GDN kernel dispatcher (gdn_backend.py:76-93)     ← ★ 核心开关
+  │  extend_kernel:
+  │    ├─ EXTEND=0 (默认): triton_kernel        ← 慢（8×），首 token 偏离
+  │    └─ EXTEND=1 (修复): DLinGDNKernel        ← 快（8×），正确
+  │                           └─ _dl_C.dl_chunk_gated_delta_rule
+  ▼
+DLIN GPU (KS38) 执行 kernel
+  │  output → next_token_logits
+  ▼
+Sampler.forward (sampler.py:143)                  ← argmax (greedy) / multinomial
+  │  batch_next_token_ids = torch.argmax(logits, -1)
+  ▼
+overlap: process_batch_result (CPU, 与下一步 GPU 并行)
+  │  → ZMQ PUSH → detokenizer_ipc_name
+  ▼
+DetokenizerManager (detokenizer_manager.py)      ← sglang 进程 3（token→text）
+  │  ZMQ PUSH → tokenizer_ipc_name
+  ▼
+TokenizerManager → HTTP response → 用户
+```
+
+**关键路径分析**（为什么 GDN flag 影响 89% 的 prefill 时间）：
+- GDN 层的 extend kernel 是 **per-step 最重的单 kernel**（gated delta rule 的 chunked scan）。
+- 模型 ~48 层中约一半是 GDN 层 → GDN forward 占总 prefill 的 89%（§3.2 分解证实）。
+- 切到 dl_chunk → 每层 GDN forward 快 ~8× → 总 prefill 快 ~8×。
+
+---
+
+## 附录 B：原始数据汇总
+
+### B.1 GDN prefill 修复（2K prefill，cache-miss，3 distinct content，median）
+
+| 配置 | 2K prefill | tok/s | 正确性 |
+|---|---|---|---|
+| normal（triton extend） | 41249 ms | 50 | "首 token 偏离 vLLM" |
+| skip_moe | 36839 ms | 56 | — |
+| skip_attn | 4643 ms | 441 | — |
+| +GDN_EXTEND=1（dl_chunk） | 5135 ms | 399 | ✅ " Paris" |
+| vLLM MRV1（参考） | 1406 ms | 1457 | ✅ |
+
+### B.2 离线场景对比（sglang flag vs vLLM MRV1，同 session TP4 FP8）
+
+| 场景 | sglang(flag) | vLLM MRV1 | 比 | 胜者 |
+|---|---|---|---|---|
+| SC1 warm | 1034 ms | 1178 ms | 1.14× | sglang |
+| SC1 cold | 3834 ms | 1602 ms | 0.42× | vLLM（一次性） |
+| SC2 avg | 1479 ms | 1262 ms | 0.85× | vLLM |
+| SC3 tput | 61.5 tok/s | 42.3 tok/s | 1.45× | sglang |
+| SC5 total | 7753 ms | 7854 ms | 1.01× | sglang |
+| SC7 tput | 26.9 tok/s | 24.0 tok/s | 1.12× | sglang |
+| SC8 tput | 64.1 tok/s | 51.1 tok/s | 1.25× | sglang |
+| SC9 tput | 34.3 tok/s | 37.0 tok/s | 0.93× | vLLM（但重测→sglang，见 B.4） |
+| SC10 tput | 27.4 tok/s | 24.2 tok/s | 1.13× | sglang |
+
+### B.3 并发 serving（共享 1K 前缀 + 64-tok decode，两引擎 decode-CG bs≤32）
+
+| 并发 | sglang(flag) | vLLM MRV1 | 比 |
+|---|---|---|---|
+| 1 | 30.5 | 31.7 | 0.96× |
+| 4 | 66.7 | 55.8 | 1.20× |
+| 8 | 101.6 | 70.9 | 1.43× |
+| 16 | 128.2 | 81.6 | 1.57× |
+| 32 | 141.5 | 87.6 | 1.61× |
+
+### B.4 纯 decode 5-rep 分布（干净卡 + gen(512) 预热 + ignore_eos）
+
+| 引擎 | 5 reps (tok/s) | mean | min | max |
+|---|---|---|---|---|
+| sglang | 42.3, 43.2, 43.2, 43.3, 43.3 | **43.0** | 42.3 | 43.3 |
+| vLLM | 41.0, 40.4, 40.4, 40.9, 40.9 | **40.7** | 40.4 | 41.0 |
+
+sglang 最差(42.3) > vLLM 最好(41.0) → 分布不重叠 → sglang +5.7%。
+
+### B.5 正确性探针（12 prompt，sglang GDN flag on）
+
+| 类型 | prompt | 输出 | ✅/❌ |
+|---|---|---|---|
+| fact | "capital of France" | "Paris, a city renowned..." | ✅ |
+| chinese | "中国的首都" | "北京" | ✅ |
+| chinese | "介绍一下你自己" | "我是通义千问..." | ✅ |
+| code | "def fibonacci(n):" | valid Python | ✅ |
+| math | "15 times 4" | 60 (via thinking) | ✅ |
+| english | "how are you" | coherent greeting | ✅ |
+
+**无乱码 / 无重复循环 / 无 prompt-regurgitation / 无首-token-bug。**
+
+---
+
+## 附录 C：脚本与日志索引
 
 | 脚本 | 作用 |
 |---|---|
