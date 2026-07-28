@@ -262,6 +262,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture()
 
         self.raw_num_tokens = 0
+        self._dl_captured_attn_metadata = None  # DL: saved capture-time attn metadata for NO_BREAK CG
 
     def _is_mamba_track_enabled(self) -> bool:
         return (
@@ -391,6 +392,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
+            # DL begin — save the capture-time metadata object so we can
+            # copy_ fresh values into its tensor addresses at replay (NO_BREAK
+            # CG fix: the captured graph reads from these addresses).
+            self._dl_captured_attn_metadata = getattr(attn_backend, "forward_metadata", None)
+            # DL end
             return
         metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
             forward_batch
@@ -410,7 +416,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         to the generic eager init."""
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
+            # DL begin — investigated using init_forward_metadata_out_graph(in_capture=False)
+            # instead of init_forward_metadata for NO_BREAK CG. The _apply_cuda_graph_metadata
+            # path it routes to doesn't handle EXTEND metadata at capture time → still garbled.
+            # The real fix is implementing the full captured-metadata contract (like DSV4's 3
+            # methods) for fa3 + GDN backends. Reverted to default for now (2026-07-28).
             attn_backend.init_forward_metadata(forward_batch)
+            # DL end
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
