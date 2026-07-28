@@ -253,6 +253,14 @@ def unified_attention_with_output(
     return
 
 
-breakable_unified_attention_with_output = eager_on_graph(True)(
-    unified_attention_with_output
-)
+# DL begin — conditionally disable break points on DLIN (sync cudaGraphLaunch × ~48 layers
+# = overhead > Python-dispatch savings). SGLANG_DL_BCG_NO_BREAK=1 → no breaks → 1 segment
+# (≈FULL CG, like vLLM). This is the key to closing the 3.7× cold-prefill gap (2026-07-28).
+import os as _dl_os
+if _dl_os.environ.get("SGLANG_DL_BCG_NO_BREAK") == "1":
+    breakable_unified_attention_with_output = unified_attention_with_output
+else:
+    breakable_unified_attention_with_output = eager_on_graph(True)(
+        unified_attention_with_output
+    )
+# DL end

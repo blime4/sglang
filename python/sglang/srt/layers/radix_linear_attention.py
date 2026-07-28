@@ -156,6 +156,12 @@ def unified_linear_attention_with_output(
     return
 
 
-bcg_unified_linear_attention_with_output = eager_on_graph(True)(
-    unified_linear_attention_with_output
-)
+# DL begin — conditionally disable break points on DLIN (see radix_attention.py for rationale).
+import os as _dl_os
+if _dl_os.environ.get("SGLANG_DL_BCG_NO_BREAK") == "1":
+    bcg_unified_linear_attention_with_output = unified_linear_attention_with_output
+else:
+    bcg_unified_linear_attention_with_output = eager_on_graph(True)(
+        unified_linear_attention_with_output
+    )
+# DL end
