@@ -425,6 +425,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # init_forward_metadata (builds fresh values), then copy_ each tensor field INTO
             # the capture-time addresses saved in _dl_captured_attn_metadata_list.
             # Traverse HybridLinearAttnBackend.attn_backend_list (wrapper has no forward_metadata).
+            # For tensors where fresh.shape != captured.shape (e.g. page_table depends on
+            # max_seq_len_k), copy into the captured tensor's leading slice and zero-pad.
             attn_backend.init_forward_metadata(forward_batch)
             import torch as _dl_torch
             inner_backends = getattr(attn_backend, "attn_backend_list", [attn_backend])
@@ -443,8 +445,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                             except Exception:
                                 continue
                             if isinstance(val, _dl_torch.Tensor) and isinstance(cap, _dl_torch.Tensor):
-                                if val.shape == cap.shape and val.dtype == cap.dtype:
-                                    cap.copy_(val, non_blocking=True)
+                                if val.dtype == cap.dtype:
+                                    if val.shape == cap.shape:
+                                        cap.copy_(val, non_blocking=True)
+                                    elif val.ndim == cap.ndim and val.shape[0] == cap.shape[0]:
+                                        # Same first dim but different second dim (e.g. page_table).
+                                        # Copy into leading slice of captured, zero-pad rest.
+                                        min_cols = min(val.shape[1] if val.ndim > 1 else 1,
+                                                       cap.shape[1] if cap.ndim > 1 else 1)
+                                        cap.zero_()
+                                        if val.ndim > 1:
+                                            cap[:, :min_cols].copy_(val[:, :min_cols], non_blocking=True)
+                                        else:
+                                            cap[:min_cols].copy_(val[:min_cols], non_blocking=True)
                             elif not isinstance(val, (_dl_torch.Tensor, type)) and not callable(val):
                                 try:
                                     object.__setattr__(captured, name, val)
@@ -517,24 +530,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         bs = 1
 
         with torch.device(self.device):
+            # DL begin — capture with seq_lens = context_length so the baked-in
+            # max_seq_len_k covers any real request. extend_seq_lens stays = num_tokens
+            # (query length = bucket). cu_seqlens_k (from copy_) bounds actual attention.
+            _dl_ctx = self.model_runner.server_args.context_length
             shape_inputs = {
                 "req_pool_indices": torch.arange(bs, device=self.device),
-                "seq_lens": torch.tensor([num_tokens], device=self.device),
-                "orig_seq_lens": torch.tensor([num_tokens], device=self.device),
+                "seq_lens": torch.tensor([_dl_ctx], device=self.device),
+                "orig_seq_lens": torch.tensor([_dl_ctx], device=self.device),
                 "extend_seq_lens": torch.tensor([num_tokens], device=self.device),
                 "extend_prefix_lens": torch.tensor([0], device=self.device),
                 "extend_start_loc": torch.tensor([0], device=self.device),
             }
         if self._prefill_static_buffers is not None:
             s = self._prefill_static_buffers
-            s["seq_lens"][:bs].fill_(num_tokens)
+            s["seq_lens"][:bs].fill_(_dl_ctx)
             s["extend_seq_lens"][:bs].fill_(num_tokens)
             s["extend_prefix_lens"][:bs].zero_()
             s["extend_start_loc"][:bs].zero_()
             s["req_pool_indices"][:bs].copy_(
                 torch.arange(bs, device=s["req_pool_indices"].device)
             )
-            s["orig_seq_lens"][:bs].fill_(num_tokens)
+            s["orig_seq_lens"][:bs].fill_(_dl_ctx)
+            # DL end
             for name in _PREFILL_STATIC_FIELDS:
                 shape_inputs[name] = s[name][:bs]
 
