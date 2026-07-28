@@ -126,7 +126,12 @@ SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
 # Enabled with -S / --spec-ngram. Needs the fused-MoE path + extra mem headroom
 # for the num_draft=8 draft tree; apply_ngram_overrides() sets those when on.
 USE_NGRAM="${USE_NGRAM:-0}"
-DL_WARMUP="${DL_WARMUP:-0}"    # -W/--dl-warmup: pre-compile fused-MoE prefill-M dlcc shapes at serve start
+DL_WARMUP="${DL_WARMUP:-0}"    # -W/--dl-warmup: pre-compile dlcc kernels (MoE + GDN dl_chunk) at serve start.
+# Measured effect (2026-07-28, with SGLANG_DL_GDN_DLIN_EXTEND=1): only ~293ms (5.7%) per
+# new shape — the dl_chunk first-use JIT (2K prefill reps 5426->5133ms). The BIG prefill
+# win was the GDN flag itself (41s->5.1s, sglang beats vLLM 6/9), NOT this warmup. Use -W
+# only to shave first-request latency / serving suffix-JIT spikes; it is NOT the prefill lever.
+# GOTCHA: a crashed run can corrupt dl_chunk's triton cache -> restore ~/.triton/cache.good_backup.
 NGRAM_NUM_DRAFT="${NGRAM_NUM_DRAFT:-8}"
 NGRAM_MIN_BFS="${NGRAM_MIN_BFS:-1}"
 NGRAM_MAX_BFS="${NGRAM_MAX_BFS:-1}"
