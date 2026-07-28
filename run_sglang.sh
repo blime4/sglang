@@ -834,6 +834,12 @@ start_server_bg() {  # launches launch_server detached; sets SERVER_PID
   local ngram_flags=""
   [ "$USE_NGRAM" = "1" ] && ngram_flags="--speculative-algorithm NGRAM --speculative-num-draft-tokens $NGRAM_NUM_DRAFT --speculative-ngram-min-bfs-breadth $NGRAM_MIN_BFS --speculative-ngram-max-bfs-breadth $NGRAM_MAX_BFS"
   BENCH_LOG="${BENCH_LOG:-/tmp/sglang_bench_server.log}"
+  # DL: cache self-healing — restore known-good dl_chunk triton cache + write-protect
+  # before launching sglang. Prevents the contagious crash-corrupts-cache failure.
+  if [ -d ~/.triton/cache.good_backup ]; then
+    rm -rf ~/.triton/cache && cp -a ~/.triton/cache.good_backup ~/.triton/cache
+    chmod -R a-w ~/.triton/cache 2>/dev/null
+  fi
   nohup python -m sglang.launch_server \
     --model-path "$MODEL_PATH" --page-size "$page_size" --dtype bfloat16 \
     --tp-size "$tp" \

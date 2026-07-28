@@ -9,6 +9,40 @@
 > Model: Qwen3.5/3.6-35B-A3B-FP8, TP4, DLIN. Commit `b22ee6c393` + the SC6/SC8b
 > diagnostic probes added 2026-07-24.
 
+---
+
+> ## ⚠️ SUPERSEDED by run r009 (2026-07-27) — the central premise of this audit is overturned.
+>
+> This audit's whole framework rests on **§1a: "APC cannot be turned ON for vLLM
+> on this model — MRV1 crashes; APC-off is vLLM's only working config."** That
+> premise is **wrong**. vLLM **MRV1 + CG + APC runs cleanly on DLIN** once
+> torch.compile is disabled (`compilation_config.mode="none"`, capture sizes
+> `[1,2,4,528]`). The "MRV1 crashes on DLIN" observation was under *default*
+> torch.compile (dynamic-shape guard); with CG driven directly, MRV1+APC works.
+>
+> Run `r009` (TP4, FP8, commit `d9b63d51cc`) re-ran SC5/SC7/SC8/SC9/SC10 against
+> MRV1+CG+APC and **flipped every scenario**:
+>
+> | SC | (this doc, APC-off) | r009 (APC-on) | winner now |
+> |---|---|---|---|
+> | SC5 | sglang 8.22× | vLLM 1.5× (7942 vs 12093 ms) | **vLLM** |
+> | SC7 | sglang 16.25× | vLLM 1.7× (23.8 vs 13.9 tok/s) | **vLLM** |
+> | SC8 | sglang 5.84× | vLLM 2.2× (51.0 vs 23.4 tok/s) | **vLLM** |
+> | SC9 | vLLM 1.30× | tied +3% (36.8 vs 35.8 tok/s) | **parity** |
+> | SC10 | sglang 7.05× | vLLM 1.7× (24.2 vs 14.3 tok/s) | **vLLM** |
+>
+> So the "rock-solid caching wins" this audit certifies (SC5/SC7/SC10, 7–16×) are
+> **an artifact of vLLM's APC being off**, not a robust sglang advantage. The
+> SC6 attribution ("wins = caching, not faster raw prefill") is still *correct as
+> a mechanism* — it just means: once vLLM *can* cache (MRV1+APC), vLLM's faster
+> kernels win. The only residual sglang edge is SC1's *per-engine* cache ratio;
+> absolute latency favors vLLM.
+>
+> **What survives from this audit:** the methodological rigor (SC6 raw-prefill
+> probe, SC8b decomposition) is still good science. What does **not** survive is
+> the verdict that these are durable sglang wins. See memory
+> `dlin-sglang-vllm-compare-r009-mrv1-apc-overturns`.
+
 ## TL;DR — verdict per scenario
 
 | Scenario | sglang vs vLLM | Rigor verdict |
@@ -19,11 +53,14 @@
 | **SC8** best-of-N (same prompt reused) | sglang **5.84×** | ⚠️ **Mixed** — decomposes (via SC8b) into: cross-call prompt caching (~3.9×, RLHF-loop) × a real single-call best-of-N edge (sglang ~2×; vLLM n=4 is pathologically slow on DLIN). Both factors are real sglang wins but measure different workloads — see §3 SC8. |
 | **SC9** pure decode | vLLM **1.30×** | ⚠️ **Direction rigorous, magnitude caveat** — vLLM wins decode (robust), but 1.30× is an upper bound: sglang's decode here (30.5 tok/s) is below its ~35 optimum, so the true gap is ~1.13×. |
 
-**Bottom line:** the three big prefix-reuse wins (SC5/SC7/SC10, 7–16×) are real
-and correctly attributed — SC6 proves they come from **caching, not faster raw
-prefill** (vLLM actually prefills 1.55× *faster* on unique prompts). SC8 needs a
-framing fix (it's a repeated/RLHF-loop win, not single-call best-of-N). SC9 is an
-honest loss whose magnitude is soft.
+**Bottom line:** ⚠️ **OVERTURNED by r009** — see correction block at top. _(Under
+APC-off, the original bottom line was:)_ the three big prefix-reuse wins
+(SC5/SC7/SC10, 7–16×) are real and correctly attributed — SC6 proves they come
+from **caching, not faster raw prefill** (vLLM actually prefills 1.55× *faster*
+on unique prompts). SC8 needs a framing fix (it's a repeated/RLHF-loop win, not
+single-call best-of-N). SC9 is an honest loss whose magnitude is soft. _(The
+mechanism is right; the verdict is not durable — once vLLM can cache (MRV1+APC),
+it wins.)_
 
 ---
 
@@ -33,7 +70,9 @@ Before per-scenario, three framework-level questions.
 
 ### 1a. "sglang RadixAttention-ON vs vLLM APC-OFF" — is that a fair fight?
 
-**Yes, because APC cannot be turned ON for vLLM on this model.** vLLM's prefix
+**Yes, because APC cannot be turned ON for vLLM on this model.** ⚠️ **WRONG as of
+r009 (2026-07-27):** MRV1+CG+APC runs cleanly on DLIN (torch.compile off). The
+rest of this section is the APC-off (MRV2) analysis. vLLM's prefix
 cache (APC) forces `mamba_cache_mode='align'` for hybrid-Mamba models, which
 MRV2 hard-rejects ("Model Runner V2 has not yet supported
 mamba_cache_mode='align'"); MRV1 crashes; the CG path asserts

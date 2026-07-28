@@ -1,5 +1,11 @@
 # DLIN-side Blockers Handoff（sglang 优化已榨干 sglang 侧，剩余 3 项需 DLIN 修）
 
+> ⚠️ **状态更正（2026-07-25 / r009）**：下面 L5 的 "NGRAM num_draft=8 = 2.9-3.1× vLLM"
+> 是**假阳性**——spec-verify 的 target 会重新生成 prompt（输出是 prompt-regeneration 垃圾），
+> 故该加速比建立在垃圾输出上，**不成立**（见 memory `dlin-sglang-spec-verify-prompt-regen-bug`）。
+> 另：本文所有 "sglang 超过 vLLM" 的性能结论在公平基线 MRV1+CG+APC 下已被 r009 推翻
+> （见 memory `dlin-sglang-vllm-compare-r009-mrv1-apc-overturns`）。本文作为历史 handoff 记录保留。
+
 > 2026-07-07 ｜ sglang dl-main ｜ sdk 4.2.1（`/LocalRun/.../debug/sdk`）｜ Qwen3.5-35B-A3B-FP8
 >
 > sglang 侧已达成：**NGRAM num_draft=8 = 36-40 tok/s = 2.9-3.1× vLLM**（sdk 4.2.1 复现）、

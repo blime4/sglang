@@ -7,6 +7,32 @@
 
 ---
 
+> ## ⚠️ 重要更正（run r009, 2026-07-27）—— 下列"sglang 全面领先"的结论**已被推翻**
+>
+> 本文档的数字是在 vLLM **MRV2** 上测的，而 MRV2 在本混合-Mamba 模型上**结构性无法开启前缀缓存（APC）**（硬 assert 拒绝 `mamba_cache_mode='align'`）。在该配置下 vLLM **每次都重新 prefill 共享前缀** → 在 KV-复用负载上慢得离谱 → sglang 的 RadixAttention 看起来碾压（5–16×）。
+>
+> **但这不再是 vLLM 唯一能跑的配置。** vLLM **MRV1 + CUDA-graph ON + APC ON** 在 DLIN 上**能稳定跑通**（关掉 torch.compile：`compilation_config.mode="none"`，capture sizes `[1,2,4,528]`）——长期以为"MRV1 在 DLIN 会崩"，那是默认 torch.compile 下的现象；CG 直接驱动后 MRV1+APC 可用。
+>
+> 用 **MRV1+CG+APC** 重跑同样场景（run `r009`，TP4，FP8，commit `d9b63d51cc`，`docs/dl/compare_results.json`）**结论反转**——vLLM 几乎全胜或持平：
+>
+> | 场景 | 负载 | sglang | vLLM MRV1+CG+APC | 胜者 |
+> |---|---|---|---|---|
+> | SC1 | 前缀共享 warm（绝对值） | 1872 ms | 1207 ms | **vLLM 1.55×** |
+> | SC1 | 前缀共享 cold（绝对值） | 20715 ms | 1620 ms | **vLLM 12.8×** |
+> | SC2 | 多轮对话 avg | 2751 ms | 1283 ms | **vLLM 2.1×** |
+> | SC3 | 并发批 | 20.2 tok/s | 41.9 tok/s | **vLLM 2.1×** |
+> | SC5 | 多用户 fork | 12093 ms | 7942 ms | **vLLM 1.5×** |
+> | SC7 | 长 RAG | 13.9 tok/s | 23.8 tok/s | **vLLM 1.7×** |
+> | SC8 | best-of-N 采样 | 23.4 tok/s | 51.0 tok/s | **vLLM 2.2×** |
+> | SC9 | 纯 decode | 35.8 tok/s | 36.8 tok/s | **持平（+3%）** |
+> | SC10 | 共享 system-prompt | 14.3 tok/s | 24.2 tok/s | **vLLM 1.7×** |
+>
+> sglang 唯一的残留优势是 SC1 的**单引擎**缓存加速比（11.07× vs MRV1 1.34×）——但这只是因为 sglang 未缓存 prefill 慢 12.8×，缓存带来的相对增益才大；**绝对延迟上 vLLM 冷/热都更快**。（一个真实的 sglang 改进：SC9 纯 decode 在 r008 是 vLLM 1.30× 胜，r009 已**持平**——sglang 的 host-sync 优化补上了 decode-IPC 差距。）
+>
+> **结论：** 在公平的 vLLM 基线（MRV1+CG+APC）下，sglang **并未**在这些负载上超过 vLLM。RadixAttention 的结构优势（真实存在、原生支持混合-Mamba KV 布局 + CG）被 vLLM 更快的内核抵消了。旧的 MRV2/APC-off 数字**仅作为该配置下的测量值有效**，**不能**当作 sglang 优于 vLLM 的论据。详见 `sglang-vs-vllm-new-scenarios.md`、`sglang-vs-vllm-rigor-analysis.md`。
+
+---
+
 ## TL;DR — 一张图看完
 
 | 场景 | sglang | vLLM | 结论 |
@@ -25,7 +51,9 @@
 | **SC10 共享 system-prompt**（12 租户） | **13.4 tok/s** | 1.9 tok/s | **sglang 7.05× 高** ✅ |
 | SC9 纯长 decode（短 prompt，128 tok，无共享） | 30.5 tok/s | **39.6 tok/s** | vLLM 1.30×（诚实控制组）⚠️ |
 
-**一句话**：sglang 在**所有"前缀/多轮/并发"缓存复用场景**全面领先 1.6–2.3×；**vLLM 的 APC（前缀缓存）在本模型上根本无法开启**（硬 assert 失败）。vLLM 仅在**无缓存复用的纯 decode / 短 JSON** 上略快 ~8–9%。
+**一句话**（⚠️ **r009 已推翻，见顶部更正**）：sglang 在**所有"前缀/多轮/并发"缓存复用场景**全面领先 1.6–2.3×；**vLLM 的 APC（前缀缓存）在本模型上根本无法开启**（硬 assert 失败）。vLLM 仅在**无缓存复用的纯 decode / 短 JSON** 上略快 ~8–9%。
+>
+> ⚠️ **r009 更正**：上面这句基于"vLLM APC 无法开启"。但 MRV1+CG+APC 在 DLIN 能跑通 → vLLM 反而在多数缓存复用场景反超 sglang（见顶部表格）。
 
 > **2026-07-24 新增场景**（SC5/SC7/SC8/SC9/SC10）：多用户 fork 树、长 RAG 吞吐、
 > best-of-N 并行采样、纯 decode 控制、共享 system-prompt 多租户。SC5/SC7/SC10 把
@@ -157,6 +185,11 @@ sglang JSON 的真正优势在**复杂 schema / 长输出 / 与前缀共享叠�
 ---
 
 ## 8. 给"说服别人"用的一页结论
+
+> ⚠️ **r009 更正（2026-07-27）：本节的 sglang-favorable 结论已被推翻。** 在公平基线
+> vLLM MRV1+CG+APC 下，vLLM 在前缀/多轮/并发场景反超 sglang（见顶部更正表格）。
+> 本节内容仅作为"APC-off 配置下"的历史记录保留。唯一仍然成立的真实 sglang 改进：
+> SC9 纯 decode 已追平 vLLM（r008 的 1.30× 劣势 → r009 持平）。
 
 ### sglang 明确赢的（数据支撑）
 1. **前缀共享**：16.4× 加速（warm 5.6 s vs vLLM 13.0 s 每次）。vLLM 1.0×。

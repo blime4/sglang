@@ -354,8 +354,6 @@ CUDA_VISIBLE_DEVICES=24,25,26,27 .venv/bin/python scripts/dl/test_decode_vllm_fw
 1. **dl_chunk cache 自愈**：把 `dl_safe_reset.sh` 的“崩即恢复好 cache”做成自动化（监控 NCCL 崩溃 → 自动 restore），或请 DLIN 让 dlcc 编译更确定性（避免崩即写坏 cache）。
 2. **缩小 cold-prefill 残留差距**：sglang cold-prefill 稳态 399 vs vLLM ~1457 tok/s（虽然 warm/缓存命中已赢）。profile dl_chunk 是否还能更快。
 3. **decode 微优化**：融合 model_runner 里那些 per-step 小 aten op（dtype cast/copy/index），收益小、风险高，目前 sglang 已赢，优先级低。
-4. **把 `SGLANG_DL_GDN_DLIN_EXTEND=1` 设为 DLIN 源码默认**（gdn_backend.py），而不只是 harness preset。
-
 ---
 
 ## 附录 A：完整代码调用链（从 HTTP 请求到 GPU kernel）

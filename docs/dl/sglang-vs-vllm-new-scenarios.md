@@ -11,10 +11,49 @@
 > wins are 100% RadixAttention caching, not faster raw prefill) and the SC8b
 > cold-best-of-N probe (SC8's 5.84× = caching 3.9× × single-call 2.0×).
 
+---
+
+> ## ⚠️ SUPERSEDED by run r009 (2026-07-27) — the sglang-favorable conclusions below no longer hold.
+>
+> The numbers below were measured against vLLM **MRV2**, on which prefix caching
+> (APC) is **structurally forced off** on this hybrid-Mamba model (MRV2
+> hard-rejects `mamba_cache_mode='align'`). Under that config vLLM **re-prefilled
+> every shared prefix** → catastrophically slow on KV-reuse workloads → sglang's
+> RadixAttention looked dominant (5.8–16.3×). **This is no longer the only
+> working vLLM config.**
+>
+> vLLM **MRV1 + CUDA-graph ON + APC ON** runs cleanly on DLIN (disable
+> torch.compile via `compilation_config.mode="none"`, set explicit capture sizes
+> `[1,2,4,528]`). It was long believed "MRV1 crashes on DLIN" — that was under
+> *default* torch.compile; with CG driven directly it works. Re-running the same
+> scenarios against **MRV1+CG+APC** (run `r009`, TP4, FP8, commit `d9b63d51cc`,
+> `docs/dl/compare_results.json`) **reverses the conclusions** — vLLM wins or
+> ties nearly everything:
+>
+> | SC | workload | sglang | vLLM MRV1+CG+APC | winner |
+> |---|---|---|---|---|
+> | SC5 | multi-user fork | 12093 ms | 7942 ms | **vLLM 1.5×** |
+> | SC7 | long-RAG | 13.9 tok/s | 23.8 tok/s | **vLLM 1.7×** |
+> | SC8 | best-of-N sampling | 23.4 tok/s | 51.0 tok/s | **vLLM 2.2×** |
+> | SC9 | pure decode | 35.8 tok/s | 36.8 tok/s | **tied (+3%)** |
+> | SC10 | shared system-prompt | 14.3 tok/s | 24.2 tok/s | **vLLM 1.7×** |
+>
+> (SC1 warm 1872 vs 1207 ms → vLLM 1.55×; SC2 2751 vs 1283 ms → vLLM 2.1×; SC3
+> 20.2 vs 41.9 tok/s → vLLM 2.1×.) sglang's only residual edge is SC1's
+> **per-engine** cache speedup ratio (11.07× vs 1.34×) — large only because
+> sglang's uncached prefill is 12.8× slower; absolute latency favors vLLM. One
+> genuine sglang improvement: SC9 pure decode, a vLLM 1.30× win in r008, is now at
+> **parity**.
+>
+> **Net:** with a fair vLLM baseline, sglang does **not** beat vLLM here. The old
+> MRV2/APC-off numbers remain valid *as measurements under that config*; they are
+> not valid as an sglang-vs-vLLM superiority claim. Full table:
+> `dlin-sglang-vllm-compare-r009-mrv1-apc-overturns` memory.
+
 ## TL;DR
 
-_Done (run r008, commit ba1bab09de). 4 sglang wins (5.8–16.3×) + 1 honest
-vLLM decode win (SC9, the control)._
+_⚠️ **SUPERSEDED by r009 — see correction block above.** Under APC-off (MRV2): Done (run r008, commit ba1bab09de). 4 sglang wins (5.8–16.3×) + 1 honest
+vLLM decode win (SC9, the control). Under APC-on (MRV1, r009): vLLM wins/ties nearly all._
 
 | Scenario | Workload (shared-structure shape) | sglang | vLLM-MRV2 | Verdict |
 |----------|-----------------------------------|--------|-----------|---------|
@@ -133,6 +172,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./run_sglang.sh compare --scenarios SC5,SC7,SC8,SC9
 ```
 
 ## 6. Conclusion — the sglang-win design space (on this model)
+
+> ⚠️ **OVERTURNED by r009 (2026-07-27).** This conclusion holds **only** under
+> vLLM APC-off (MRV2). Under MRV1+CG+APC, vLLM caches prefixes too and wins these
+> scenarios 1.5–2.2× (see the correction block at the top). The design-space
+> analysis below is retained as the APC-off historical record.
 
 The feasible sglang-favorable workloads on Qwen3.5/3.6-35B-A3B-FP8 (DLIN) are
 exhaustively covered by SC1–SC10. **Every KV-reuse shape is a sglang win
