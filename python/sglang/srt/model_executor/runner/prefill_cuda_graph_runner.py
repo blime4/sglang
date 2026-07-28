@@ -866,8 +866,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # DL begin — timing instrumentation for CG replay breakdown
+        import os as _dl_exec_os, time as _dl_exec_time
+        _dl_timing = _dl_exec_os.environ.get("SGLANG_DL_CG_TIMING") == "1"
+        # DL end
         with self.backend.replay_session():
+            # DL begin
+            _dl_t0 = _dl_exec_time.perf_counter() if _dl_timing else 0
+            # DL end
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
+            # DL begin
+            _dl_t1 = _dl_exec_time.perf_counter() if _dl_timing else 0
+            # DL end
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 
@@ -909,6 +919,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         )
                 finally:
                     self.layer_model.forward = original_layer_forward
+                # DL begin — timing instrumentation
+                if _dl_timing:
+                    _dl_t2 = _dl_exec_time.perf_counter()
+                    print(f"[CG-TIME] load_batch={(_dl_t1-_dl_t0)*1000:.0f}ms replay={(_dl_t2-_dl_t1)*1000:.0f}ms "
+                          f"nt={static_num_tokens}", flush=True)
+                # DL end
             else:
                 # TC_PIECEWISE path. backend.replay calls the compiled
                 # outer model.forward directly (torch.compile handles
