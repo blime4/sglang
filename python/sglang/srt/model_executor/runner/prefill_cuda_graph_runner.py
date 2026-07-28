@@ -263,6 +263,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
         self._dl_captured_attn_metadata = None  # DL: saved capture-time attn metadata for NO_BREAK CG
+        self._dl_captured_attn_metadata_list = []  # DL: per-inner-backend saved metadata
 
     def _is_mamba_track_enabled(self) -> bool:
         return (
@@ -392,10 +393,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
-            # DL begin — save the capture-time metadata object so we can
-            # copy_ fresh values into its tensor addresses at replay (NO_BREAK
-            # CG fix: the captured graph reads from these addresses).
-            self._dl_captured_attn_metadata = getattr(attn_backend, "forward_metadata", None)
+            # DL begin — save the capture-time forward_metadata from each inner backend
+            # (HybridLinearAttnBackend has attn_backend_list, not forward_metadata itself).
+            # At replay, copy_ fresh values INTO these captured addresses.
+            inner_backends = getattr(attn_backend, "attn_backend_list", [attn_backend])
+            self._dl_captured_attn_metadata_list = [
+                getattr(ib, "forward_metadata", None) for ib in inner_backends
+            ]
             # DL end
             return
         metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
@@ -416,12 +420,37 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         to the generic eager init."""
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
-            # DL begin — investigated using init_forward_metadata_out_graph(in_capture=False)
-            # instead of init_forward_metadata for NO_BREAK CG. The _apply_cuda_graph_metadata
-            # path it routes to doesn't handle EXTEND metadata at capture time → still garbled.
-            # The real fix is implementing the full captured-metadata contract (like DSV4's 3
-            # methods) for fa3 + GDN backends. Reverted to default for now (2026-07-28).
+            # DL begin — NO_BREAK CG metadata fix. init_forward_metadata creates NEW tensor
+            # objects → captured graph reads stale addresses → garbled. Fix: call
+            # init_forward_metadata (builds fresh values), then copy_ each tensor field INTO
+            # the capture-time addresses saved in _dl_captured_attn_metadata_list.
+            # Traverse HybridLinearAttnBackend.attn_backend_list (wrapper has no forward_metadata).
             attn_backend.init_forward_metadata(forward_batch)
+            import torch as _dl_torch
+            inner_backends = getattr(attn_backend, "attn_backend_list", [attn_backend])
+            saved_list = getattr(self, "_dl_captured_attn_metadata_list", [])
+            for idx, inner in enumerate(inner_backends):
+                fresh = getattr(inner, "forward_metadata", None)
+                if idx < len(saved_list) and fresh is not None and saved_list[idx] is not None:
+                    captured = saved_list[idx]
+                    if fresh is not captured:
+                        for name in dir(fresh):
+                            if name.startswith("_"):
+                                continue
+                            try:
+                                val = getattr(fresh, name)
+                                cap = getattr(captured, name, None)
+                            except Exception:
+                                continue
+                            if isinstance(val, _dl_torch.Tensor) and isinstance(cap, _dl_torch.Tensor):
+                                if val.shape == cap.shape and val.dtype == cap.dtype:
+                                    cap.copy_(val, non_blocking=True)
+                            elif not isinstance(val, (_dl_torch.Tensor, type)) and not callable(val):
+                                try:
+                                    object.__setattr__(captured, name, val)
+                                except Exception:
+                                    pass
+                        inner.forward_metadata = captured
             # DL end
             return
         assert self.attn_metadata_buffers is not None
