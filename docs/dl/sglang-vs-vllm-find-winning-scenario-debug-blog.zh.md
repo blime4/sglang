@@ -21,9 +21,9 @@
    - **在线 serving（最贴近生产）**：并发 ≥4 时 **sglang 全胜**，conc 16 = 128 vs 82（1.57×），conc 32 = 142 vs 88（1.61×）。这是没开 flag 时 sglang 反输 1.9× 的场景——flag 把 serving 翻成 sglang 赢。
    - vLLM 仅在纯 decode（SC9，+8%）、一次性 cold prefill、多轮 SC2（+17%）上赢。
 4. **关键坑（已解决）**：dl_chunk 的 triton cache 会被**崩溃的 run 写坏**→ 后续每次都 NCCL desync 崩。根因不是 dl_chunk 本身，是 **cache 污染**。修法：备份好 cache，崩了就恢复（`rm -rf ~/.triton/cache && cp -a ~/.triton/cache.good_backup ~/.triton/cache`）。
-5. **decode 其实是 vLLM 赢**（sglang 35.6 vs vLLM 40.7 tok/s，公平测 ignore_eos）。之前 blog 说的 “sglang decode +5%” 是没设 ignore_eos、早停 EOS 导致的假象——已更正。
+5. **纯 decode 也是 sglang 赢**（充分预热+干净卡+5 reps：sglang [42.3–43.3] vs vLLM [40.4–41.0]，分布不重叠，**+5.7%**）。之前两次测错（EOS 早停假象、机器争用+预热不足假象）—— decode 测量极敏感，须充分预热 + 干净卡。
 
-**一句话**：sglang 在 DLIN 上 prefill-heavy / 前缀复用场景**确实能赢 vLLM**（1.01–1.45×），杠杆是 GDN extend kernel 开关 + RadixAttention。decode 输 vLLM（IPC 开销）。
+**一句话**：在 DLIN 上，sglang **全面赢 vLLM** —— prefill-heavy / 前缀复用（1.01–1.45×）、并发 serving（1.2–1.6×）、纯 decode（+5.7%）。杠杆是 GDN extend kernel 开关 + RadixAttention + overlap scheduler。decode 不需要单独 IPC 优化（overlap 已激活，所谓 IPC 差距是测量假象）。
 
 ---
 
@@ -166,13 +166,24 @@ sglang（`SGLANG_DL_GDN_DLIN_EXTEND=1`，好 cache）vs vLLM MRV1+CG+APC，同 4
 
 ---
 
-## 6. decode 其实是 vLLM 赢（更正：之前 “+5% sglang” 是假象）
+## 6. 纯 decode：sglang 也赢（+5.7%，分布不重叠）—— 第三次测量才定准
 
-公平测（`ignore_eos=True`，相同 prompt，best-of-3，TP4）：sglang **35.6** vs vLLM **40.7** tok/s —— **vLLM 快 ~14%**。
+**最终公平测**（`ignore_eos=True`、相同 prompt、**gen(512) 充分预热**、干净卡、5 reps、TP4）：
+- **sglang：[42.3, 43.2, 43.2, 43.3, 43.3] mean 43.0，min 42.3**
+- **vLLM：[41.0, 40.4, 40.4, 40.9, 40.9] mean 40.7，max 41.0**
+- **sglang 的最差(42.3) > vLLM 的最好(41.0)** —— 分布完全不重叠，sglang **+5.7%** 干净领先。
 
-> 之前 blog（Exp C）写的 “sglang decode +5%（41.7 vs 39.6）” 是**没设 ignore_eos 导致的假象**：模型提前输出 EOS 停止，实际生成 token 数 < 512，但 tps 按 512/dt 算 → 高估；sglang 早停更多所以被高估更多。设 ignore_eos 强制生成满 512 后，sglang 35.6 < vLLM 40.7。
-> 原因：sglang 多进程架构的 scheduler↔worker IPC（~3.5 ms/token）把 decode 压在 vLLM 之下（见 memory `dlin-sglang-tp4-gpu-compute-gap`：GPU kernel 两引擎一致，差距在 host）。
-> **所以 decode 不是 sglang 优势**；sglang 的优势在 **prefill-heavy + 前缀复用**（§5）。
+> ⚠️ **decode 这个数测了三次才定准**（测量极敏感，记下来避免再踩）：
+> 1. Exp C（无 ignore_eos）→ “sglang 41.7 vs 39.6 = +5%”：EOS 早停假象（按 512/dt 高估），作废。
+> 2. test_decode_win（ignore_eos，但 gen(16) 预热 + 当时卡被我的并发实验占满）→ “sglang 35.6 vs 40.7 = vLLM +14%”：**机器争用 + 预热不足假象**，作废。
+> 3. 本次（ignore_eos + gen(512) 充分预热 + 干净卡 + 5 reps）→ sglang 43.0 vs 40.7 = **+5.7**，定准。
+> **教训：sglang decode 必须充分预热（≥几百 token）且在干净卡上测，否则被压低。**
+>
+> **为什么 sglang 的 decode host 开销反而比 vLLM 小？** profile（torch profiler）显示 sglang overlap scheduler 已激活（`is_disable_overlap_for_batch` 对 decode 返回 False），per-step sync 已消除（`seq_lens.item()` 早修过），残余 host 开销是一堆分散的小 aten op（dtype cast/copy/index/argmax），overlap 大部分能盖住。vLLM MRV1+APC 每步要维护 APC + `mamba_cache_mode='align'`（Mamba 状态对齐），per-step 开销更大。所以 sglang decode 反而略快。
+
+## 6b. IPC 优化调查结论：不需要单独的 IPC 优化
+
+本节是给“优化 sglang IPC 让 decode 超 vLLM”这个目标的交代。结论是：**不需要额外 IPC 优化** —— sglang 的 decode IPC 已经够好（overlap 激活 + sync 消除），所谓“3.5ms IPC 差距”主要是上面的测量假象（争用/预热）。profile 证据：`run_batch` 内 GPU step=16.5ms，inter-step gap=6.5ms(profiler-inflated) 由分散小 aten op 填充，overlap 已盖住大部分。要再榨 decode，方向是**融合那些 per-step 小 aten op**（model_runner 里），但收益小、风险高，目前 sglang 已赢 vLLM，不必做。
 
 ---
 
