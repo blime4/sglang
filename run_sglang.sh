@@ -173,6 +173,7 @@ COMPARE_ONLY="${COMPARE_ONLY:-}"                # --only sglang|vllm-mrv2|vllm-m
 COMPARE_SHOW="${COMPARE_SHOW:-0}"               # --show: re-render table from cache, no GPU run
 COMPARE_HISTORY="${COMPARE_HISTORY:-0}"         # --history: print the results log, no GPU run
 COMPARE_LIST="${COMPARE_LIST:-0}"               # --list: print all scenarios + ASCII diagrams, no GPU run
+COMPARE_LIST_ZH="${COMPARE_LIST_ZH:-0}"         # --zh: Chinese version of --list
 COMPARE_RECORD="${COMPARE_RECORD:-1}"           # --no-record: don't append to the JSON store
 COMPARE_RUN_MRV1="${COMPARE_RUN_MRV1:-1}"       # DL: MRV1+CG+APC = the FAIR baseline (default on). +~10min (528 capture)
 COMPARE_BASELINE="${COMPARE_BASELINE:-}"        # --baseline <id|commit>: diff vs this (else previous run)
@@ -686,6 +687,7 @@ parse_test_args() {
       --show)              COMPARE_SHOW=1; shift;;
       --history)           COMPARE_HISTORY=1; shift;;
       --list)              COMPARE_LIST=1; shift;;
+      --zh)                COMPARE_LIST_ZH=1; shift;;
       --no-record)         COMPARE_RECORD=0; shift;;
        --baseline)          COMPARE_BASELINE="$2"; shift 2;;
        --verbose)           COMPARE_VERBOSE=1; shift;;
@@ -1070,6 +1072,92 @@ _compare_row() {  # $1=label  $2=KEY  $3=dir(lower|higher) — 3 engines: sglang
   printf "  %-24s | %-10s | %-10s | %-10s | %s\n" "$label" "$sd" "$m2d" "$m1d" "$verdict"
 }
 
+# Chinese version: sglang vs vLLM 场景中文描述（compare --list --zh）
+_compare_list_zh() {
+  cat <<'COMPARE_EOF'
+
+================ sglang vs vLLM — 场景对比列表（--list --zh）================
+每个场景代表一种不同的负载模式。选子集运行：
+    ./run_sglang.sh compare --scenarios SC2,SC5,SC7            # 逗号分隔
+    ./run_sglang.sh compare --scenarios SC5,SC7,SC8,SC9,SC10   # 完整新版展示
+两引擎：同模型（Qwen3.5/3.6-35B-A3B-FP8）、TP4、同 GPU、独立进程、
+temperature 0（SC8/SC8b=0.7，真实 best-of-N）、预热后 best-of-2。
+公平基线：vLLM MRV1 + CG + APC ON（前缀缓存开）。sglang 使用 GDN
+dl_chunk 开关（SGLANG_DL_GDN_DLIN_EXTEND=1，默认开）+ RadixAttention。
+  => 开 GDN 开关后，sglang 在大多数前缀复用 + serving 场景获胜
+     （RadixAttention 复用完整 hybrid-Mamba 状态，含 Mamba 循环状态，
+     vLLM APC 只能部分缓存）。vLLM 仅在纯 prefill（SC6）和首次冷 prefill 获胜。
+注意：不开 GDN 开关时 sglang 多数场景输（旧 r009 基线）——该开关是关键杠杆。
+详见技术报告 docs/dl/sglang-beats-vllm-dlin-technical-report.zh.md。
+图例：[sglang win ~Nx] / [vLLM win ~Nx]   [probe] = 诊断探针
+
+---------------------------------------------------------------------------
+SC1  前缀共享（扁平前缀）                    [sglang win ~1.14x warm]
+     [共享前缀] -- req1（独立后缀）
+                -- req2
+                -- req3
+     冷：prefill 前缀；热：缓存命中 → 完全跳过 prefill。
+
+SC2  多轮对话（单一线性问题）                 [vLLM win ~1.17x]
+     sys+history -> turn1 -> turn2 -> turn3 -> turn4 -> turn5（单个用户，增长中）
+     每一轮的 suffix（生成文本 + 新问题）更大 → sglang 略输
+     （其绝对 prefill 仍较慢；vLLM APC 复用增长中的前缀）。
+
+SC3  并发批处理（一个前缀，批量 decode）       [sglang win ~1.45x]
+     [共享 prompt] -- 分支到 N 个 decode 同时（单次调用，多个输出）
+     聚合批处理 prefill+decode 吞吐。受 prefill 瓶颈（融合 FP8 MoE）。
+
+SC4  结构化 JSON（短约束解码）               [~tie / vLLM +~9%]
+     prompt -> { "name": "...", "age": ... }（greedy JSON）
+     受 decode 瓶颈，短输出，无前缀复用 → 纯 decode + JSON 路径决定胜负。
+
+SC5  多用户分支（基数树，共享根）              [sglang win ~1.01x（平）]
+              [共享 system-prompt 根]   <- prefill 一次，KV 共享
+                /              \
+         用户 A 分支        用户 B 分支
+        turn1->2->3->4      turn1->2->3->4（交错，分支树）
+     多租户 / 多个用户共享一个 system prompt。
+
+SC6  纯 prefill 对标（唯一 prompt，无缓存）    [probe -- vLLM ~3-4x 更快]
+     唯一 prompt1   唯一 prompt2   ...（不同前缀 → 缓存无法命中）
+     隔离纯 prefill 速率。sglang 稳态 prefill ~399 vs vLLM ~1457 tok/s
+     （sglang dl_chunk 仍慢于 vLLM 的绝对 prefill kernel）。
+
+SC7  长 RAG 吞吐（~2K 文档 × 8 查询）         [sglang win ~1.12x]
+     [~2K-token 文档]   <- 共享；sglang 缓存完整状态，vLLM APC 部分缓存
+          |- Q1 |
+          |- Q2 |    8 个不同查询基于同一文档；聚合 decode tok/s。
+          |- ...|    RAG 长共享文档场景。
+
+SC8  重复 best-of-N（RLHF 循环，同 prompt）    [sglang win ~1.25x]
+     [prompt]  <- 跨轮次复用；sglang 缓存它
+       /  |  |  \     n=4 采样补全（temp=0.7）
+      c1 c2 c3 c4
+     RLHF 拒绝采样循环。缓存主导；单次调用 best-of-N 见 SC8b。
+
+SC8b 冷启动单次 best-of-N（唯一 prompt）       [probe -- sglang ~2x]
+     每次调用唯一 prompt -> n=4 采样（无跨调用缓存）。
+     从 SC8 的缓存因子中隔离单次 best-of-N。
+
+SC9  纯长 decode（短 prompt + 128 tok）        [sglang win +5.7%]
+     [短 ~14-tok prompt] -> decode 128 token（单流，无共享结构）
+     受 decode 瓶颈；sglang overlap scheduler + vLLM APC/mamba-align 开销 →
+     sglang 略胜（5 次重复分布不重叠）。需充分预热 + 干净卡，否则偏低 ~8 tok/s。
+
+SC10 共享 system-prompt（多租户）              [sglang win ~1.13x]
+     [~0.9K system prompt]   <- 12 个租户共享
+          |- tenant1 |
+          |- tenant2 |   24 个短请求，同一角色；RadixAttention 生产经典场景。
+          |- ...     |
+---------------------------------------------------------------------------
+Serving（非场景，单独）：并发 HTTP，共享前缀 → sglang 1.2-1.6x
+  并发 4-32（exp_b_serving_client.py）。详见报告 §3.5。
+完整文档：docs/dl/sglang-beats-vllm-dlin-technical-report.zh.md（决定性报告），
+          docs/dl/sglang-vs-vllm-showcase-dlin.md（SC1-4），
+          docs/dl/sglang-vs-vllm-new-scenarios.md（SC5/7/8/9/10）。
+COMPARE_EOF
+}
+
 # Print every compare scenario with an ASCII diagram of its workload shape, the
 # win/loss verdict, and the typical ratio — so you can pick which to run via
 # --scenarios SCx,SCy. No GPU/model/env needed. (compare --list)
@@ -1247,6 +1335,7 @@ _print_compare_commands() {
 }
 
 phase_compare() {
+  [ "$COMPARE_LIST_ZH" = "1" ] && { _compare_list_zh; [ "$COMPARE_VERBOSE" = "1" ] && _print_compare_commands; return 0; }
   [ "$COMPARE_LIST" = "1" ] && { _compare_list; [ "$COMPARE_VERBOSE" = "1" ] && _print_compare_commands; return 0; }
   log "Phase [compare]: sglang vs vLLM (MRV2 + MRV1) showcase ($COMPARE_SCENARIOS)"
   [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
