@@ -72,7 +72,7 @@ guard 在 `==1` 时过保守（真），但**不是"纯误判"**：长 prefill �
 
 - [x] **35-40 tok/s 是否真实？→ 真实测量。** §7.12（2026-07-07）两次复现：35.23 / 39.86 tok/s，accept 0.61/0.75，accept_length 5-6。
 - [x] **但建立在退化输出上 → 是。** §7.14 明确撤回："§7.12 的 NGRAM '35–40 tok/s = 2.8–3.2× vLLM' ……是**退化输出（复述 prompt / 多语言乱码）上的吞吐，不是真实质量加速**"。根因 = spec verify 的 target 在 verify 位置**重新生成 prompt**（`dlin-sglang-mtp-vs-ngram-report.md` §10 + memory `spec-verify-prompt-regen-bug`）→ 重复 prompt 上的 n-gram 匹配率虚高 → accept 虚高。
-- [x] **verify 路径修复后 accept？→ 部分修，仍不���用。** full-attn verify 从 FA2 `_fa2_kvcache` 改为逐 token `paged_decode_attn` loop（因果 mask 正确），accept 8.5%→15.4%。但 §7.14 P0 决定性复核：greedy 不再逐字复述 prompt，**采样 (temp=0.6) 仍复述 prompt**；verify≠decode 残留未解（根因 = hybrid **GDN 状态层 batch-verify ≠ sequential-decode** 数值不等价，架构级）。
+- [x] **verify 路径修复后 accept？→ 部分修，仍不能使用。** full-attn verify 从 FA2 `_fa2_kvcache` 改为逐 token `paged_decode_attn` loop（因果 mask 正确），accept 8.5%→15.4%。但 §7.14 P0 决定性复核：greedy 不再逐字复述 prompt，**采样 (temp=0.6) 仍复述 prompt**；verify≠decode 残留未解（根因 = hybrid **GDN 状态层 batch-verify ≠ sequential-decode** 数值不等价，架构级）。
 - [x] **num_draft tradeoff 曲线 → 未测（被阻塞）。** 在 spec-verify prompt-regen bug 修好前，任何 num_draft 的吞吐都是垃圾输出上的，无意义。
 
 ### 结论

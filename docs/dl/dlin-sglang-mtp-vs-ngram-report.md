@@ -1,5 +1,10 @@
 # DLIN sglang：Qwen3.5-35B-A3B-FP8 上 MTP vs NGRAM 投机解码调研报告
 
+> ⚠️ **状态更正**：本报告摘要中 "NGRAM = 2.8–3.2× vLLM" 的成绩是**假阳性**——spec-verify
+> target 会重新生成 prompt，输出为 prompt-regeneration 垃圾，加速比建立在垃圾输出上**不成立**
+> （见 memory `dlin-sglang-spec-verify-prompt-regen-bug`，及 DFlash 调研里干净测试的真实
+> spec 天花板 ~1.2–1.3×）。本报告作为 spec-decode 架构调研的历史记录保留，**其性能数字不可引用**。
+
 - **日期**：2026-07-07
 - **代码基线**：sglang `dl-main` @ `a36a88926f`
 - **模型**：`/mars/aebox/LLM/model/Qwen3.5-35B-A3B-FP8/`（FP8，自带原生 MTP 头）
@@ -16,7 +21,7 @@
 
 3. **跑通 MTP 的本质是「上游 Qwen3.5 功能缺口移植」，不是纯 DLIN 适配**。全库只有 `gemma4_mtp.py` 实现了 frozen-KV 所需的两个 hook；`qwen3_5_mtp.py` 没实现 → 目前上游 **Qwen3.5 frozen-KV MTP 根本跑不起来**（第一次 `draft_forward` 必崩）。
 
-4. **跑通 = 恰好 3 处明确改动**（全部有模板 / 有 guard，���未知项）：
+4. **跑通 = 恰好 3 处明确改动**（全部有模板 / 有 guard，无未知项）：
    - `qwen3_5_mtp.py`：补 `build_frozen_kv_mtp_context` + `bind_frozen_kv_context`（照搬 gemma4，typed-layer 逻辑改为 Qwen3.5 的 linear/full）。
    - `qwen3_5.py:982`：`self.attn(...)` 调用补 guarded `save_kv_cache=not getattr(self,"is_kv_shared_layer",False)`（2 行，默认行为不变 → 非 MTP 运行零影响）。
    - DLIN 侧：**无需新 op fallback**（贪婪 MTP 复用 NGRAM 已 fallback 的 `verify_tree_greedy` + `build_tree_kernel_efficient`）。
@@ -57,7 +62,7 @@
 
 ### 3.1 上游成熟度：成熟功能，但 Qwen3.5 的 hook 没写
 
-- `frozen_kv_mtp_worker_v2.py` / `qwen3_5_mtp.py` 的提交均为正常上游 PR���#28567、#28129、#28683、#28093…），活跃维护，**非 WIP 半成品**。
+- `frozen_kv_mtp_worker_v2.py` / `qwen3_5_mtp.py` 的提交均为正常上游 PR（#28567、#28129、#28683、#28093…），活跃维护，**非 WIP 半成品**。
 - 但全库实现 `build_frozen_kv_mtp_context` / `bind_frozen_kv_context` 的**只有 `gemma4_mtp.py`**；`qwen3_5_mtp.py` 没有。
 - worker 硬性要求 `kv_context` 非空：`frozen_kv_mtp_utils.py:44` 在 `kv_context is None` 时 `raise RuntimeError("...bind the frozen KV context first.")`；而 `kv_context` 只在这两个 hook 里被设置（worker `__init__` line 162–164 / 259–276）。
 - **结论**：Qwen3.5 frozen-KV MTP 目前上游**不可运行**，第一次 `draft_forward` → `_target_kv_pool_view` → 必崩。这是上游功能缺口，不是 DLIN bug。
@@ -259,7 +264,7 @@ slot='out_cache_loc' axis=tokens dst=(1,) src=(10,) raw_bs=1 raw_n=1
 
 **剩余嫌疑（draft KV 读）**：
 1. layer 映射：draft→target 最后一个 full-attn 层(39) 可能不是 draft 训练时期望的 KV 层。
-2. pool swap：尽管修了 sub-backend swap，flashattention 子后端的 `get_kv_buffer(39)` 可能仍读到 draft 自己的（空/错）pool 而非 target ���。
+2. pool swap：尽管修了 sub-backend swap，flashattention 子后端的 `get_kv_buffer(39)` 可能仍读到 draft 自己的（空/错）pool 而非 target 的。
 3. positions/rope：draft Q 在 pos(seq_len-1)，target K 在 pos(0..seq_len-1) —— rope 相对位置可能不对齐。
 4. K/V layout：target layer-39 的 paged KV 与 draft attention 期望的 layout 不匹配。
 

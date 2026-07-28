@@ -13,6 +13,26 @@
 > （Route A 废弃，降级为 Route B 的 shim）。构建产物与旧 copied .so 逐 bit 一致（max diff 0.0，
 > vs SDPA 5e-4），故下表性能数据不变。详见 §3 P0。
 
+---
+
+> ## ⚠️ 状态更正（汇总，2026-07-25 / r009 2026-07-27）——阅读本文前必读
+>
+> 本文是按时间顺序的性能调查**全程记录**（1.7B → 35B，decode-gap → NGRAM → 35B 调优）。
+> 其中部分 "sglang 超过 / 全面超过 vLLM" 的性能结论**已不再成立**，分两类：
+>
+> 1. **NGRAM "2× / 2.8–3.2× vLLM"（§7.11/7.12 等）= 假阳性。** spec-verify 的 target 会
+>    重新生成 prompt，输出为 prompt-regeneration 垃圾，加速比建立在垃圾输出上**不成立**
+>    （见 memory `dlin-sglang-spec-verify-prompt-regen-bug`；真实 spec 天花板 ~1.2–1.3×）。
+> 2. **SC1–SC10 showcase "sglang 领先 1.6–16.3×"（前缀/缓存复用场景）= vLLM APC-off 伪影。**
+>    那些数字在 MRV2（结构性无法开 APC）下测得。公平基线 **MRV1+CG+APC** 下（r009）vLLM
+>    反而在多数场景反超 sglang（SC2/SC3/SC8 ~2.1–2.2×、SC7/SC10 1.7×、SC5 1.5×；SC9 纯 decode
+>    已持平）。见 memory `dlin-sglang-vllm-compare-r009-mrv1-apc-overturns` 与
+>    `sglang-vs-vllm-showcase-dlin.md` 顶部更正。
+>
+> **仍然成立的**：decode-gap 根因（GPU kernel 逐字节一致、差距在 host 侧 sync/pipeline）、
+> 35B CG 是 net-positive、各 op 移植（`_dl_C`）等**工程结论**。本文作为调查史保留；**引用本文
+> 性能数字前请核对上述两条更正。**
+
 ### 当前 DLIN 集成现状（截至 2026-07-09）
 
 > 本文前半段的性能分析主要基于 **Qwen3-1.7B bf16 dense 模型**，用于解释当时的 decode/perf-gap 根因；
@@ -984,7 +1004,7 @@ CUDA_VISIBLE_DEVICES=<4 free> SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MOE_FUSED=1 \
 |---|---|---|---|
 | baseline（triton GDN, q1）| 37.7ms | 26.5 | §7.19 起点附近（../sdk 略快于 sdk-0401 的 39.4）|
 | + GDN dl_recurrent op（`SGLANG_DL_GDN_DLIN=1`）| 34.7ms | 28.8 | **-3ms**：triton recurrent → `_dl_C.dl_recurrent_gated_delta_rule` |
-| + quant_type=2 dense FP8 linear（`SGLANG_DL_FP8_Q2=1`）| **30.6ms** | **32.6** | **-4ms**：per-channel requant ��� blockwise 硬件融合 dequant（vLLM 同款）|
+| + quant_type=2 dense FP8 linear（`SGLANG_DL_FP8_Q2=1`）| **30.6ms** | **32.6** | **-4ms**：per-channel requant 到 blockwise 硬件融合 dequant（vLLM 同款）|
 | **合计** | **30.6ms** | **32.6** | **-7ms（-19% vs 37.7 baseline）**；离 26ms 还差 4.6ms |
 
 **优化 1：GDN dl_recurrent op** — `SGLANG_DL_GDN_DLIN=1`（§7.20 已接入）。验证：dispatcher 确认 `decode=DLinGDNKernel`，op 跑通、CG 可捕获（66s capture 无 segfault），**输出与 triton 逐字一致**（greedy 确定性 → 两条路径同文）。TPOT 37.7→34.7（-3ms）。**但**：dl_recurrent op 本身只占 ~0.5ms（kprof 估算）；GDN 层 38% 的大头是 conv1d + gating + projections，非 recurrent。
@@ -1053,7 +1073,7 @@ sglang 16/128/128 对 M=1 decode（memory-bound GEMV，小 BM 少 padding）已�
 **根因**：`python/sglang/srt/models/qwen3_5.py` 第 784 行 `get_rope(..., is_neox_style=True)` 硬编码。模型 config.json 有 `text_config.rope_parameters.mrope_interleaved = True`。交错 rotary ≠ NeoX（NeoX 对半切；交错交替配对）。sglang 用 NeoX → 10 个 full-attention 层的 rotary 应用到**错误的维度对** → attention 完全错 → 模型输出退化（重复循环）。
 
 **验证过程**（排除 10+ 组件后找到）：
-1. 排除：tokenization（一致）、gating 公式（一致）、ssm state（已清零）���dense FP8（与 vLLM 逐字一致）、RMSNorm（同为 GemmaRMSNorm）、MoE op（同款）、chunk intra（fused 和 unfused 同错→非 intra）、conv1d call（args 一致）、full-attn backend（fa3 和 triton 均错→非根因）、partial_rotary_factor（正确读 0.25）。
+1. 排除：tokenization（一致）、gating 公式（一致）、ssm state（已清零）、dense FP8（与 vLLM 逐字一致）、RMSNorm（同为 GemmaRMSNorm）、MoE op（同款）、chunk intra（fused 和 unfused 同错→非 intra）、conv1d call（args 一致）、full-attn backend（fa3 和 triton 均错→非根因）、partial_rotary_factor（正确读 0.25）。
 2. 发现：`full_attention_interval=4`（每 4 层 1 个 full-attn）、`head_dim=256`、`rope_theta=10M`、`partial_rotary_factor=0.25`（rotary_dim=64）、`mrope_interleaved=True`、`mrope_section=[11,11,10]`。
 3. 关键：sglang `is_neox_style=True` vs config `mrope_interleaved=True`（应为 `is_neox_style=False`）。
 
@@ -1127,7 +1147,7 @@ sglang 16/128/128 对 M=1 decode（memory-bound GEMV，小 BM 少 padding）已�
 - block_size 对齐（bsn/bsk 同 128/128，bsm 实测无影响）。
 - ⇒ **差距在 MoE 的"环绕开销"（moe_align_block_size 分离调用 + shared_expert 分离计算 + silu*up + sum combine），非 GEMM 本身。** vLLM 用 monolithic MoE kernel（`make_fp8_moe_kernel` / `FusedMoEExpertsMonolithic`，prepare_finalize+experts 融合 dispatch/GEMM/combine/shared）把这些融合；sglang 分离调用。
 
-**关闭 gap 的可执行路径**��非 config quick-fix，需工程）：
+**关闭 gap 的可执行路径**（非 config quick-fix，需工程）：
 1. **shared_expert 融合进 MoE**：sglang FP8/DL 路径 `num_fused_shared_experts=0`（shared 分离计算于 `forward_normal_dual_stream`，含 `hidden_states.clone()` + 跨流 sync）。vLLM 把 shared 融为额外 expert（`shared_experts` 传入 `FusedMoE`，monolithic 内处理）。融合后省 shared 的 40×2 GEMM + clone + sync。
 2. **移植 vLLM monolithic FP8 MoE kernel**（`make_fp8_moe_kernel` 架构：fused dispatch+align+GEMM+combine）——最大收益但工程量大。
 
@@ -1217,7 +1237,7 @@ decode batch=1 时 vLLM **跳过 moe_align_block_size**（每层省一个 triton
 
 **结论（确定）**：gap = vLLM monolithic FP8 MoE kernel（C++ 级融合）vs sglang dl_invoke + 分离 align/act/combine/shared。monolithic 的融合在 **C++ 层**（_dl_C.so / vLLM ext），Python 级融合（silu_and_mul、use_moe_cu）在 DLIN 上崩——无法用 Python 复刻。关闭 = 移植 vLLM monolithic MoE 架构到 sglang（C++ 级，multi-session 工程）。
 
-**本轮累计 9 个实��**，全部失败/更慢/崩溃。gap 锁定在 monolithic MoE kernel（C++ 级），非 sglang 代码层可解。
+**本轮累计 9 个实验**，全部失败/更慢/崩溃。gap 锁定在 monolithic MoE kernel（C++ 级），非 sglang 代码层可解。
 
 ---
 
@@ -1551,7 +1571,7 @@ stream 实验（#1）未测——但 use_moe_cu 崩是 Device page fault（内�
 | triton MoE + 非-PDL | 184ms |
 | breakable | 50ms |
 
-**use_moe_cu（vLLM 18ms 的唯一路径）的 trivial sorted_token_ids page fault 是 sglang 所有 CG 变体（raw/compiled-forward/breakable��下都崩的硬阻塞，且与 capture-state、compiled forward、fake_impl（bs=2 裸调 real-moe_align 能捕获，证明不需要）均无关。** 差异最终落在 `_dl_C.so` 内部对 use_moe_cu 路径 sorted_token_ids 的内存访问——vLLM 不崩 sglang 崩，同 op 同输入，这是 op 内部 dispatch 行为，sglang Python 层无法改变。
+**use_moe_cu（vLLM 18ms 的唯一路径）的 trivial sorted_token_ids page fault 是 sglang 所有 CG 变体（raw/compiled-forward/breakable）下都崩的硬阻塞，且与 capture-state、compiled forward、fake_impl（bs=2 裸调 real-moe_align 能捕获，证明不需要）均无关。** 差异最终落在 `_dl_C.so` 内部对 use_moe_cu 路径 sorted_token_ids 的内存访问——vLLM 不崩 sglang 崩，同 op 同输入，这是 op 内部 dispatch 行为，sglang Python 层无法改变。
 
 ### 7.44 🔬 输入逐项一致（dump 实证）→ 原因在执行上下文，非输入（2026-07-14）
 
@@ -1700,7 +1720,7 @@ dlPTI 显示非-MoE 已高效（AR 3.8%/norm <1%/GDN <2%），剩余空间小。
 3. **vLLM 的矛盾仍在**：vLLM 用同 op 同 .so 能跑——它必然不传 FP8 给 invoke_fused_moe_opt，而是通过 modular experts + prepare_finalize 的不同代码路径（experts 可能在 prepare_finalize 和 invoke_fused_moe_opt 之间做了某种转换，或用不同的 experts 子类）。
 
 **下一步方向**：
-- **A**（最���接）：研究 vLLM 的 modular experts 的 `_fused_experts` 到底传什么给 invoke_fused_moe_opt——是 BF16（触发 PDL 但 vLLM 不崩？）还是 FP8（op 不 segfault？）。需对比 vLLM 的 experts.apply 和 sglang 的 DL block 调用差异。
+- **A**（最直接）：研究 vLLM 的 modular experts 的 `_fused_experts` 到底传什么给 invoke_fused_moe_opt——是 BF16（触发 PDL 但 vLLM 不崩？）还是 FP8（op 不 segfault？）。需对比 vLLM 的 experts.apply 和 sglang 的 DL block 调用差异。
 - **B**：invoke_fused_moe_opt 可能有一个参数控制是否做内部量化（类似 vLLM 的 `defer_input_quant` / `expects_unquantized_inputs`）。检查 op 的 22 个参数中是否有 skip-quant 标志。
 - **C**：PDL 不支持 → 找 DLIN 要一个**非-PDL 版本的 invoke_fused_moe_opt**（kUsePDL=False 的编译变体），或让 op 检查输入 dtype 自动跳过量化。
 

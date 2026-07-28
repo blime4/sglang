@@ -58,7 +58,7 @@ gather 回退（`:187`）更严重：`_cu_q = arange(0, batch+1) * _seqq`（均�
 ### 验证（2026-07-24）
 1. ✅ **Spy 验证 PASS**（`scripts/dl/test_prefill_varlen.py`）：拦截 `_sgl_fa2_varlen`，断言 wrapper 传 `max_seqlen_q=max(extend_lens)=32`（修复前 `_seqq=14`）、`cu_seqlens_q=[0,16,24,56,59]` 正确。**wrapper 修复确认。**
 2. ⚠️ **裸调单测数值对比失败 = 单测方法问题，非 wrapper**：直接调 `_sgl_fa2_C.varlen_fwd` 对不等长多序列 dleol JIT `to bc failed`。但单测用错 head 配置（8/8 vs 35B 真实 `num_attention_heads=16 / num_key_value_heads=2 / head_dim=256`）+ 缺 sinks/metadata，**不代表端到端**。教训：wrapper 修复应**端到端验证**，不要裸调 kernel。
-3. ✅ **端到端 flash_attn 工作**：SC6 sglang 跑通 48 tok/s（未崩 `to bc failed`）→ 端到端 attention 正常。FA2 在线并发（不等长多请求）直接端到端验证可后续（SC5 多用户 overnight 8.22× 间接佐证多请求并发能跑）。
+3. ✅ **端到端 flash_attn 工作**：SC6 sglang 跑通 48 tok/s（未崩 `to bc failed`）→ 端到端 attention 正常。FA2 在线并发（不等长多请求）直接端到端验证可后续（SC5 多用户 overnight 8.22× 间接佐证多请求并发能跑）。⚠️ 注：此处的 "SC5 8.22×" 是 APC-off(MRV2) 下的数字，已被 r009 推翻——MRV1+CG+APC 下 SC5 反为 vLLM 1.5× 快；该 8.22× 仅作为"多请求并发能跑"的功能佐证（FA2 不崩），不作性能优势论据。见 memory `dlin-sglang-vllm-compare-r009-mrv1-apc-overturns`。
 
 > ⚠️ 修改 attention 相关代码，动手前读 `.claude/skills/speculative-naming`（如涉及 spec）/ `sglang-modify`（DL 标记约定）。
 
@@ -86,7 +86,7 @@ gather 回退（`:187`）更严重：`_cu_q = arange(0, batch+1) * _seqq`（均�
 ### 现状（纠正 piecewise CG）
 - decode gap 剩余 ~6.2ms/token = **100% scheduler↔tokenizer ZMQ IPC**（`ipc_channels.py:34-66`，scheduler↔tokenizer 双进程）
 - **IPC 与 CG 完全正交**（ZMQ 是进程间 Unix socket；CG 在 scheduler 进程 GPU stream 内）→ **piecewise CG 不可能消解这 6.2ms**。周报 §10 把 piecewise CG 列为 decode 杠杆是**错的**。
-- DLIN ��� `cudaGraphLaunch` 是**同步阻塞 ~22ms**（不像 NVIDIA 异步）→ decode 一步 = CPU 串行等 GPU launch + ZMQ + load_batch + sampling + ZMQ send
+- DLIN 的 \`cudaGraphLaunch` 是**同步阻塞 ~22ms**（不像 NVIDIA 异步）→ decode 一步 = CPU 串行等 GPU launch + ZMQ + load_batch + sampling + ZMQ send
 
 ### 第一杠杆：async-replay（已有代码）
 `full_cuda_graph_backend.py:216-261`（`SGLANG_DL_ASYNC_REPLAY=1`）把同步 `cudaGraphLaunch` 丢到 daemon 线程，让 scheduler 主线程的 ZMQ recv / load_batch / sampling / ZMQ send 与 GPU 并行。这是把 decode 从"CPU+GPU 串行 ~27ms"拉到"GPU-bound ~22ms"的手段。

@@ -11,7 +11,7 @@
 
 - **结论**：在 DLIN 上跑 Qwen3.6-35B-A3B-FP8（hybrid Mamba），sglang **全面反超 vLLM MRV1+CG+APC**：prefill-heavy / 前缀复用场景 **1.01–1.45×**（9 项赢 6）、并发 serving **1.2–1.6×**、纯 decode **+5.7%**（5-rep 分布不重叠）。
 - **核心杠杆**：一个配置开关 `SGLANG_DL_GDN_DLIN_EXTEND=1` —— 把 GDN（hybrid Mamba 的门控线性注意力）的 prefill 路径从慢的 triton chunk kernel 切到 DLIN `dl_chunk` kernel，**2K prefill 41s→5.1s（8×）且更正确**。这个开关之前默认关着，正是 r009“sglang 全输”的根因。
-- **关键教训**：性能对比**极易测错**。本报告���了 5 个坑（EOS 早停、缓存命中、预热不足、机器争用、triton-cache 污染），每个都曾给出错误结论。**正确的测量方法**：`ignore_eos=True` + 干净卡 + 充分预热 + 多 rep 取分布 + 每次跑前复位。
+- **关键教训**：性能对比**极易测错**。本报告指出了 5 个坑（EOS 早停、缓存命中、预热不足、机器争用、triton-cache 污染），每个都曾给出错误结论。**正确的测量方法**：`ignore_eos=True` + 干净卡 + 充分预热 + 多 rep 取分布 + 每次跑前复位。
 
 ---
 

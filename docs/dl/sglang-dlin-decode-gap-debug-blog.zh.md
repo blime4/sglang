@@ -89,7 +89,7 @@ ValueError: pool memory leak detected! [full] total=568208, available=568000, ev
 - 实测记账：`allocated = committed + output_len`（即输出 token 被有效计了两次），印证了投机分配与回收的不匹配。
 
 ### 为什么本次未修 → 已弃用（实测：multi-step 不是加速手段）
-插桩并实测（两个泄漏检查都改为非致命以便跑完）：**multi-step 输出是正确的**（有效 JSON，与 CG 一��），但 **multi-step 慢约 4×，不是更快**——8.6 tok/s vs 基线 33.7。DL multi-step 循环里的 `.item()` D2H 同步（`tp_worker.py:626-628`，每步 3 次）加上投机分配/泄漏簿记占主导，淹没了任何 scheduler 往返的节省。**之前对 `SGLANG_DL_MULTI_STEP` "~2 ms/token" 的说法在 DLIN 上不成立**——得不偿失。⇒ **P0a″ 已弃用。** 其 KV 泄漏（真实的，边界对齐：`output % _dl_n == 0 → allocated` 翻倍）已无意义，因为 multi-step 反正更慢。修这个泄漏只会让一条慢路径稍微不那么漏。真正的杠杆是 **P0a′（在*正常*解码路径里减少同步点/IPC）**。
+插桩并实测（两个泄漏检查都改为非致命以便跑完）：**multi-step 输出是正确的**（有效 JSON，与 CG 一样），但 **multi-step 慢约 4×，不是更快**——8.6 tok/s vs 基线 33.7。DL multi-step 循环里的 `.item()` D2H 同步（`tp_worker.py:626-628`，每步 3 次）加上投机分配/泄漏簿记占主导，淹没了任何 scheduler 往返的节省。**之前对 `SGLANG_DL_MULTI_STEP` "~2 ms/token" 的说法在 DLIN 上不成立**——得不偿失。⇒ **P0a″ 已弃用。** 其 KV 泄漏（真实的，边界对齐：`output % _dl_n == 0 → allocated` 翻倍）已无意义，因为 multi-step 反正更慢。修这个泄漏只会让一条慢路径稍微不那么漏。真正的杠杆是 **P0a′（在*正常*解码路径里减少同步点/IPC）**。
 
 ---
 

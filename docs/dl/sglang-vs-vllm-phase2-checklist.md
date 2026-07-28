@@ -47,7 +47,7 @@
 
 ## C 赛道（Compile 侧，让 GPU forward <20ms，多日）
 
-> 目标��torch.compile 给 sglang 加 norm_quant/act_quant 融合 → GPU forward ~18ms → 打败 vLLM。
+> 目标：torch.compile 给 sglang 加 norm_quant/act_quant 融合 → GPU forward ~18ms → 打败 vLLM。
 > 现状：compile 跑通但 decode 82ms（CG 抓的是编译后的 model.forward，inductor 没融合时通用 kernel 比 DLIN eager 慢）。
 > decode 即使开 compile 也走 `full_cuda_graph_backend`（不是 tc_piecewise，decode_cuda_graph_runner.py:22 确认）。
 

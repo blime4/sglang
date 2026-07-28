@@ -18,7 +18,7 @@ sglang TP4 decode TPOT 显著慢于 vLLM：
 | Wall TPOT (含 host 开销) | 33.5ms | 26.1ms | 7.4ms |
 | Host 开销 | ~6ms | ~7.8ms | ~相等 |
 
-**关键发现**: 两边 host 开销基本相等，gap **全部在 GPU ��算**。
+**关键发现**: 两边 host 开销基本相等，gap **全部在 GPU 计算**。
 
 ---
 
@@ -117,7 +117,7 @@ sglang TP4 decode TPOT 显著慢于 vLLM：
 | 3 | page_size=64 | config | 27.2ms ≈ baseline | 无改善 |
 | 4 | NO_ALT_STREAM (去 dual-stream) | config | 27.5ms | 无变化 |
 | 5 | DELAY_SAMPLE=1 | config | 33.5ms wall | 仅省 wall host（不省 GPU） |
-| 6 | shared_expert 融合 (FUSE_SHARED) | 代码 | **28.3ms 更慢** | 第9 expert ���销 > 分离 shared 节省 |
+| 6 | shared_expert 融合 (FUSE_SHARED) | 代码 | **28.3ms 更慢** | 第9 expert 开销 > 分离 shared 节省 |
 | 7 | GEMMEX=3 (per-expert dlblas GEMM) | 代码 | 37.4ms 更慢 | per-expert loop 开销大 |
 | 8 | silu_and_mul (sglang jit_kernel triton) | 代码 | **崩溃** | DLEOL JIT: Device page fault |
 | 9 | silu_and_mul (vLLM `_C` C++) | 代码 | **崩溃** | DLEOL JIT: K%VEC_K assert（加载_C 破坏 JIT state） |
@@ -185,7 +185,7 @@ DLEOL JIT bug 阻止了所有可能减小 gap 的优化：
 
 | 优化 | 需要 | 阻塞 |
 |---|---|---|
-| 跳过 MoE align | use_moe_cu（新 JIT key�� | Device page fault |
+| 跳过 MoE align | use_moe_cu（新 JIT key） | Device page fault |
 | 融合 silu+mul | 新 triton kernel / _C 加载 | Device page fault / K%VEC_K |
 | 改 w2 mul_routed_weight | JIT key 变化 | K%VEC_K |
 | fused_experts_impl | 新 config/cache JIT key | K%VEC_K |
@@ -242,7 +242,7 @@ vLLM 在相同硬件、相同 op、相同权重下达到 18.3ms（比 sglang 快
 ### 9.1 短期（需 DLIN SDK 团队配合）
 
 1. **修复 DLEOL JIT `K%VEC_K` assert**: JIT auto-tuning 应在 VEC_K 不整除 K 时回退到更小的 VEC_K，而非 assert 失败。
-2. **修复 DLEOL JIT Device page fault**: 调查为何 `torch.distributed` 初始化后新 triton kernel 变体会越界访问���
+2. **修复 DLEOL JIT Device page fault**: 调查为何 `torch.distributed` 初始化后新 triton kernel 变体会越界访问。
 3. **提供 `use_moe_cu` 的稳定支持**: 确保 `invoke_fused_moe_opt` 在所有调用上下文中正确处理 trivial sorted_token_ids。
 
 ### 9.2 中期（sglang 代码层面，待 DLEOL JIT 修复后）

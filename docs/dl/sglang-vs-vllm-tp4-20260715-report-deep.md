@@ -256,7 +256,7 @@ profile 实测 32 步：`aten::copy_` 673 次、`aten::to` 678 次、`aten::_to_
   1. **路径 A**：恢复一次**异步** `copy_to_cpu`（`non_blocking=True` + event），让 `.tolist()` 在"下一步处理"时再 sync——把 sync 藏到 overlap 的下一轮，与 forward 重叠（vLLM 思路）。
   2. **路径 B**：bs=1 单请求时，finish 判定可以延后（多攒几个 token 再判 EOS），把 N 步合并成 1 次 sync（multi-step 已经在做，no.14 会深化）。
 - 预期收益：**0.3~0.8ms/步**（消除每步的同步停顿，让 GPU 真正连续）。
-- 风险：路径 A 要保证 overlap 下 token 生命期正确（别被下一步 `stash` 覆盖）；路径 B 会延迟 EOS 检�� 1~2 token，通常可接受。
+- 风险：路径 A 要保证 overlap 下 token 生命期正确（别被下一步 `stash` 覆盖）；路径 B 会延迟 EOS 检测 1~2 token，通常可接受。
 
 ---
 

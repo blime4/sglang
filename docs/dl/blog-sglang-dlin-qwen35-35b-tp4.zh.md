@@ -46,7 +46,7 @@ DLIN GPU 是一类国产 GPGPU。它在**编程模型层面兼容 CUDA,但运行
 
 整体架构见**图 1**:每一个模块都必须映射到一个既存在、又足够快的 DLIN 算子。
 
-![图 1 — Qwen3.5-35B-A3B-FP8 混合��构](figures/fig1-architecture.zh.svg)
+![图 1 — Qwen3.5-35B-A3B-FP8 混合架构](figures/fig1-architecture.zh.svg)
 
 *图 1. 40 层混合堆栈。两种注意力(10 层全注意力、30 层 GatedDeltaNet 线性注意力)都汇入一个共享的 FP8 MoE 模块。每个模块都需要对应的 DLIN 算子存在且足够快。*
 
@@ -388,7 +388,7 @@ python -m sglang.launch_server \
 
 ---
 
-## 11. 路���图
+## 11. 路线图
 
 - **`torch.compile` 第二阶段:**接通 compile↔CG、移植 `norm_quant`/`act_quant` 融合 pass、补齐残余 graph break——目标 GPU forward 约 18 ms,TPOT 23–24 ms。
 - **投机解码质量:**NGRAM/MTP 的 verify 路径在本混合架构上仍有 prompt-复述回归,这会卡住任何投机解码的吞吐论断。
