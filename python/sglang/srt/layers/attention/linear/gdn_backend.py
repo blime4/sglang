@@ -77,14 +77,16 @@ class GDNKernelDispatcher:
         # Opt-in via SGLANG_DL_GDN_DLIN=1 on DLIN. decode=dl_recurrent_gated_delta_rule,
         # extend=dl_chunk_gated_delta_rule (replaces sglang triton chunk which uses a
         # custom initial_state_indices path that diverges from vLLM → wrong first token).
-        # verify stays on triton. SGLANG_DL_GDN_DLIN_EXTEND=0 to keep extend on triton.
+        # verify stays on triton. EXTEND defaults to "1" (dl_chunk) since 2026-07-28:
+        # 8x faster prefill + correct output + sglang beats vLLM. Set EXTEND=0 to
+        # fall back to triton for debugging/rollback.
         import os as _os
         from sglang.srt.utils.common import is_dlin as _is_dlin
         if _is_dlin() and _os.environ.get("SGLANG_DL_GDN_DLIN") == "1":
             from sglang.srt.layers.attention.linear.kernels.gdn_dlin import DLinGDNKernel
 
             self.decode_kernel = DLinGDNKernel()
-            _dl_extend = _os.environ.get("SGLANG_DL_GDN_DLIN_EXTEND", "0") == "1"
+            _dl_extend = _os.environ.get("SGLANG_DL_GDN_DLIN_EXTEND", "1") == "1"
             self.extend_kernel = DLinGDNKernel() if _dl_extend else triton_kernel
             self.verify_kernel = triton_kernel
             self.supports_packed_decode = False
