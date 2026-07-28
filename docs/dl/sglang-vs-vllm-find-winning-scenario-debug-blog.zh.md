@@ -156,6 +156,14 @@ sglang（`SGLANG_DL_GDN_DLIN_EXTEND=1`，好 cache）vs vLLM MRV1+CG+APC，同 4
 **为什么 sglang 高并发赢**：(1) RadixAttention 把共享前缀缓存成基数树，N 个客户端复用，只 prefill 极短 unique suffix；(2) flag 让 suffix prefill 也快；(3) sglang decode CG bs≤32 + continuous batching 在高并发下扩展更好（conc 1→32：sglang 30→141 即 4.6×；vLLM 32→88 即 2.8×）。
 **边界**：前缀高度共享时 sglang 赢；若每个请求前缀都不同（无复用），vLLM 的绝对 prefill 更快（sglang 稳态 399 vs vLLM ~1457 tok/s）会反超。复现：`scripts/dl/exp_b_serving_client.py` + `scripts/dl/dl_safe_reset.sh`（每次跑前复位，避免 cache 污染崩）。
 
+### 公平性审计（回应“vLLM 多并发不该这么弱”）
+
+怀疑过两点，都排除了：
+1. **vLLM APC 是不是没生效？** 跑了 APC-ON vs `--no-enable-prefix-caching`：conc32 = 87.6(APC on) vs 56.2(off)，**APC 确实在缓存、帮了 +56%**。所以 vLLM 是在它的最佳配置（APC on），不是配错。
+2. **Python 线程 client 是不是没真正并发？** 换了真 async（aiohttp，`asyncio.gather` 同时发 + 连接池）：conc32 = 56.8(async) vs 56.2(thread)，**完全一致** → client 不是瓶颈，vLLM 确实就是这么慢。
+
+**那 vLLM 为什么并发弱？**（未完全证明，最可能机制）：APC 在 hybrid-Mamba 上只能缓存 attention 的 KV，**缓存不了 Mamba 的 recurrent state**（Mamba 是状态递推的，不能像 attention KV 那样按块复用）→ 每个请求仍要重算 Mamba state。所以 APC 帮了 +56%（attention KV 部分）但没全帮上。sglang 的 RadixAttention 原生支持 hybrid-Mamba 的完整状态复用 → 高并发下大幅领先。这是 hybrid-Mamba 架构（Qwen3.5/3.6、Jamba、Zamba）上 sglang 的**结构性优势**，不是 vLLM 配错。vLLM 的 Mamba-align（强制 `max_num_batched_tokens=528`）也是 APC-on 的硬约束，无法绕开。
+
 ---
 
 ## 6. decode 其实是 vLLM 赢（更正：之前 “+5% sglang” 是假象）
