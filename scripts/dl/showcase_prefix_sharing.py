@@ -22,11 +22,11 @@ os.environ.setdefault("SGLANG_DL_FP8_Q2", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED", "1")
 os.environ.setdefault("SGLANG_DL_MOE_FUSED_MAX_M", "2048")
 os.environ.setdefault("SGLANG_DL_GDN_DLIN", "1")
-# DL: GDN prefill(extend) fix is OPT-IN (not default). SGLANG_DL_GDN_DLIN_EXTEND=1 routes
-# extend to DLIN dl_chunk (8x faster, 2K 41s->5.1s, correct) BUT dl_chunk is UNSTABLE on
-# TP4 (NCCL desync / hung scheduler on some runs). Set this env manually to try; re-verify
-# clean before enabling. See gdn_backend.py:76-93 + blog sglang-vs-vllm-find-winning-scenario.
-# os.environ.setdefault("SGLANG_DL_GDN_DLIN_EXTEND", "1")  # OPT-IN (crashes full compare)
+# DL: route GDN prefill(extend) to DLIN dl_chunk (8x faster, 2K 41s->5.1s, correct; sglang
+# then beats vLLM on prefill-heavy scenarios). GOTCHA: a crashed run can corrupt the dl_chunk
+# triton cache (~/.triton/cache) -> all later runs crash. Restore: rm -rf ~/.triton/cache &&
+# cp -a ~/.triton/cache.good_backup ~/.triton/cache. gdn_backend.py:76-93. 2026-07-28.
+os.environ.setdefault("SGLANG_DL_GDN_DLIN_EXTEND", "1")
 os.environ.setdefault("SGLANG_DL_MULTI_STEP", "1")
 os.environ.setdefault("DLEOL_CACHE_SIZE", "1024")
 os.environ.setdefault("DLEOL_FLA_ENABLE_PINGPONG", "1")

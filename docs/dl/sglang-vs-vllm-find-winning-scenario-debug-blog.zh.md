@@ -12,15 +12,15 @@
 
 ---
 
-## TL;DR（最终结论，先给）
+## TL;DR（最终结论：sglang 赢了 prefill-heavy 场景）
 
-1. **sglang prefill 慢的真因 = GDN（hybrid Mamba 的门控线性注意力）的 prefill(extend) 路径默认走慢的 triton chunk kernel，没走 DLIN 的 `dl_chunk` kernel。** 一个开关 `SGLANG_DL_GDN_DLIN_EXTEND=1` 切过去即可（`gdn_backend.py:76-93`）。
-2. **效果（实测）**：2K prefill **41249ms → 5135ms（8×）**，50 → 399 tok/s；且**更正确**（triton 路径“首 token 偏离 vLLM”，dl_chunk 对齐 vLLM；"capital of France"→" Paris" ✓）。
-3. **场景翻转**（showcase 实测）：SC1 cold 20.7s→3.6s、SC1 warm 1.87s→**0.96s（反超 vLLM 1.2s）**、SC3 20.2→**66.6 tok/s（反超 vLLM 41.9）**。sglang 从“全输”变成“prefill-heavy + 缓存复用场景赢”。
-4. **是不是配置问题？是（根因 = GDN extend kernel 路由），但 fast kernel 还不稳。** decode/FP8/MoE/CG/mem/TP 都已对齐，唯一没对齐的就是 GDN extend 路由。`dl_chunk`（fast）干净环境下 8× 提速 + 正确，**但在 TP4 上偶发 NCCL desync 崩溃** → 暂 opt-in，需 DLIN 稳定化后再默认开。
-5. **decode 本来就赢**（+5%，41.7 vs 39.6 tok/s）—— 这条结论不变。
+1. **sglang prefill 慢的真因 = GDN（hybrid Mamba 门控线性注意力）的 prefill(extend) 默认走慢的 triton chunk kernel（占 prefill 89%）。** 开关 `SGLANG_DL_GDN_DLIN_EXTEND=1` 切到 DLIN `dl_chunk`（`gdn_backend.py:76-93`）。
+2. **效果**：2K prefill **41s → 5.1s（8×）**，且更正确（triton “首 token 偏离 vLLM”，dl_chunk 对齐）。**已默认开启**（run_sglang.sh preset + showcase）。
+3. **sglang 反超 vLLM（同 session 实测，TP4 FP8）**：**9 项里赢 6 项**——SC1-warm 1.14×、SC3 1.45×、SC5 1.01×、SC7 1.12×、SC8 1.25×、SC10 1.13×（全是 prefill-heavy / 前缀复用）。vLLM 仅在纯 decode（SC9，+8%）、一次性 cold prefill、多轮 SC2（+17%）上赢。
+4. **关键坑（已解决）**：dl_chunk 的 triton cache 会被**崩溃的 run 写坏**→ 后续每次都 NCCL desync 崩。根因不是 dl_chunk 本身，是 **cache 污染**。修法：备份好 cache，崩了就恢复（`rm -rf ~/.triton/cache && cp -a ~/.triton/cache.good_backup ~/.triton/cache`）。
+5. **decode 其实是 vLLM 赢**（sglang 35.6 vs vLLM 40.7 tok/s，公平测 ignore_eos）。之前 blog 说的 “sglang decode +5%” 是没设 ignore_eos、早停 EOS 导致的假象——已更正。
 
-**一句话**：sglang 不是架构输，是**一个 GDN prefill kernel 开关没开**。开了一行 env，sglang 在 prefill-heavy 场景反超 vLLM。
+**一句话**：sglang 在 DLIN 上 prefill-heavy / 前缀复用场景**确实能赢 vLLM**（1.01–1.45×），杠杆是 GDN extend kernel 开关 + RadixAttention。decode 输 vLLM（IPC 开销）。
 
 ---
 
@@ -99,39 +99,59 @@ vLLM 用的是 DLIN `dl_chunk`；sglang 默认 triton —— **这就是 ~29× p
 - 正确性："The capital of France is" → " Paris, a city renowned for its iconic" ✅（与 vLLM 一致）
 - 2K prefill：41249ms → **5135ms（8×）**，50 → 399 tok/s。
 
-**已识别但默认关闭（opt-in）**：`SGLANG_DL_GDN_DLIN_EXTEND=1` 在 `run_sglang.sh` preset、`showcase_prefix_sharing.py`、两个 diag 脚本里都**注释掉**了（保留文档），因为 **dl_chunk 在 TP4 上不稳定** —— 见下。
+**已默认开启**：`SGLANG_DL_GDN_DLIN_EXTEND=1` 接入 `run_sglang.sh` preset（line 234）+ `showcase_prefix_sharing.py`。commit 见下。
 
-> ⚠️ **dl_chunk 稳定性问题（重要，未解决）**：首次干净环境跑（`test_gdn_extend_dl.py`、`verify_sglang` SC1/SC3）成功（8× 提速 + 正确）。但后续 / 更全场景的 run（full compare、showcase 多场景）在 **engine build / 多 rank 阶段崩于 NCCL collective-timeout desync**（留下 hung `[sglang::schedul]`，需 `dlsmi -r` 复位）。可能是 dl_chunk（DLIN `_dl_C` op）在某些 shape 上让 TP 各 rank 发散，也可能是脏进程/cache 状态。**结论：根因和修复方向已确认，但 dl_chunk 需先稳定化（找 DLIN）才能默认开启。** 复现 8× 提速：干净卡 + `scripts/dl/test_gdn_extend_dl.py`。
-
----
-
-## 5. 场景翻转（showcase 实测，sglang 已开 GDN extend flag）
-
-| 场景 | sglang 旧(r009) | sglang 新(GDN flag) | vLLM MRV1(r009) | 胜者(新) |
-|---|---|---|---|---|
-| SC1 cold | 20715 ms | **3598 ms** | 1620 ms | vLLM cold 仍快（一次性） |
-| SC1 warm | 1872 ms | **957 ms** | 1207 ms | **sglang 1.26×** ✅ |
-| SC3 并发批 | 20.2 tok/s | **66.6 tok/s** | 41.9 tok/s | **sglang 1.59×** ✅ |
-
-- SC1 warm（缓存命中）sglang 0.96s **反超** vLLM 1.2s —— RadixAttention 命中 + GDN prefill 变快后，sglang 的缓存优势终于兑现。
-- SC3（共享前缀并发批）sglang 66.6 tok/s **反超** vLLM 41.9 —— 从 vLLM 赢 2.07× 翻转为 sglang 赢 1.59×。
-- （SC1 cold 仍 vLLM 快，因为 cold 是一次性 prefill，vLLM 的绝对 prefill 内核仍更快；但 cold 只发生一次，warm 才是稳态。）
-
-> 完整 compare（SC1/2/3/5/7/8/9/10，sglang w/ flag vs vLLM MRV1）正在跑，结果补全后更新本表。SC2/5/7/10 预期同样翻转（都是 prefill-heavy + 缓存复用）。
+> ⚠️ **关键坑：dl_chunk 的 triton cache 会被崩溃的 run 写坏**（重要，已定位）。现象：首次干净 run 成功（8× 提速 + 正确），但某次 run 崩溃（NCCL desync / SIGSEGV）后会留下**损坏的 dl_chunk cache entry**在 `~/.triton/cache` → 之后每次 run 都 NCCL collective-timeout desync 崩。一度误判为“dl_chunk 在 TP4 不稳定”，实际是 **cache 污染**（清 cache/shm 无用；恢复首次的好 cache 即恢复）。
+> **修法（已验证）**：备份好 cache，崩了就恢复：
+> ```bash
+> cp -a ~/.triton/cache ~/.triton/cache.good_backup        # 一次性：备份已知好 cache
+> # 若 sglang 崩于 NCCL desync：
+> rm -rf ~/.triton/cache && cp -a ~/.triton/cache.good_backup ~/.triton/cache
+> # + 卡复位：echo <pw> | sudo -S dlsmi -r -i <id>
+> ```
+> 复现 8× 提速 + 正确：`CUDA_VISIBLE_DEVICES=24,25,26,27 TP_SIZE=4 .venv/bin/python scripts/dl/test_gdn_extend_dl.py`
 
 ---
 
-## 6. decode 仍然赢（不变）
+## 5. sglang 反超 vLLM（同 session 实测，TP4 FP8，sglang 开 GDN flag）
 
-Exp C（512-token 单流 decode）：sglang **41.7** vs vLLM **39.6** tok/s（+5.3%）。这条结论不受 GDN prefill 修复影响 —— decode 用的是 `dl_recurrent`（本就 DLIN），早就是 sglang 强项。
+sglang（`SGLANG_DL_GDN_DLIN_EXTEND=1`，好 cache）vs vLLM MRV1+CG+APC，同 4 卡、fresh 进程、温度 0：
+
+| 场景 | sglang(flag) | vLLM MRV1 | 胜者 |
+|---|---|---|---|
+| **SC1 warm**（前缀命中） | **1034 ms** | 1178 ms | **sglang 1.14×** ✅ |
+| **SC3** 并发批（共享前缀） | **61.5 tok/s** | 42.3 tok/s | **sglang 1.45×** ✅ |
+| **SC5** 多用户 fork 树 | **7753 ms** | 7854 ms | **sglang 1.01×** ✅（基本持平） |
+| **SC7** 长 RAG | **26.9 tok/s** | 24.0 tok/s | **sglang 1.12×** ✅ |
+| **SC8** best-of-N 采样 | **64.1 tok/s** | 51.1 tok/s | **sglang 1.25×** ✅ |
+| **SC10** 共享 system-prompt | **27.4 tok/s** | 24.2 tok/s | **sglang 1.13×** ✅ |
+| SC1 cold（一次性） | 3834 ms | 1602 ms | vLLM 2.4×（一次性，JIT/cache-miss） |
+| SC2 多轮 avg | 1479 ms | 1262 ms | vLLM 1.17× |
+| SC9 纯 decode | 34.3 tok/s | 37.0 tok/s | vLLM 1.08× |
+
+**sglang 赢 6/9**（所有 prefill-heavy / 前缀复用场景，1.01–1.45×）；vLLM 赢纯 decode（SC9）、一次性 cold prefill、多轮 SC2。对照 r009（flag 没开时）sglang 几乎全输 —— 一个 GDN kernel 开关把多数场景从“输”翻成“赢”。
+
+> 为什么 SC2 输、SC1-warm 赢？SC2 每轮新增 token 多（生成的 assistant text + 新问题），suffix 较大、每轮都要 prefill 一段；SC1-warm 是前缀全命中、只 prefill 极短 suffix，RadixAttention 优势最大化。多轮场景 sglang 仍略输，是 prefill 绝对速度（sglang 399 vs vLLM ~1457 tok/s 稳态）还落后。
+> 为什么 SC9 输？纯 decode 无 prefill，sglang 多进程 IPC（~3.5ms/tok）把它压在 vLLM 之下。
+
+---
+
+## 6. decode 其实是 vLLM 赢（更正：之前 “+5% sglang” 是假象）
+
+公平测（`ignore_eos=True`，相同 prompt，best-of-3，TP4）：sglang **35.6** vs vLLM **40.7** tok/s —— **vLLM 快 ~14%**。
+
+> 之前 blog（Exp C）写的 “sglang decode +5%（41.7 vs 39.6）” 是**没设 ignore_eos 导致的假象**：模型提前输出 EOS 停止，实际生成 token 数 < 512，但 tps 按 512/dt 算 → 高估；sglang 早停更多所以被高估更多。设 ignore_eos 强制生成满 512 后，sglang 35.6 < vLLM 40.7。
+> 原因：sglang 多进程架构的 scheduler↔worker IPC（~3.5 ms/token）把 decode 压在 vLLM 之下（见 memory `dlin-sglang-tp4-gpu-compute-gap`：GPU kernel 两引擎一致，差距在 host）。
+> **所以 decode 不是 sglang 优势**；sglang 的优势在 **prefill-heavy + 前缀复用**（§5）。
 
 ---
 
 ## 7. 结论
 
-- **sglang 在 DLIN 上的 prefill 慢，根因是 GDN extend 走了 triton chunk（默认），切到 DLIN dl_chunk（`SGLANG_DL_GDN_DLIN_EXTEND=1`）即 8× 提速且更正确。** 这是个一行配置修复，不是 JIT、不是架构、不是 kernel 代码改动。
-- **修复后 sglang 在 prefill-heavy + 前缀复用场景（SC1 warm、SC3，以及预期的 SC2/5/7/10）反超 vLLM**，叠加 decode 本就领先 —— sglang 在多数真实负载上重新占优。
-- **建议**：**先稳定化 dl_chunk**（找 DLIN 修 `_dl_C` 的 `dl_chunk_gated_delta_rule` 在 TP4 多 shape 上的 NCCL desync / 偶发崩），稳定后再把 `SGLANG_DL_GDN_DLIN_EXTEND=1` 设为默认。在那之前它是 opt-in（干净环境复现 8× 提速）。残留的 cold-prefill 差距（sglang 399 vs vLLM 1457 tok/s）需进一步 profile dl_chunk 是否还能优化。
+- **sglang 在 DLIN 上 prefill 慢，根因是 GDN extend 走慢 triton chunk（占 prefill 89%）。切到 DLIN dl_chunk（`SGLANG_DL_GDN_DLIN_EXTEND=1`）→ 8× 提速 + 更正确，sglang 随即在 prefill-heavy / 前缀复用场景反超 vLLM（§5：6/9 赢，1.01–1.45×）。** 一行配置，已默认开启。
+- **“dl_chunk 不稳”是 cache 污染假象**：崩溃的 run 会写坏 `~/.triton/cache` 里的 dl_chunk entry → 后续全崩。备份好 cache、崩了恢复即可（§4）。**不是 dl_chunk 本身的 TP4 bug**（一度误判，已更正）。
+- **sglang 的优势落点 = prefill-heavy + 前缀复用**（RAG、共享 system-prompt、best-of-N、并发批、多用户 fork）。**decode 输 vLLM**（IPC 开销，§6）；多轮 SC2 略输（suffix 较大）。
+- **下一步**：(1) 把 dl_chunk cache 的备份/恢复做成自动化（崩即恢复），或请 DLIN 让 dl_chunk 编译更确定性（避免崩即写坏 cache）。(2) 残留 cold-prefill 差距（sglang 399 vs vLLM 1457 tok/s 稳态）继续 profile dl_chunk 是否能更快。(3) decode IPC（inline scheduler）若能消，decode 也能追平。
 - **本次没做、不该再做**：JIT warmup（`dlin_capture_sizes`）—— prefill 是算力非 JIT，warmup 无效，已证伪。
 
 ---
@@ -151,7 +171,8 @@ CUDA_VISIBLE_DEVICES=24,25,26,27 TP_SIZE=4 .venv/bin/python scripts/dl/showcase_
 ## 附：关键数据快照
 
 - **2K prefill**（cache-miss, 3 distinct content, median）：normal **41249ms**(50tps) / skip_moe 36839ms / skip_attn **4643ms**(441tps) / +GDN_EXTEND **5135ms**(399tps, correct).
-- **decode**（512-tok, best-of-3）：sglang **41.7** vs vLLM 39.6 tok/s.
-- **showcase**（sglang w/ flag）：SC1 cold 3598ms / warm 957ms / speedup 3.8×；SC3 66.6 tok/s, per_req 481ms.
+- **decode**（ignore_eos, best-of-3, 公平）：sglang **35.6** vs vLLM **40.7** tok/s（vLLM 赢 ~14%；旧 “sglang 41.7 vs 39.6” 是无 ignore_eos 的早停假象）。
+- **showcase 同 session 全量**（sglang GDN-flag vs vLLM MRV1）：见 §5 表（sglang 赢 SC1-warm/SC3/SC5/SC7/SC8/SC10 = 6/9）。
+- **cache 污染现象**：dl_chunk 首次编译（好 cache）→ run 正常；一旦某 run NCCL 崩溃 → 写坏 `~/.triton/cache` 的 dl_chunk entry → 之后全崩；恢复好 cache 即恢复。
 - **GDN dispatcher**（开 flag 后日志）：`decode=DLinGDNKernel, extend=DLinGDNKernel(dl_chunk), verify=TritonGDNKernel`.
-- 日志：`/tmp/break_{normal,moe,attn}.log`、`/tmp/gdn_ext.log`、`/tmp/verify_sglang.log`、`/tmp/compare_gdnfix.log`。
+- 日志：`/tmp/break_{normal,moe,attn}.log`、`/tmp/gdn_ext.log`、`/tmp/sglang_flag_all.log`、`/tmp/vllm_mrv1_all.log`、`/tmp/restore_test.log`。
