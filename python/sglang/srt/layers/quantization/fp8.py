@@ -2274,9 +2274,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # avoids a captured CUDA kernel in CG).
                 _ti = topk_ids if (topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()) else topk_ids.to(torch.int32).contiguous()
                 _tw = topk_weights if (topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()) else topk_weights.to(torch.float32).contiguous()
+                # DL: GEMMEX=4 — V4 FP4 per-expert via gptq_dlblas_gemmex(quant_type=0,
+                # bit=4), matching vLLM mxfp4_dlblas. Before the mabs call (per-expert
+                # uses topk_ids, not mabs dispatch).
+                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "4" and M == 1:
+                    _ensure_dl_C()
+                    _ti1d = _ti.reshape(-1)
+                    _w13_g = layer.w13_weight[_ti1d]
+                    _s13_g = layer._dl_w13s[_ti1d]
+                    _w2_g = layer.w2_weight[_ti1d]
+                    _s2_g = layer._dl_w2s[_ti1d]
+                    out = torch.zeros(1, hidden, dtype=x.dtype, device=x.device)
+                    for k in range(topk):
+                        _c1 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
+                            x.view(-1, x.shape[-1]), _w13_g[k].t(),
+                            None, _s13_g[k], 0, 4)
+                        _gate, _up = _c1[:, :inter], _c1[:, inter:]
+                        _he = F.silu(_gate) * _up
+                        _c2 = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
+                            _he.view(-1, _he.shape[-1]), _w2_g[k].t(),
+                            None, _s2_g[k], 0, 4)
+                        out += _c2 * _tw[0, k]
+                    return StandardCombineInput(hidden_states=out)
                 # DL: only call moe_align_block_size if a GEMMEX path needs it;
                 # the use_moe_cu fused path (default) uses trivial dispatch tensors.
-                _need_mabs = _os.environ.get("SGLANG_DL_MOE_GEMMEX") is not None or _os.environ.get("SGLANG_DL_MOE_VLLM") == "1"
+                # DL FIX: the sglang moe_align_block_size wrapper is signature-broken
+                # (passes 9 args to an 8-arg op on this v0.5.16 build) -> silently
+                # blocks all GEMMEX/v3 paths. The GEMMEX paths use topk_ids directly
+                # and the use_moe_cu path uses trivial dispatch, so real mabs is NOT
+                # needed here. Force _need_mabs=False to bypass the broken wrapper.
+                _need_mabs = False
                 if _need_mabs:
                     srt, eid, npp = _mabs(_ti, _BM, num_experts)
                 # DL begin — per-expert FP8 GEMM via gptq_dlblas_gemmex (SGLANG_DL_MOE_GEMMEX=1).
