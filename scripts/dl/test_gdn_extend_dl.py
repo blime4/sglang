@@ -19,7 +19,8 @@ def main():
     e = sgl.Engine(model_path=MODEL, tp_size=TP, dtype="bfloat16", context_length=4096,
         mem_fraction_static=0.55, max_running_requests=4, disable_cuda_graph=False,
         cuda_graph_max_bs_decode=4, attention_backend="fa3", page_size=16,
-        disable_custom_all_reduce=True, trust_remote_code=True, chunked_prefill_size=512)
+        disable_custom_all_reduce=True, trust_remote_code=True,
+        chunked_prefill_size=int(os.environ.get("CHUNK_SIZE", "512")))
     sp = {"max_new_tokens": 1, "temperature": 0}
     # correctness
     out = e.generate("The capital of France is", {"max_new_tokens": 8, "temperature": 0})

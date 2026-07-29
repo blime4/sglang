@@ -2131,19 +2131,82 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
                     return StandardCombineInput(hidden_states=out)
                 # DL end (vLLM-exact MoE)
+                # DL begin — v3 fused MoE kernel (SGLANG_DL_MOE_V3=1, M>1 prefill).
+                # invoke_fused_moe_opt_v3 is vLLM's FAST prefill MoE kernel — the non-v3
+                # invoke_fused_moe_opt that sglang's sgl_kernel port ships is 3.7× slower
+                # per-token (MoE was 86% of prefill time, all here). Both kernels live in
+                # vLLM's _dl_C.so (sglang loads it dl19-built). We load_library ONCE to
+                # register v3 (sglang's port only registered the non-v3), then call the
+                # raw v3 op. NO vLLM Python imports (dl_fused_moe pulls _vllm_fa2_C →
+                # double-reg SIGABRT vs sglang's _sgl_fa2_C).
+                if _os.environ.get("SGLANG_DL_MOE_V3") == "1" and M > 1:
+                    if not hasattr(self, "_dl_v3_loaded"):
+                        import vllm as _dl_v3_vllm
+                        _dl_v3_so = _os.path.join(
+                            _os.path.dirname(_dl_v3_vllm.__file__),
+                            "_dl_C.cpython-312-x86_64-linux-gnu.so",
+                        )
+                        torch.ops.load_library(_dl_v3_so)
+                        self._dl_v3_loaded = True
+                    _V3 = torch.ops._dl_C.invoke_fused_moe_opt_v3
+                    _WBITS = 8
+                    _BS = [128, 128]
+                    # DL: BM auto-select by M (microbench-tuned). M=2048→BM=128 matches
+                    # vLLM's 9.16ms; M=512→BM=32. Larger M amortizes a bigger M-tile.
+                    # 4×M=512 (22.4ms) <<<< 1×M=2048 (8.97ms) → prefer big chunks.
+                    _VBM = int(_os.environ.get("SGLANG_DL_MOE_V3_BM",
+                                              "128" if M >= 1024 else "32"))
+                    _VBN = int(_os.environ.get("SGLANG_DL_MOE_V3_BN", "128"))
+                    _VBK = int(_os.environ.get("SGLANG_DL_MOE_V3_BK", "128"))
+                    # DL: vLLM's mabs (NOT sglang's port) — sglang's moe_align_block_size
+                    # produces a dispatch layout the v3 kernel OOB-reads at M>=~100 →
+                    # segfault. vLLM's pairs correctly with invoke_fused_moe_opt_v3.
+                    # This import is engine-safe: its chain loads only flashinfer utils,
+                    # NOT _vllm_fa2_C (the SIGABRT source vs sglang's _sgl_fa2_C).
+                    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+                        moe_align_block_size as _dl_v3_mabs,
+                    )
+                    _vsrt, _veid, _vnpp = _dl_v3_mabs(_ti, _VBM, num_experts, None)
+                    _v3_c13 = torch.empty(M, topk, 2 * inter, dtype=x.dtype, device=x.device)
+                    _V3(x.view(-1, hidden), layer.w13_weight,
+                        _v3_c13.view(-1, topk, 2 * inter), None, layer._dl_w13s, None,
+                        _tw.view(-1, topk), _ti.view(-1, topk),
+                        _vsrt, _veid, _vnpp, False, topk, _VBM, _VBN, _VBK, _WBITS, _BS, M)
+                    _v3_he = _silu_and_mul(_v3_c13.view(-1, 2 * inter)).view(M, topk, inter)
+                    _v3_c2 = torch.empty(M, topk, hidden, dtype=x.dtype, device=x.device)
+                    _V3(_v3_he.reshape(-1, inter), layer.w2_weight,
+                        _v3_c2.view(-1, 1, hidden), None, layer._dl_w2s, None,
+                        _tw.reshape(-1, 1), _ti.reshape(-1, 1).to(torch.int32),
+                        _vsrt, _veid, _vnpp, True, 1, _VBM, _VBN, _VBK, _WBITS, _BS, M)
+                    out = _v3_c2.view(M, topk, hidden).sum(dim=1)
+                    return StandardCombineInput(hidden_states=out)
+                # DL end (v3 MoE)
                 # DL begin — use_moe_cu: trivial dispatch tensors, skip moe_align_block_size
                 # DL: SKIP_MOE for profiling — measures non-MoE GPU time
                 if _os.environ.get("SGLANG_DL_SKIP_MOE") == "1":
                     return StandardCombineInput(hidden_states=torch.zeros_like(x))
                 c13 = torch.empty(M, topk, 2 * inter, dtype=x.dtype, device=x.device)
-                if not hasattr(layer, "_dl_moecu_srt"):
-                    _PAD = 4096
-                    layer._dl_moecu_srt = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
-                    layer._dl_moecu_eid = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
-                    layer._dl_moecu_npp = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
-                _srt = layer._dl_moecu_srt
-                _eid = layer._dl_moecu_eid
-                _npp = layer._dl_moecu_npp
+                # DL begin — use real moe_align_block_size dispatch for large M (matches vLLM).
+                # vLLM uses use_moe_cu (trivial dispatch) only when avg_tokens_per_expert <= 16.
+                # For prefill M=512: avg = 512*8/128 = 32 > 16 → real dispatch is 3.8× faster.
+                # Previously sglang ALWAYS used trivial dispatch → 3.8× slower prefill MoE.
+                _avg_tpe = M * topk / num_experts
+                _dl_use_real_mabs = _avg_tpe > 16
+                if _dl_use_real_mabs:
+                    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+                        moe_align_block_size as _dl_mabs,
+                    )
+                    _srt, _eid, _npp = _dl_mabs(_ti, _BM, num_experts)
+                else:
+                    if not hasattr(layer, "_dl_moecu_srt"):
+                        _PAD = 4096
+                        layer._dl_moecu_srt = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                        layer._dl_moecu_eid = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                        layer._dl_moecu_npp = torch.zeros((_PAD,), dtype=torch.int32, device=x.device)[:1]
+                    _srt = layer._dl_moecu_srt
+                    _eid = layer._dl_moecu_eid
+                    _npp = layer._dl_moecu_npp
+                # DL end
                 _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
                    _tw, _ti,
                    _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
@@ -2153,6 +2216,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
                 _tw_w2 = _tw.reshape(-1, 1)  # [M*topk, 1]
                 c2 = torch.empty(_M2, 1, hidden, dtype=x.dtype, device=x.device)
+                # DL: pass _srt/_eid/_npp from real mabs (or trivial) for w2 too
                 _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
                    _tw_w2, _ti_w2.to(torch.int32),
                    _srt, _eid, _npp, True, 1, _BM, _BN, _BK,

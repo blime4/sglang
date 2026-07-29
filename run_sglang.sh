@@ -225,6 +225,13 @@ pick_model() {
       #                     compare SC3 6.0->20.2 tok/s, SC1/SC2 prefill 2.5-5x faster.
       #   MAX_BF16_M=2048 — bf16-bmm fallback only for M>2048 (shouldn't occur w/ chunk<=2048).
       export SGLANG_DL_MOE_FUSED=1 SGLANG_DL_MOE_FUSED_MAX_M=2048 SGLANG_DL_MOE_MAX_BF16_M=2048
+      # DL: route prefill MoE (M>1) through invoke_fused_moe_opt_v3 (vLLM's fast kernel).
+      # sglang's sgl_kernel port only ships the non-v3 invoke_fused_moe_opt, which is
+      # 3.7x slower per-token. With chunked_prefill_size=2048 (1 chunk for 2K prefill),
+      # v3 at BM=128 matches vLLM's 9.16ms/GEMM: 2K cold-prefill 396->1565 tok/s, now
+      # BEATING vLLM (1457). BM auto-selects by M (fp8.py). Uses vLLM's moe_align_block_size
+      # (sglang's port OOB-reads at M>=~100). 2026-07-29.
+      export SGLANG_DL_MOE_V3=1
       # Matches the tuned TP4 config in scripts/dl/compare_tp4.py (~27ms TPOT = ~vLLM parity):
       # FP8 Q2 GEMM, DLIN GDN op, multi-step decode, FLA pingpong/unroll.
       export SGLANG_DL_FP8_Q2=1 SGLANG_DL_GDN_DLIN=1 SGLANG_DL_MULTI_STEP=1
@@ -1260,6 +1267,7 @@ _print_compare_commands() {
   echo "  SGLANG_DL_FP8_Q2=1"
   echo "  SGLANG_DL_MOE_FUSED=1"
   echo "  SGLANG_DL_MOE_FUSED_MAX_M=2048"
+  echo "  SGLANG_DL_MOE_V3=1            # prefill MoE via vLLM invoke_fused_moe_opt_v3 (3.7x faster; sglang beats vLLM on prefill)"
   echo "  SGLANG_DL_GDN_DLIN=1"
   echo "  SGLANG_DL_GDN_DLIN_EXTEND=1   # GDN prefill on DLIN dl_chunk (8x faster; the win lever)"
   echo "  SGLANG_DL_MULTI_STEP=1"
