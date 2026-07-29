@@ -1,4 +1,4 @@
-# DLIN (DLIN) 算子与 CUDA Graph 优化：vLLM → sglang 差距分析
+# DLIN 算子与 CUDA Graph 优化：vLLM → sglang 差距分析
 
 > 目的：对照 vLLM 的DLIN fork（`/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/vllm`，分支 `dl-main`，263 个 `# DL` 标记 + ~80 个 DL-only 文件），盘点 vLLM 已接入的DLIN算子与 CUDA Graph 优化，并标注 sglang 当前支持情况与接入点，作为后续把DLIN算子接入 sglang 的路线图。
 >

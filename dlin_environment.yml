@@ -1,5 +1,5 @@
 # =============================================================================
-# DLIN (DLIN) environment manifest for sglang
+# DLIN environment manifest for sglang
 # -----------------------------------------------------------------------------
 # Pin record for the sglang commit below. Use this to:
 #   - reproduce the uv venv (exact DLIN wheels + hashes),

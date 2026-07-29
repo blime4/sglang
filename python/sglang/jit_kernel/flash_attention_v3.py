@@ -30,7 +30,7 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
 @cache_once
 def _load_fa3_kernels():
     # DL begin
-    # DLIN (DLIN): use the DLIN Flash Attention (FA2) from the `flash_attn`
+    # DLIN: use the DLIN Flash Attention (FA2) from the `flash_attn`
     # package (Denglin build, pinned in pyproject_dl.toml). Mirrors vLLM's
     # fa_utils `if current_platform.is_dl(): only flash attention 2`.
     # The FA3 backend's call sites pass FA3-only kwargs (num_splits, sinks,

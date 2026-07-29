@@ -1,6 +1,6 @@
 [build-system]
 # DL begin
-# DLIN (DLIN) variant: no Rust grpc ext, no NVIDIA-only binary deps
+# DLIN variant: no Rust grpc ext, no NVIDIA-only binary deps
 # (flashinfer / flash-attn-4 / nvidia-cutlass-dsl / cuda-python are not on the
 # DLIN index). sgl-kernel is built from source (sgl-kernel/) with dlcc and is
 # NOT pinned here so `pip install -e` does not try to pull an NVIDIA wheel.
@@ -75,7 +75,7 @@ runtime_common = [
   "xgrammar==0.2.1",
 ]
 
-# DLIN (DLIN) runtime. torch is the DLIN-patched wheel exposing
+# DLIN runtime. torch is the DLIN-patched wheel exposing
 # torch.version.dl (installed via the dl-virtual index, see run_sglang.sh).
 # triton 3.3.0+dlgpu: DLIN-specific build with dlgpu backend that compiles
 # @triton.jit kernels to dlgput64 format. Installed from sw-triton artifactory

@@ -1,5 +1,5 @@
 # DL begin
-# DLIN (DLIN) build variant for sgl-kernel. Mirrors pyproject_rocm.toml:
+# DLIN build variant for sgl-kernel. Mirrors pyproject_rocm.toml:
 # setuptools backend (NOT scikit-build/CMake — CMake's enable_language(CUDA)
 # can't see dlcc). The actual extension is defined in setup_dl.py (a curated
 # flashinfer/CUTLASS-free source subset compiled with dlcc via torch's

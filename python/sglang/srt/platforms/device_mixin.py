@@ -134,7 +134,7 @@ class DeviceMixin:
 
     # DL begin
     def is_dlin(self) -> bool:
-        """True for Denglin (DLIN/DLIN) GPUs.
+        """True for Denglin (DLIN) GPUs.
 
         DLIN is CUDA-shaped and reuses PlatformEnum.CUDA (so is_cuda() is also
         True); override this to True on DlinSRTPlatform. Code that needs a

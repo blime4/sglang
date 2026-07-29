@@ -2,7 +2,7 @@
 
 **日期**: 2026-07-13
 **模型**: Qwen3.5-35B-A3B-FP8 (256 experts, topk=8, 40 layers: 30 GDN + 10 full-attn)
-**硬件**: DLIN DLIN GPU × 4 (32GB each), TP=4
+**硬件**: DLIN GPU × 4 (32GB each), TP=4
 **配置**: `attention_backend=fa3, page_size=16, disable_custom_all_reduce=True, CG on`
 **环境**: `../sdk/env.sh` (dl19-matching), `DLEOL_CACHE_SIZE=1024`
 

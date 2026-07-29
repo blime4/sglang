@@ -1,11 +1,11 @@
 ---
 name: sglang-modify
-description: Convention for Denglin (DLIN/DLIN) modifications to sglang — how to mark and place DL changes so the DL diff stays greppable and survives upstream syncs. Read before editing sglang source for DLIN. Enforced by scripts/dl/check_dl_markers.py at commit time.
+description: Convention for Denglin (DLIN) modifications to sglang — how to mark and place DL changes so the DL diff stays greppable and survives upstream syncs. Read before editing sglang source for DLIN. Enforced by scripts/dl/check_dl_markers.py at commit time.
 ---
 
 # sglang-modify — DLIN modification convention
 
-**Goal:** every Denglin (DLIN/DLIN) change to sglang must be trivially findable
+**Goal:** every Denglin (DLIN) change to sglang must be trivially findable
 (`grep -rn "# DL"`) and cleanly re-applicable when upstream sglang is updated.
 This mirrors how Denglin's vLLM fork marks its patches (~240 `# DL` markers).
 

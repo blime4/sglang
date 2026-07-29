@@ -1,10 +1,10 @@
 # SGLang 移除 vLLM .so 依赖 — 移植调试实录
 
-> 2026-07-22 ~ 2026-07-23 | DLIN (DLIN) KS38 QUAD | sglang dl-main branch
+> 2026-07-22 ~ 2026-07-23 | DLIN KS38 QUAD | sglang dl-main branch
 
 ## 1. 背景与目标
 
-SGLang 在 DLIN (DLIN) 平台的运行严重依赖 vLLM 的两个 C++ 扩展：
+SGLang 在 DLIN 平台的运行严重依赖 vLLM 的两个 C++ 扩展：
 - **`_dl_C.so`**：21 个 DLIN 专有 CUDA kernel（gemma_rms_norm、gptq_dlblas_gemmex、
   invoke_fused_moe_opt、flash_mla、dl_lora 等），链接 `libdlblas.so` + `libdlblasLt.so` + `libdldnn.so`
 - **`_C.so`**：标准 vLLM kernel（silu_and_mul_quant、dynamic_per_token_scaled_fp8_quant 等）

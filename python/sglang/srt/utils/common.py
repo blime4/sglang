@@ -163,7 +163,7 @@ if not hasattr(torch.version, "dl"):
 
 @lru_cache(maxsize=1)
 def is_dlin() -> bool:
-    """True when running on a Denglin (DLIN/DLIN) GPU.
+    """True when running on a Denglin (DLIN) GPU.
 
     DLIN is CUDA-shaped: device_type is "cuda", torch.cuda.* works, CUDA_VISIBLE_DEVICES
     is honored, and is_cuda() is also True. Use is_dlin() to route hot operators to

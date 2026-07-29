@@ -1,5 +1,5 @@
 # DL begin
-"""DLIN (DLIN) Flash Attention FA2 wrappers.
+"""DLIN Flash Attention FA2 wrappers.
 
 sglang's FlashAttentionBackend is FA3-flavored: its forward calls
 ``flash_attn_varlen_func`` / ``flash_attn_with_kvcache`` with FA3 kwargs

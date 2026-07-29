@@ -1,4 +1,4 @@
-# SGLang × DLIN (DLIN) — High-Performance Operator Integration Plan
+# SGLang × DLIN — High-Performance Operator Integration Plan
 
 Status: **Phase 0 (environment) working**; this document plans the operator
 integration (Phases 1–5). It is the blueprint referenced by `run_sglang.sh`.

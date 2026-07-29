@@ -1,5 +1,5 @@
 # DL begin
-"""Denglin (DLIN/DLIN) GPU platform for SGLang.
+"""Denglin (DLIN) GPU platform for SGLang.
 
 DLIN (e.g. KS38) is CUDA-shaped: device_type is "cuda", ``torch.cuda.*`` works,
 ``CUDA_VISIBLE_DEVICES`` is honored, and the DLIN-patched torch exposes
@@ -62,7 +62,7 @@ _install_triton_gdc_stubs()
 
 
 class DlinSRTPlatform(CudaSRTPlatform):
-    """In-tree platform for Denglin (DLIN/DLIN) GPUs."""
+    """In-tree platform for Denglin (DLIN) GPUs."""
 
     def is_dlin(self) -> bool:
         return True

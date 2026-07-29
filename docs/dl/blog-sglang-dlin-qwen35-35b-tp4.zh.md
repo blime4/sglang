@@ -1,11 +1,11 @@
 ---
 title: "让 SGLang 跑在DLIN GPU 上:运行 Qwen3.5-35B-A3B-FP8,并在 TP4 上对标 vLLM"
 subtitle: "一篇关于把推理框架移植到非 NVIDIA GPU、并为 3 毫秒死磕一周的实战记录"
-authors: "SGLang DLIN(DLIN)适配团队"
+authors: "SGLang DLIN适配团队"
 date: 2026-07-17
 tags: [sglang, dlin, DLIN, 硬件适配, moe, fp8, 线性注意力, 性能]
 model: Qwen3.5-35B-A3B-FP8
-hardware: DLIN DLIN KS38(×4)
+hardware: DLIN KS38(×4)
 baseline: vLLM 0.21.1
 ---
 
@@ -14,19 +14,19 @@ baseline: vLLM 0.21.1
 
 > *一篇关于把推理框架移植到非 NVIDIA GPU、并为 3 毫秒死磕一周的实战记录。*
 
-**作者:**SGLang DLIN(DLIN)适配团队　·　**日期:**2026 年 7 月　·　**模型:**Qwen3.5-35B-A3B-FP8　·　**硬件:**DLIN DLIN KS38(4 卡)　·　**对标:**vLLM 0.21.1
+**作者:**SGLang DLIN适配团队　·　**日期:**2026 年 7 月　·　**模型:**Qwen3.5-35B-A3B-FP8　·　**硬件:**DLIN KS38(4 卡)　·　**对标:**vLLM 0.21.1
 
 ---
 
 ## 摘要
 
-我们将 SGLang 移植到DLIN(DLIN)GPU,使 **Qwen3.5-35B-A3B-FP8** ——一个混合线性注意力 + MoE、采用 blockwise FP8 量化的模型——达到正确、可对外提供服务的运行状态。工作分三个阶段推进:以 vLLM 为参考建立正确性、选择正确的 DLIN MoE kernel 路径以恢复吞吐、以及在 TP4 下对标 vLLM 的 decode 延迟。稳态下 SGLang 达到 **27.3 ms/token**,vLLM 为 **24.0 ms/token**;这 3.3 ms 的差距,我们用直接测量定位到了单一根因:两个引擎运行字节级相同的 GPU 原语,但 vLLM 的 `torch.compile` 应用了 Inductor 的 IR 级算子融合(`fuse_norm_quant`、`fuse_act_quant`),而 SGLang 在 DLIN 上暂时无法使用。我们已落地 compile 集成修复的第一阶段,并报告剩余路径。本文完整记录测量方法,并对过程中修正过的若干论断如实说明。
+我们将 SGLang 移植到DLINGPU,使 **Qwen3.5-35B-A3B-FP8** ——一个混合线性注意力 + MoE、采用 blockwise FP8 量化的模型——达到正确、可对外提供服务的运行状态。工作分三个阶段推进:以 vLLM 为参考建立正确性、选择正确的 DLIN MoE kernel 路径以恢复吞吐、以及在 TP4 下对标 vLLM 的 decode 延迟。稳态下 SGLang 达到 **27.3 ms/token**,vLLM 为 **24.0 ms/token**;这 3.3 ms 的差距,我们用直接测量定位到了单一根因:两个引擎运行字节级相同的 GPU 原语,但 vLLM 的 `torch.compile` 应用了 Inductor 的 IR 级算子融合(`fuse_norm_quant`、`fuse_act_quant`),而 SGLang 在 DLIN 上暂时无法使用。我们已落地 compile 集成修复的第一阶段,并报告剩余路径。本文完整记录测量方法,并对过程中修正过的若干论断如实说明。
 
 ---
 
 ## 1. 背景
 
-### 1.1 DLIN(DLIN)GPU
+### 1.1 DLINGPU
 
 DLIN GPU 是一类国产 GPGPU。它在**编程模型层面兼容 CUDA,但运行时与算子栈完全自研**:没有 cuBLAS、cuDNN、cuBLASLt,也没有预编译好的 FlashAttention 二进制。其软件环境由以下几部分构成:
 

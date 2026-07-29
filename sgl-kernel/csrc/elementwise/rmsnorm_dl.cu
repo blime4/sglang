@@ -1,6 +1,6 @@
 // DL begin
 //
-// Standalone RMSNorm kernels for DLIN (DLIN) — built by setup_dl.py via dlcc.
+// Standalone RMSNorm kernels for DLIN — built by setup_dl.py via dlcc.
 // No FlashInfer / CUTLASS dependency: the upstream sgl_kernel rmsnorm kernels
 // include <flashinfer/norm.cuh>, which dlcc cannot build against yet, so this
 // file provides an equivalent standard RMSNorm + fused(residual_add)_rmsnorm

@@ -2,7 +2,7 @@
 #===============================================================================
 # run_sglang.sh
 #-------------------------------------------------------------------------------
-# One-stop driver for building/running SGLang on DLIN (DLIN) GPUs.
+# One-stop driver for building/running SGLang on DLIN GPUs.
 #
 # Phases (run individually or all at once):
 #   setup        source DLIN SDK, create a uv venv (py3.12), install DLIN torch
@@ -551,7 +551,7 @@ PY
 #-------------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
-run_sglang.sh — build/run SGLang on DLIN (DLIN) GPUs.
+run_sglang.sh — build/run SGLang on DLIN GPUs.
 
 Usage:
   ./run_sglang.sh                       # all phases: setup -> build-kernel -> install -> test
