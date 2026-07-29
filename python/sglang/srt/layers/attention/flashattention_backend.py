@@ -395,7 +395,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.head_dim = model_runner.model_config.head_dim
         self.num_attention_heads = (
             model_runner.model_config.hf_text_config.num_attention_heads
-            // model_runner.tp_size
+            // model_runner.ps.tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
             model_runner.ps.tp_size
