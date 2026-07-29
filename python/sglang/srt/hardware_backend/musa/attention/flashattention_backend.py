@@ -13,7 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.musa.layers.utils.cp_utils import (
     musa_cp_attn_forward_extend as cp_attn_forward_extend,
 )
-from sglang.kernels.ops.attention.flashattention_backend import (
+from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
     FlashAttentionMultiStepBackend,
     merge_state_v2_wrapper,

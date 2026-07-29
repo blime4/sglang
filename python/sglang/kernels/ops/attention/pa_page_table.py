@@ -1,5 +1,5 @@
 """Paged-attention page-table builder, migrated from
-``sglang.kernels.ops.attention.flashattention_backend`` (RFC #29630, Phase 2.5).
+``sglang.srt.layers.attention.flashattention_backend`` (RFC #29630, Phase 2.5).
 """
 
 from typing import Optional

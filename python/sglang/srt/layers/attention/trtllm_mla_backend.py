@@ -30,7 +30,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
-from sglang.kernels.ops.attention.flashinfer_mla_backend import (
+from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
