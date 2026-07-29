@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils.common import is_dlin
 
 if TYPE_CHECKING:
     pass
@@ -120,7 +121,25 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
+        # DL begin: on DLIN build the indexer schedule_metadata via the JIT path
+        # (deep_gemm is absent). The vendored fp8_fp4_paged_mqa_logits DL op needs
+        # this metadata (None/empty -> cuDNN BAD_PARAM). Matches vLLM's
+        # get_paged_mqa_logits_metadata usage.
+        if is_dlin():
+            from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+
+            _c4 = self.c4_seq_lens.to(torch.int32)
+            if _c4.dim() == 1:
+                _c4 = _c4.unsqueeze(-1)
+            _num_sms = torch.cuda.get_device_properties(
+                self.c4_seq_lens.device
+            ).multi_processor_count
+            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                _c4, self.c4_page_size, _num_sms
+            )
+            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            # DL end
+        elif (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()

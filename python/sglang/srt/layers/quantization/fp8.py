@@ -2520,10 +2520,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     _eid = layer._dl_moecu_eid
                     _npp = layer._dl_moecu_npp
                 # DL end
+                # DL: V4 MoE is mxfp4/FP4 (w13 packed as int8). Calling with the FP8
+                # tuple (use_fp8_w8a8=True) interprets FP4-packed bytes as FP8 -> 9000x
+                # residual explosion -> gibberish (the V4 gibberish ROOT CAUSE). Pick the
+                # quant tuple by expert weight dtype (matches the standard path's assertion
+                # at line ~2604: is_fp4_expert == (w13.dtype == int8)).
+                _use_mxfp4 = (
+                    layer.w13_weight.dtype == torch.int8
+                    or _os.environ.get("SGLANG_DL_MOE_FP4") == "1"
+                )
+                _qf = (False, False, False, True) if _use_mxfp4 else (True, False, False, False)
                 _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
                    _tw, _ti,
                    _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
-                   True, False, False, False, [128, 128], M)
+                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
                 he = _silu_and_mul(c13.reshape(-1, 2 * inter)).reshape(M, topk, inter)
                 _M2 = M * topk
                 _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
@@ -2533,7 +2543,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
                    _tw_w2, _ti_w2.to(torch.int32),
                    _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
-                   True, False, False, False, [128, 128], _M2)
+                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
                 out = c2.reshape(M, topk, hidden).sum(dim=1)
                 return StandardCombineInput(hidden_states=out)
                 # DL end (use_moe_cu)

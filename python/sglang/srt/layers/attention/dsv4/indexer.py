@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -32,7 +32,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_dlin, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -73,7 +73,10 @@ def fp8_paged_mqa_logits_torch(
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
-    assert seq_lens.shape == (batch_size,)
+    # DL begin: relax shape assertion for DLIN (seq_lens may carry extra dims)
+    seq_lens = seq_lens.reshape(-1)
+    assert seq_lens.shape[0] == batch_size, f"seq_lens {seq_lens.shape} vs batch {batch_size}"
+    # DL end
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
@@ -203,7 +206,10 @@ def fp8_paged_mqa_logits_torch_sm120(
     assert weight.shape == (batch_size, num_heads)
     if seq_lens.dim() > 1:
         seq_lens = seq_lens.squeeze(-1)
-    assert seq_lens.shape == (batch_size,)
+    # DL begin: relax shape assertion for DLIN (seq_lens may carry extra dims)
+    seq_lens = seq_lens.reshape(-1)
+    assert seq_lens.shape[0] == batch_size, f"seq_lens {seq_lens.shape} vs batch {batch_size}"
+    # DL end
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
@@ -638,6 +644,27 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
+        elif is_dlin():
+            # DL begin: route the V4 indexer to the vendored DL op (the torch
+            # fallback is ~400ms/decode-step = the decode bottleneck; deep_gemm is
+            # absent on DLIN). Matches vLLM's deep_gemm_patch.fp8_fp4_paged_mqa_logits.
+            # FP8 path (V4 KV cache is fp8_e4m3) -> q_scale=None. schedule_metadata
+            # (deep_gemm_metadata) is None on DLIN; the DL op computes SM scheduling
+            # internally, so pass an empty int32 placeholder.
+            def fn(q, kv_cache, weights, context_lens, block_tables, sched_meta,
+                   max_model_len, clean):
+                _q = q if isinstance(q, torch.Tensor) else q[0]
+                _qs = None if isinstance(q, torch.Tensor) else q[1]
+                _sm = (
+                    sched_meta
+                    if sched_meta is not None
+                    else torch.empty(0, dtype=torch.int32, device=_q.device)
+                )
+                return torch.ops.sgl_kernel.fp8_fp4_paged_mqa_logits(
+                    _q.contiguous(), _qs, kv_cache, weights.float(),
+                    context_lens, block_tables, _sm, int(max_model_len), clean,
+                )
+            # DL end
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             if is_sm120_supported():
                 fn = fp8_paged_mqa_logits_torch_sm120
