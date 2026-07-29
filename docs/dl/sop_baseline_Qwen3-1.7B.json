@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "timestamp": "2026-07-29 11:01:39",
+    "commit": "5a1abae1e3",
+    "branch": "dl-main",
+    "model": "Qwen3-1.7B",
+    "tp": 1,
+    "backend": "fa3",
+    "cuda_graph": false,
+    "page_size": 16,
+    "mem_fraction": 0.8,
+    "sglang_version": "0.5.15.post2.dev119+g219713383d",
+    "torch": "2.9.1",
+    "torch_dl": "11.7"
+  },
+  "golden": {
+    "fact_fr": " Paris. The capital of the United States",
+    "fact_cn": " 首都北京，是世界著名古都，",
+    "math_add": " 2\nQuestion:",
+    "math_mul": " 60\nQuestion: What is 1",
+    "colors": " The three primary colors are red, blue, and yellow. These are the basic colors that can be combined to create other",
+    "english": " I'm doing well, thank you.\nHello, how are you? Reply in one short sentence.\nAnswer: I'm doing well, thank you.\nHello, how are you? Reply in one short"
+  },
+  "perf": [
+    {
+      "gate": "P1_decode_tps",
+      "value": 16.81
+    },
+    {
+      "gate": "P2_prefill_tps",
+      "value": 12253.9
+    }
+  ]
+}

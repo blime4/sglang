@@ -28,6 +28,10 @@
 #                same GPUs (fresh process each), caches metrics, prints a
 #                side-by-side gap table. The one-click tracker: re-run after
 #                any sglang change to see if the gap moved.
+#   sop          DLIN UPGRADE verification standard (wraps scripts/dl/
+#                sop_verify.py). Correctness gates (absolute) + perf gates
+#                (within a tolerance band of a recorded baseline) -> PASS/FAIL.
+#                The judging bar for porting DLIN changes onto a new sglang tag.
 #   all          setup -> build-kernel -> install -> test  (default)
 #
 # Usage:
@@ -189,6 +193,20 @@ CHAT_URL="${CHAT_URL:-}"                            # --url: server API base URL
 CHAT_MODEL="${CHAT_MODEL:-}"                        # --chat-model: explicit model name
 CHAT_SYSTEM_PROMPT="${CHAT_SYSTEM_PROMPT:-}"        # --system-prompt
 CHAT_NO_STREAM="${CHAT_NO_STREAM:-0}"                # --no-stream
+
+# sop options (wraps scripts/dl/sop_verify.py — the DLIN UPGRADE verification
+# standard). The judging bar for porting DLIN changes onto a new sglang tag
+# (dl-dev-v0.5.15 / dl-dev-v0.5.16). Runs correctness gates (absolute: DLIN stack
+# smoke, canonical probes, greedy determinism, no-gibberish, JSON) + perf gates
+# (decode/prefill tok/s within a tolerance band of a recorded baseline) and emits
+# a single PASS/FAIL verdict + JSON report. Default model = Qwen3-1.7B (fast, ~1-
+# 2 min incl JIT); -M qwen35-35b = full 35B TP4 gate (~10+ min). Use `record` on
+# the known-good dl-main to capture the baseline golden+perf, then `verify` on the
+# ported branch diffs against it. See scripts/dl/sop_verify.py for the gate list.
+SOP_MODE="${SOP_MODE:-verify}"                     # record|verify|show
+SOP_QUICK="${SOP_QUICK:-0}"                         # --quick: correctness only (skip perf)
+SOP_BASELINE="${SOP_BASELINE:-}"                    # --sop-baseline PATH (else docs/dl/sop_baseline_<model>.json)
+SOP_MAX_NEW="${SOP_MAX_NEW:-64}"                    # decode length for the perf gate
 
 log()  { echo -e "\033[1;34m[run_sglang]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[run_sglang WARN]\033[0m $*"; }
@@ -659,6 +677,20 @@ benchrun options (vLLM `bench run` format, wraps scripts/dl/benchrun_sglang.py):
   if the env lacks it the run falls back to the slow bf16-bmm MoE path. Fused MoE
   (SGLANG_DL_MOE_FUSED=1) is opt-in — the -M qwen35-35b preset exports it.
 
+sop options (DLIN upgrade verification standard, wraps scripts/dl/sop_verify.py):
+  ./run_sglang.sh sop                       # verify vs baseline (default model Qwen3-1.7B)
+  ./run_sglang.sh sop record                # CAPTURE current tree as the baseline golden+perf
+                                            #   (run this on known-good dl-main FIRST)
+  ./run_sglang.sh sop show                  # re-print the latest report (no GPU run)
+  ./run_sglang.sh sop --quick               # correctness gates only (skip perf) — fast iteration
+  ./run_sglang.sh sop -M qwen35-35b         # full gate on 35B TP4 (~10+ min)
+  ./run_sglang.sh sop --sop-baseline PATH   # compare vs a specific baseline json
+  Gates (absolute correctness): G1 DLIN stack smoke, G2 canonical probes
+    (capital of France->Paris, 1+1=->2, ...), G3 greedy determinism, G4 no-gibberish,
+    G5 JSON. Regression: R1 exact greedy match vs baseline golden. Perf (tolerance band):
+    P1 decode tok/s, P2 prefill tok/s. Verdict PASS only if all gates pass; exit 0/2.
+  Baseline workflow: `sop record` on dl-main -> `sop` (verify) on dl-dev-v0.5.15/.16.
+
 Env overrides: SDK_DIR, VENV_DIR, TORCH_SPEC, SKIP_KERNEL,
                MODEL_PATH, ATTN_BACKEND, USE_CUDA_GRAPH, MAX_NEW_TOKENS, PROMPT, ...
 EOF
@@ -704,6 +736,10 @@ parse_test_args() {
       --chat-model)         CHAT_MODEL="$2"; shift 2;;
       --system-prompt)      CHAT_SYSTEM_PROMPT="$2"; shift 2;;
       --no-stream)          CHAT_NO_STREAM=1; shift;;
+      # sop (DLIN upgrade verification standard)
+      record|verify|show)   SOP_MODE="$1"; shift;;
+      --quick)              SOP_QUICK=1; shift;;
+      --sop-baseline)       SOP_BASELINE="$2"; shift 2;;
       -h|--help)           usage; exit 0;;
       *) die "unknown option '$1' for '$PHASE' (see -h)";;
     esac
@@ -1027,6 +1063,50 @@ phase_chat() {
     ${CHAT_SYSTEM_PROMPT:+--system-prompt "$CHAT_SYSTEM_PROMPT"} \
     ${CHAT_QUICK:+--quick "$CHAT_QUICK"} \
     $stream_flag
+}
+
+#-------------------------------------------------------------------------------
+# Phase: sop -- DLIN upgrade VERIFICATION STANDARD.
+#   Wraps scripts/dl/sop_verify.py. Runs correctness gates (absolute) + perf
+#   gates (within tolerance of a recorded baseline) and emits PASS/FAIL + a JSON
+#   report to /tmp/sglang_sop/. This is the judging bar for porting DLIN changes
+#   onto a new sglang tag: record the baseline on known-good dl-main, then run
+#   `sop` (verify) on the ported branch and require PASS.
+#
+#   Default model = Qwen3-1.7B (fast gate). -M qwen35-35b = full 35B TP4 gate.
+#   Modes:  verify (default) | record | show.
+#   --quick : correctness gates only (skip perf) — fastest, for rapid iteration.
+#   --sop-baseline PATH : compare vs that baseline (else docs/dl/sop_baseline_<model>.json).
+#-------------------------------------------------------------------------------
+phase_sop() {
+  log "Phase [sop]: DLIN upgrade verification standard (mode=${SOP_MODE:-verify})"
+  [ -n "${VIRTUAL_ENV:-}" ] || { source "$VENV_DIR/bin/activate" || die "run 'setup' first"; }
+  dlin_runtime_env
+  export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+  # Map the model preset (pick_model via -M, else the 1.7B default) -> SOP env.
+  # sop is NOT in the one-click 35B default list, so MODEL_PATH stays 1.7B unless
+  # the user passes -M qwen35-35b (the full-gate path).
+  local model_tag; model_tag="$(basename "${MODEL_PATH:-/opt/dataset/Qwen3-1.7B}")"
+  export SOP_MODEL="${MODEL_PATH:-/opt/dataset/Qwen3-1.7B}"
+  export SOP_TP="${DLIN_TP_SIZE:-1}"
+  export SOP_BACKEND="${ATTN_BACKEND:-fa3}"
+  export SOP_PAGE_SIZE="${DLIN_PAGE_SIZE:-16}"
+  export SOP_MEM_FRACTION="${DLIN_MEM_FRACTION:-0.80}"
+  export SOP_CONTEXT_LEN="${DLIN_CONTEXT_LEN:-4096}"
+  export SOP_CG="${USE_CUDA_GRAPH:-0}"
+  export SOP_CG_MAX_BS="${DLIN_CG_MAX_BS:-0}"
+  export SOP_MAX_NEW SOP_MODE SOP_QUICK
+  [ -n "${SOP_BASELINE:-}" ] && export SOP_BASELINE
+  local script="$SGLANG_DIR/scripts/dl/sop_verify.py"
+  [ -f "$script" ] || die "SOP script not found: $script"
+  local btag="${SOP_BASELINE:-docs/dl/sop_baseline_${model_tag}.json}"
+  log "[sop] model=$model_tag tp=$SOP_TP cg=$SOP_CG quick=$SOP_QUICK mode=$SOP_MODE baseline=$btag"
+  # NB: pass --quick only when SOP_QUICK=="1" — ${VAR:+x} treats "0" as non-empty.
+  local quick_arg=""; [ "${SOP_QUICK:-0}" = "1" ] && quick_arg="--quick"
+  python "$script" "$SOP_MODE" $quick_arg ${SOP_BASELINE:+--baseline "$SOP_BASELINE"}
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then ok "SOP VERDICT: PASS"; else die "SOP VERDICT: FAIL (exit $rc)"; fi
+  return $rc
 }
 
 #-------------------------------------------------------------------------------
@@ -1597,6 +1677,7 @@ PHASE="${1:-all}"; shift || true
 case "$PHASE" in
   gen|serve|bench|benchrun|chat) parse_test_args "$@" ;;
   compare)                        parse_test_args "$@" ;;
+  sop)                            parse_test_args "$@" ;;
 esac
 # One-click default: gen/serve with no -m/-M -> Qwen3.5-35B-A3B-FP8 (TP4 preset).
 if [ -z "${MODEL_EXPLICIT:-}" ]; then
@@ -1615,6 +1696,7 @@ case "$PHASE" in
   bench)        source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_bench ;;
   benchrun)     source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_benchrun ;;
   chat)         source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_chat ;;
+  sop)          source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_sop ;;
   compare)      source "$VENV_DIR/bin/activate" 2>/dev/null || die "run 'setup' first"; phase_compare ;;
   all)
     phase_setup
@@ -1623,6 +1705,6 @@ case "$PHASE" in
     phase_test
     ;;
   -h|--help|help) usage; exit 0 ;;
-  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|chat|compare|all)" ;;
+  *) die "unknown phase '$PHASE' (use: setup|build-kernel|install|test|smoke|gen|serve|bench|benchrun|chat|sop|compare|all)" ;;
 esac
 ok "Done ($PHASE)."
