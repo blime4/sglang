@@ -427,6 +427,75 @@
           "error": "File \"/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sglang/.venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 799, in _send_input\n    self.ensure_alive()\n  File \"/LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sglang/.venv/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 628, in ensure_alive\n    raise EngineDeadError()\nvllm.v1.engine.exceptions.EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.\n\nRendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]\n/home/shaobo.xie/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 4 leaked semaphore objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n/home/shaobo.xie/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 5 leaked shared_memory objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n[W727 18:39:14.792016044 AllocatorConfig.cpp:28] Warning: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF instead (function operator())"
         }
       }
+    },
+    {
+      "id": "r010",
+      "timestamp": "2026-07-29T12:57:12",
+      "sglang_commit": "b9b4b54002",
+      "sglang_branch": "dl-dev-v0.5.16",
+      "sglang_dirty": false,
+      "model": "Qwen3.6-35B-A3B-FP8",
+      "tp": 4,
+      "sdk": "sdk-dlop-07-13-20-30",
+      "mem_frac": 0.55,
+      "scenarios": [
+        "SC1",
+        "SC2",
+        "SC3",
+        "SC4",
+        "SC5",
+        "SC6",
+        "SC7",
+        "SC8",
+        "SC9",
+        "SC10"
+      ],
+      "engines": {
+        "sglang": {
+          "status": "ok",
+          "SC10_throughput_tps": 29.0,
+          "SC10_total_ms": 9927.0,
+          "SC1_cold_ms": 1745.0,
+          "SC1_speedup_x": 1.74,
+          "SC1_warm_ms": 1000.0,
+          "SC2_avg_ms": 1214.0,
+          "SC2_turn5_ms": 1199.0,
+          "SC3_per_req_ms": 584.0,
+          "SC3_throughput_tps": 54.8,
+          "SC4_tps": 33.3,
+          "SC4_valid": 1.0,
+          "SC5_avg_turn_ms": 903.0,
+          "SC5_total_ms": 7227.0,
+          "SC6_prefill_tps": 990.0,
+          "SC6_total_ms": 10807.0,
+          "SC7_throughput_tps": 28.1,
+          "SC7_total_ms": 6825.0,
+          "SC8_tps": 58.4,
+          "SC9_tps": 37.0
+        },
+        "vllm_mrv1": {
+          "status": "ok",
+          "SC10_throughput_tps": 24.2,
+          "SC10_total_ms": 11884.0,
+          "SC1_cold_ms": 1620.0,
+          "SC1_speedup_x": 1.34,
+          "SC1_warm_ms": 1207.0,
+          "SC2_avg_ms": 1283.0,
+          "SC2_turn5_ms": 1201.0,
+          "SC3_per_req_ms": 763.0,
+          "SC3_throughput_tps": 41.9,
+          "SC5_avg_turn_ms": 993.0,
+          "SC5_total_ms": 7942.0,
+          "SC7_throughput_tps": 23.8,
+          "SC7_total_ms": 8064.0,
+          "SC8_tps": 51.0,
+          "SC9_tps": 36.8
+        },
+        "vllm_mrv2": {
+          "status": "fail",
+          "error": "Processed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.62s/it, est. speed input: 75.89 toks/s, output: 0.23 toks/s]\nProcessed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.62s/it, est. speed input: 75.89 toks/s, output: 0.23 toks/s]\nProcessed prompts: 100%|██████████| 1/1 [00:17<00:00, 17.62s/it, est. speed input: 75.89 toks/s, output: 0.23 toks/s]\n\nRendering prompts:   0%|          | 0/1 [00:00<?, ?it/s]\nRendering prompts: 100%|██████████| 1/1 [00:00<00:00, 245.40it/s]\n\nProcessed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]/home/shaobo.xie/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 4 leaked semaphore objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n/home/shaobo.xie/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 6 leaked shared_memory objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n./run_sglang.sh: line 1459: 1800493 Killed                  python \"$script\" --engine \"$eng\" $vllm_args --mem-frac \"$COMPARE_MEM_FRAC\" --scenarios \"$COMPARE_SCENARIOS\""
+        }
+      }
     }
   ]
 }
