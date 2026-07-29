@@ -302,3 +302,6 @@ artifacts/
 /vllm-new-overlay/
 /models-dl/
 /whl-for-compare/
+
+# Internal, non-published docs
+internal-docs/

@@ -9,7 +9,7 @@ else:
     merge_state_v2 = None
 # DL end
 
-from sglang.srt.layers.attention.triton_ops.merge_state import merge_state_triton
+from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()

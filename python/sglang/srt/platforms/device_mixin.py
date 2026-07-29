@@ -172,6 +172,10 @@ class DeviceMixin:
         """[Active] Get current peak memory usage in bytes."""
         raise NotImplementedError
 
+    def is_pin_memory_available(self, device=None) -> bool:
+        """[Active] Whether pinned host memory is available for a target device."""
+        return False
+
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded
     # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
@@ -259,6 +263,14 @@ class DeviceMixin:
         elif machine in ("arm64", "aarch64"):
             return CpuArchEnum.ARM
         return CpuArchEnum.UNSPECIFIED
+
+    def get_torch_profiler_activity_str(self) -> str:
+        """[Planned] Return the torch profiler activity string."""
+        raise NotImplementedError
+
+    def get_torch_profiler_activity(self) -> torch.profiler.ProfilerActivity:
+        """[Planned] Return the torch profiler activity."""
+        raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Dunder helpers
