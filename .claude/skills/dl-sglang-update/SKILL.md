@@ -117,7 +117,51 @@ Write a memory entry recording: tag, conflict count + resolution decisions, SOP
 numbers, any DL opt dropped, gotchas hit. Branch is ready to become the new dl-main
 once green.
 
-## Conflict-resolution catalog (from the v0.5.14 -> v0.5.15 port)
+## v0.5.16 is a STRUCTURAL-REFACTOR release (much harder than v0.5.15)
+
+v0.5.15 ported clean (9 conflicts, all textual). **v0.5.16 relocated code tree-wide** —
+expect ~23 conflicts AND a cross-file import migration. Do NOT treat it like v0.5.15.
+The merge produces 23 conflicts; resolving them is necessary but NOT sufficient — the
+build then surfaces import errors from DL files still using the old paths.
+
+Relocation map (old -> new) that DL imports must follow:
+- `sglang.srt.layers.attention.fla.*` -> `sglang.kernels.ops.attention.fla.*`
+- `sglang.srt.layers.attention.dsv4.*` -> `sglang.kernels.ops.attention.dsv4.*`
+- `sglang.srt.layers.quantization.fp8_kernel` -> `sglang.kernels.ops.quantization.fp8_kernel`
+- `sglang.jit_kernel.utils` (one file) -> `sglang.jit_kernel.utils.{arch,common,compile,deps}` (a PACKAGE):
+  - `_get_default_target_flags` -> `arch.py:get_default_target_flags`
+  - `is_arch_support_pdl`, `get_jit_cuda_arch`, `override_jit_cuda_arch` -> `arch.py`
+  - `register_dependency`, `get_*_include_paths`, `_find_package_root` -> `deps.py`
+  - `__init__.py` re-exports the public names (so `from sglang.jit_kernel.utils import is_arch_support_pdl` still works once arch.py has it)
+- model_runner methods `init_aux_hidden_state_capture`, `model_specific_adjustment`,
+  `remote_instance_init_transfer_engine` were MOVED OUT of model_runner.py (find their
+  new home and re-apply DL's `init_aux_hidden_state_capture` FROZEN_KV_MTP block there).
+- prefill_cuda_graph_runner: the inline replay in `execute`/`load_batch` was EXTRACTED
+  into `_uses_eager_prefill_tail()` + `_execute_body_capture(...)`. DL's NO_BREAK-CG
+  `seq_lens=ctx_len` fix lives in `capture_prepare` (auto-merged, preserved); DL's
+  replay-path timing moves into `_execute_body_capture`.
+- qwen3_5 MoE call: wrapped in `with get_forward().scoped(fuse_mlp_allreduce=..., mlp_reduce_scatter=...):`
+  and the call simplified to `self.mlp(hidden_states)`. DL's per-layer timing
+  (`SGLANG_DL_LAYER_TIMING`/`SGLANG_DL_SKIP_MOE`, both opt-in/off) wrapped the OLD call —
+  DROP it (re-add inside the scoped block later if needed); adopt the scoped call.
+- MoE dispatch: `should_allreduce_fusion` -> `fuse_mlp_allreduce`.
+- `get_global_server_args()` still EXISTS in v0.5.16 (NOT renamed) — DL blocks using it are fine.
+
+**Critical JIT step (the v0.5.16 blocker):** because `utils.py` was split, DL's three
+utils.py edits MUST move to `arch.py` (their new home) or prefill/FLA kernels miscompile:
+1. the gdc_wait/gdc_launch_dependents triton shim (top of arch.py),
+2. the DLIN dlcc branch in `get_default_target_flags`,
+3. the `is_dlin() -> False` check in `is_arch_support_pdl`.
+For compile.py's rename conflicts, take **theirs** (the functions moved out).
+
+Resolve-order that worked (got to 20/23 + the arch.py JIT migration before hitting the
+2 deepest): the clear textual conflicts first, the package-split rename via take-theirs
++ re-apply-to-arch.py, then qwen3_5 (take theirs, drop DL timing). The 2 that need careful
+manual surgery (not blind take-theirs): `prefill_cuda_graph_runner` (DL timing inside the
+extracted method) and `decode_cuda_graph_runner` (DL bs=1 fastpath vs upstream `is_ragged`).
+After all conflicts resolve, grep the tree for old import paths and migrate them, then build.
+
+
 
 Reusable patterns (DL = HEAD/ours, UP = upstream/theirs):
 
