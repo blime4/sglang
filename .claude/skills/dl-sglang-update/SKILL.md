@@ -154,14 +154,30 @@ utils.py edits MUST move to `arch.py` (their new home) or prefill/FLA kernels mi
 3. the `is_dlin() -> False` check in `is_arch_support_pdl`.
 For compile.py's rename conflicts, take **theirs** (the functions moved out).
 
-Resolve-order that worked (got to 20/23 + the arch.py JIT migration before hitting the
-2 deepest): the clear textual conflicts first, the package-split rename via take-theirs
-+ re-apply-to-arch.py, then qwen3_5 (take theirs, drop DL timing). The 2 that need careful
-manual surgery (not blind take-theirs): `prefill_cuda_graph_runner` (DL timing inside the
-extracted method) and `decode_cuda_graph_runner` (DL bs=1 fastpath vs upstream `is_ragged`).
-After all conflicts resolve, grep the tree for old import paths and migrate them, then build.
+Resolve-order that WORKED (v0.5.16 reached SOP 13/13 PASS, R1 exact-match vs dl-main,
+decode x1.24 / prefill x0.96, commit 3e77848c6b): clear textual conflicts first; the
+package-split rename via take-theirs + re-apply-DL-to-arch.py; qwen3_5 take-theirs (drop
+opt-in DL layer-timing, adopt scoped MoE); decode_cg keeps the DL bs=1 fastpath guard then
+adopts `if is_ragged:`; prefill_cg take-theirs (adopt `_execute_body_capture` extraction).
+Then the build/SOP surfaced these **runtime fixes** (each a one-liner — fix forward, don't abort):
 
+- **sgl-kernel version gate:** v0.5.16 requires >=0.4.5; bump `sgl-kernel/pyproject_dl.toml`
+  0.4.4->0.4.5 and reinstall editable (`assert_pkg_version` at engine init).
+- **ModelRunner parallel attrs moved behind `ps`:** v0.5.16 access is `model_runner.ps.tp_size`
+  / `.ps.attn_cp_size` (not `model_runner.tp_size`). DL's flashattention_backend (kept --ours)
+  used the old direct access — fix ALL of them (`// model_runner.tp_size` integer-division too).
+- **`kv_allocated_len` moved Req -> Req.kv:** v0.5.16 tracks it as `req.kv.kv_allocated_len`
+  AND updates it in the model worker. DL's manual `req.kv_allocated_len += 1` per decode step
+  double-counts -> "Unexpected overallocated KV cache" assert. DROP the DL increment (the
+  v0.5.14-era manual tracking is now redundant); re-integrate multi-step separately.
+- **fla-package sed over-match:** `sed 's/...attention.fla/.../'` also rewrote `flashattention`/
+  `flashinfer`/`flashmla` (they start with "fla") — but those did NOT move (only the `fla/`
+  PACKAGE + `flash_mla_sm120` did). Revert the over-match; migrate only `fla.` (with trailing
+  dot). Lesson: scope path-rewrite seds to the exact package, not a prefix.
 
+After conflicts + these runtime fixes, `sop verify` is green. The structural refactor is
+mechanical once you know the relocation map above — expect ~6 runtime one-liners, not deep
+surgery.
 
 Reusable patterns (DL = HEAD/ours, UP = upstream/theirs):
 
