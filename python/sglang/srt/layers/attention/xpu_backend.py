@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.flashattention_backend import (
+from sglang.kernels.ops.attention.flashattention_backend import (
     FlashAttentionMetadata,
     make_local_attention_virtual_batches,
     merge_state_v2_wrapper,

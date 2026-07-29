@@ -23,7 +23,7 @@
 # specialized for bf16 beta; sglang's helper returns fp32).
 import torch
 
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -108,7 +108,7 @@ class DLinGDNKernel(LinearAttnKernelBase):
         # dl_chunk has NO state_indices arg, so gather active states by
         # cache_indices, run, scatter the updated final state back in-place.
         from sglang.srt.layers.quantization.fp8_utils import _ensure_dl_C
-        from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
         _ensure_dl_C()
         # beta bf16 to match op specialization (same as decode).
         beta = beta.to(torch.bfloat16)
