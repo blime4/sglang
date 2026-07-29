@@ -2837,12 +2837,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for req in self.reqs:
             req.decode_batch_idx += 1
             req.kv_committed_len += 1
-            # DL begin — pre-allocated extra slots count as allocated (freed on completion)
-            if self._dl_multi_step_locs:
-                req.kv.kv_allocated_len += _dl_n
-            else:
-                req.kv.kv_allocated_len += 1
-            # DL end
+            # DL: v0.5.16 moved KV-slot allocation into the model worker (req.kv
+            # .kv_allocated_len is updated there), so the old v0.5.14-era manual
+            # req.kv.kv_allocated_len += 1 here double-counted -> over-alloc assert.
+            # Multi-step pre-allocation (_dl_multi_step_locs) needs re-integration
+            # against v0.5.16's allocation model (opt-in, not in the SOP path).
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
