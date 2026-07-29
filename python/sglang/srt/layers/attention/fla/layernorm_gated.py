@@ -6,6 +6,7 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
+from contextlib import nullcontext
 from functools import lru_cache
 
 import torch
@@ -255,7 +256,14 @@ def _layer_norm_fwd(
     grid = (cdiv(M, rows_per_block), ngroups)
     # DL: explicit USE_GDC constexpr (not **pdl_kwargs) for torch.compile compat.
     _dl_supports_pdl = is_arch_support_pdl()  # DL:
-    with device_context(x.device):
+    # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
+    # in that release (no-op on DLIN where torch.compile is disabled).
+    device_ctx = (
+        nullcontext()
+        if x.device.type == "xpu" and torch.compiler.is_compiling()
+        else device_context(x.device)
+    )
+    with device_ctx:
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,
