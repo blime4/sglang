@@ -398,7 +398,7 @@ class FlashAttentionBackend(AttentionBackend):
             // model_runner.tp_size
         )
         self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            model_runner.tp_size
+            model_runner.ps.tp_size
         )
         _softcapping = getattr(
             model_runner.model_config.hf_text_config, "attn_logit_softcapping", None
