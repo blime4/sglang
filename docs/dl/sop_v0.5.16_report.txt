@@ -1,0 +1,20 @@
+  SOP REPORT  Qwen3-1.7B  tp=1  cg=False  dl-dev-v0.5.16@c981aebf58
+  sglang=0.5.15.post2.dev119+g219713383d  torch_dl=11.7  2026-07-29 12:17:55
+==========================================================================
+  gate                   status   value
+  ----------------------------------------------------------------------
+  G1_smoke               PASS     
+  G2_fact_fr             PASS      Paris. The capital of the United States
+  G2_fact_cn             PASS      首都北京，是世界著名古都，
+  G2_math_add            PASS      2\nQuestion:
+  G2_math_mul            PASS      60\nQuestion: What is 1
+  G2_colors              PASS      The three primary colors are red, blue, and
+  G2_english             PASS      I'm doing well, thank you.\nHello, how are 
+  G3_determinism         PASS     
+  G4_no_gibberish        PASS      Make sure to include the following: 1) the 
+  G5_json                PASS     { "name": "Alice", "age": 30 } \n\nIs this t
+  R1_exact_match         PASS     
+  P1_decode_tps          PASS     20.92 tok/s  (base 16.81, x1.244)
+  P2_prefill_tps         PASS     11768.44 tok/s  (base 12253.9, x0.96)
+  ----------------------------------------------------------------------
+  VERDICT: PASS   (passed 13/13, failed 0)
