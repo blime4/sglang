@@ -2839,9 +2839,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             # DL begin — pre-allocated extra slots count as allocated (freed on completion)
             if self._dl_multi_step_locs:
-                req.kv_allocated_len += _dl_n
+                req.kv.kv_allocated_len += _dl_n
             else:
-                req.kv_allocated_len += 1
+                req.kv.kv_allocated_len += 1
             # DL end
 
         # New-tensor avoids racing model_worker_batch refs queued for
