@@ -651,6 +651,7 @@ def dlblas_w8a8_block_fp8_linear(
             if bias is not None:
                 out = out + bias
             return out.to(dtype=input.dtype).view(*input.shape[:-1], N)
+        # DL end
         # DL begin — C-5 INVESTIGATION (NON-VIABLE, gated off). Attempted to expose
         # a discrete per-token FP8 quant -> w8a8_matmul(pre-quantized FP8) so
         # RMSNormQuantFusionPass could fuse norm+quant. Verified NON-VIABLE:
