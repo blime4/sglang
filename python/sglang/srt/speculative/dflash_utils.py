@@ -582,6 +582,12 @@ def compute_dflash_correct_drafts_and_bonus(
     matches = candidates[:, 1:] == target_predict[:, :-1]
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
+    # DL: direct accept-rate measurement (correct_len = # accepted draft tokens)
+    import os as _os
+    if _os.environ.get("SGLANG_DL_SPEC_DEBUG"):
+        _cl = correct_len.tolist()
+        print(f"[DL_SPEC] bs={bs} block_size={block_size} correct_len(per-req)={_cl} "
+              f"mean={sum(_cl)/max(len(_cl),1):.2f}", flush=True)
     return correct_len, bonus.to(torch.int64)
 
 

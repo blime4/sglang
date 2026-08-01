@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -598,6 +599,13 @@ class MQALayer(MqaAttentionBase):
         from sglang.srt.utils import is_blackwell_supported
 
         self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        # DL: on DLIN, multi-stream overlap is incompatible with CG capture at M>1
+        # (cudaErrorStreamCaptureUnsupported). Limit to M=1 so decode (M=1) keeps
+        # the fast multi-stream path, while spec verify (M>1) falls back to
+        # single-stream (CG-safe). This unblocks EAGLE spec CG capture.
+        from sglang.srt.utils.common import is_dlin as _is_dlin_ms
+        if _is_dlin_ms():
+            self._multi_stream_bs_limit = 1
 
         self.compressor = None
         self.indexer = None
@@ -749,7 +757,7 @@ class MQALayer(MqaAttentionBase):
         q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
-        if self.indexer is not None:
+        if self.indexer is not None and os.environ.get("SGLANG_DL_SKIP_INDEXER") != "1":
             with torch.cuda.stream(stream_indexer):
                 self.indexer(
                     x=x,
@@ -1156,14 +1164,20 @@ class MQALayer(MqaAttentionBase):
                 )
             kv = None
         else:
-            q, kv = self._forward_prepare(
-                x,
-                positions,
-                forward_batch,
-                attn_backend,
-                q_out,
-                x_quant=x_quant,
-            )
+            from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t3  # DL
+            # DL: skip qkv_proj for differential profiling
+            if os.environ.get("SGLANG_DL_SKIP_QKV") == "1":
+                q, kv = torch.zeros_like(x), None
+            else:
+                with _dl_t3("qkv_proj"):
+                    q, kv = self._forward_prepare(
+                        x,
+                        positions,
+                        forward_batch,
+                        attn_backend,
+                        q_out,
+                        x_quant=x_quant,
+                    )
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -1202,16 +1216,21 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache,
                 )
             else:
-                o = attn_backend.forward(
-                    q=attn_q,
-                    k=attn_k,
-                    v=attn_k,
-                    layer=self.attn_mqa,
-                    forward_batch=forward_batch,
-                    compress_ratio=self.compress_ratio,
-                    attn_sink=self._attn_sink_local,
-                    save_kv_cache=save_kv_cache,
-                )
+                from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t  # DL
+                if os.environ.get("SGLANG_DL_SKIP_FLASH") == "1":
+                    o = torch.zeros_like(attn_q)
+                else:
+                    with _dl_t("flash_mla"):
+                        o = attn_backend.forward(
+                        q=attn_q,
+                        k=attn_k,
+                        v=attn_k,
+                        layer=self.attn_mqa,
+                        forward_batch=forward_batch,
+                        compress_ratio=self.compress_ratio,
+                        attn_sink=self._attn_sink_local,
+                        save_kv_cache=save_kv_cache,
+                    )
             o = o[:, tp_slice, :]
         if _is_npu:
             v4_rope_inplace_npu(
@@ -1233,8 +1252,6 @@ class MQALayer(MqaAttentionBase):
         o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
-            import deep_gemm
-
             from sglang.srt.layers import deep_gemm_wrapper
 
             T, G, D = o.shape
@@ -1254,19 +1271,26 @@ class MQALayer(MqaAttentionBase):
                 o_s = o_s.view(T, G, -1)
                 recipe = (1, 128, 128)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+            # DL: use sgl_kernel.fp8_einsum (ported from _dl_C) — deep_gemm pkg is
+            # missing on DLIN. Same op vLLM's dl deep_gemm_patch delegates to.
+            torch.ops.sgl_kernel.fp8_einsum(
+                o_fp8, o_s,
+                self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data,
                 output,
-                recipe=recipe,
+                "bhr,hdr->bhd",
+                list(recipe),
             )
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
-        o, _ = self.wo_b(o.flatten(1))
+        from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t2  # DL
+        if os.environ.get("SGLANG_DL_SKIP_OPROJ") == "1":
+            o = torch.zeros(o.shape[0], self.hidden_size, dtype=o.dtype, device=o.device)
+        else:
+            with _dl_t2("o_proj"):
+                o, _ = self.wo_b(o.flatten(1))
         if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
@@ -1424,6 +1448,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        # DL begin — ported vLLM dl_mhc_triton MHC pre kernel (fused Sinkhorn+post+combine).
+        # On DLIN, tilelang is missing; the DeepGEMM/torch fallback is ~2ms/layer
+        # (25-30% of attn). This Triton kernel fuses the post-GEMM processing.
+        from sglang.srt.utils.common import is_dlin
+        if is_dlin():
+            from sglang.jit_kernel.dsv4.dl_mhc_triton import dl_mhc_pre_triton
+            # dl_mhc_pre_triton fuses GEMM + Sinkhorn + y in one Triton kernel.
+            # No input_layernorm fused → norm_fused=False → caller applies it.
+            post_mix, comb_mix, layer_input = dl_mhc_pre_triton(
+                x.contiguous(),
+                hc_fn.float().contiguous(),
+                hc_scale.float().contiguous(),
+                hc_base.float().contiguous(),
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                _MHC_POST_MULT_VALUE,
+                self.hc_sinkhorn_iters,
+                1,
+            )
+            return layer_input, post_mix.squeeze(-1), comb_mix, False
+        # DL end
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
@@ -1529,6 +1576,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             mhc_post(result, x, residual, post, comb)
             return result
 
+        # DL begin — ported vLLM dl_mhc_triton MHC post kernel (fused broadcast+mul+sum).
+        from sglang.srt.utils.common import is_dlin as _is_dlin_post
+        if _is_dlin_post():
+            from sglang.jit_kernel.dsv4.dl_mhc_triton import dl_mhc_post_triton
+            return dl_mhc_post_triton(x, residual, post, comb)
+        # DL end
+
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
@@ -1558,6 +1612,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
+        # DL: flush deferred decode-profile events ~once per step (43 layers =>
+        # ~once/step). Zero-cost when SGLANG_DL_DECODE_PROFILE unset.
+        from sglang.srt.layers.quantization.dl_moe_profile import maybe_flush as _dl_flush  # DL
+        _dl_flush()
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
@@ -1584,14 +1642,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant = None
         else:
             residual = hidden_states
-            hidden_states, post, comb, norm_fused = self.hc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                norm=self.input_layernorm,
-                forward_batch=forward_batch,
-            )
+            from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t_hp  # DL
+            with _dl_t_hp("hc_pre"):
+                hidden_states, post, comb, norm_fused = self.hc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    norm=self.input_layernorm,
+                    forward_batch=forward_batch,
+                )
             if not norm_fused:
                 if _use_aiter and _is_gfx95_supported:
                     x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
@@ -1605,12 +1665,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        hidden_states = self.self_attn(
-            x=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-        )
+        # DL begin — deferred-sync ATTN profiling (SGLANG_DL_DECODE_PROFILE=1).
+        # Wraps the whole attention block (q/k/v projections + flash_mla + indexer
+        # + o-proj + all-reduce). Indexer runs on an alt stream but is waited on
+        # before self_attn returns, so the default-stream event pair captures it.
+        from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t
+        # DL: skip attn for CG differential profiling (SGLANG_DL_SKIP_ATTN=1)
+        if os.environ.get("SGLANG_DL_SKIP_ATTN") == "1":
+            hidden_states = torch.zeros_like(hidden_states)
+        else:
+            with _dl_t("attn"):
+                hidden_states = self.self_attn(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=x_quant,
+            )
+        # DL end
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1653,7 +1724,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
                 norm_fused = True
         else:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            with _dl_t_hp("hc_post"):
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,

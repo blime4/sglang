@@ -2557,20 +2557,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     or _os.environ.get("SGLANG_DL_MOE_FP4") == "1"
                 )
                 _qf = (False, False, False, True) if _use_mxfp4 else (True, False, False, False)
-                _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
-                   _tw, _ti,
-                   _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
-                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
+                # DL begin — deferred-sync MoE profiling (SGLANG_DL_DECODE_PROFILE=1)
+                from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t, maybe_flush as _dl_flush
+                with _dl_t("moe_w13"):
+                    _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
+                       _tw, _ti,
+                       _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
+                       _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
+                # DL end
                 he = _silu_and_mul(c13.reshape(-1, 2 * inter)).reshape(M, topk, inter)
                 _M2 = M * topk
                 _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
                 _tw_w2 = _tw.reshape(-1, 1)  # [M*topk, 1]
                 c2 = torch.empty(_M2, 1, hidden, dtype=x.dtype, device=x.device)
                 # DL: pass _srt/_eid/_npp from real mabs (or trivial) for w2 too
-                _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
-                   _tw_w2, _ti_w2.to(torch.int32),
-                   _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
-                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
+                # DL begin — deferred-sync MoE profiling
+                with _dl_t("moe_w2"):
+                    _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
+                       _tw_w2, _ti_w2.to(torch.int32),
+                       _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
+                       _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
+                _dl_flush()
+                # DL end
                 out = c2.reshape(M, topk, hidden).sum(dim=1)
                 return StandardCombineInput(hidden_states=out)
                 # DL end (use_moe_cu)

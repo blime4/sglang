@@ -1740,22 +1740,24 @@ class DeepseekV4AttnBackend(
                 # causal=True forces a dense-causal path reading the None descriptors -> garbage
                 # across all MLA layers -> gibberish (V4 correctness bug #1). Matches vLLM +
                 # our sm120/NVIDIA paths (which omit causal -> False) and the op docstring.
-                o = torch.ops.sgl_kernel.flash_mla_with_kvcache(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    block_table=None,
-                    cache_seqlens=None,
-                    head_dim_v=self.head_dim_v,
-                    softmax_scale=self.softmax_scale,
-                    causal=False,
-                    is_fp8_kvcache=True,
-                    indices=swa_page_indices,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_cache=extra_indices,
-                    topk_length=swa_topk_lengths,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_fk  # DL
+                with _dl_fk("flash_kernel"):  # DL: isolate the MLA kernel vs prep
+                    o = torch.ops.sgl_kernel.flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        block_table=None,
+                        cache_seqlens=None,
+                        head_dim_v=self.head_dim_v,
+                        softmax_scale=self.softmax_scale,
+                        causal=False,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_cache=extra_indices,
+                        topk_length=swa_topk_lengths,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
                 # DL end
             else:
                 if _is_xpu:
