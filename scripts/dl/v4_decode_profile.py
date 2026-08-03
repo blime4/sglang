@@ -85,6 +85,26 @@ if __name__ == "__main__":
     _wt = _w["text"] if isinstance(_w, dict) else str(_w)
     _wi = (_w.get("output_ids") if isinstance(_w, dict) else None)
     print(f"[prof] WARMUP text={_wt!r} ids={_wi}", flush=True)
+
+    # DL: concurrent-requests path — tests whether the model forward amortizes
+    # at M=2 (per-request tok/s stays ~M=1 → amortized) or scales (drops). This
+    # diagnoses if EAGLE's verify-M=2 gap is model-scaling (fundamental) or
+    # framework overhead (fixable → path to 20).
+    _conc = int(os.environ.get("PROFILE_CONCURRENT", "0"))
+    N = int(os.environ.get("PROFILE_NEW_TOKENS", "256"))
+    if _conc > 1:
+        prompts = [f"Write a long essay about topic {i}:" for i in range(_conc)]
+        t1 = time.perf_counter()
+        outs = engine.generate(prompts, {"max_new_tokens": N, "temperature": 0, "ignore_eos": True})
+        dt = time.perf_counter() - t1
+        total = N * _conc
+        print(f"[prof] CONCURRENT M={_conc}: {total} tokens in {dt:.2f}s -> "
+              f"{total/dt:.2f} tok/s aggregate, {_conc*N/dt:.2f} per-req-equiv, "
+              f"per-req-tok/s={N/dt:.2f} (TPOT {dt/N*1000:.1f}ms)", flush=True)
+        engine.shutdown()
+        print("[prof] DONE", flush=True)
+        import sys; sys.exit(0)
+
     # timed decode — many steps so deferred-sync flushes multiple times
     t1 = time.perf_counter()
     N = int(os.environ.get("PROFILE_NEW_TOKENS", "256"))

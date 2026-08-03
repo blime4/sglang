@@ -1616,6 +1616,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         # ~once/step). Zero-cost when SGLANG_DL_DECODE_PROFILE unset.
         from sglang.srt.layers.quantization.dl_moe_profile import maybe_flush as _dl_flush  # DL
         _dl_flush()
+        # DL: one-shot — log the verify batch M (is the bonus reprocessed?)
+        if os.environ.get("SGLANG_DL_SPEC_DEBUG") and not globals().get("_dl_vm_dbg"):
+            globals()["_dl_vm_dbg"] = True
+            _fm = forward_batch.forward_mode
+            print(f"[DL_VERIFY_M] layer0 batch_size={forward_batch.batch_size} "
+                  f"mode={_fm} is_decode={_fm.is_decode()} is_target_verify={getattr(_fm,'is_target_verify',lambda:None)()}",
+                  flush=True)
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
@@ -1846,13 +1853,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                skip_shared_experts=_do_shared_local,
-            )
+            if os.environ.get("SGLANG_DL_SKIP_MOE") == "1":  # DL: differential profiling
+                pass  # skip MoE — keep hidden_states unchanged
+            else:
+                from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_moe_t  # DL
+                with _dl_moe_t("mlp_total"):  # DL: whole MoE (GEMM + routing + comm)
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        skip_shared_experts=_do_shared_local,
+                    )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
