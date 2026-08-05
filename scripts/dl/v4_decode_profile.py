@@ -64,6 +64,8 @@ if __name__ == "__main__":
         # V4 FP4 weight loading (~4min) + JIT init ≈ 310s exceeds the default 300s
         # watchdog → worker SIGKILL'd (exit -9) mid-init. Give it headroom.
         watchdog_timeout=float(os.environ.get("PROFILE_WATCHDOG", "600")),
+        **({"page_size": int(os.environ["PROFILE_PAGE_SIZE"])}
+           if os.environ.get("PROFILE_PAGE_SIZE") else {}),
         # context_length: shrinks the indexer page_table capacity (max_c4_seq_len).
         # If the DL op grids on max_c4_seq_len, a small ctx drops idx_logits.
         **({"context_length": int(os.environ["PROFILE_CONTEXT_LEN"])}
