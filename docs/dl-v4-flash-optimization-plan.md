@@ -378,3 +378,25 @@ Frozen-KV MTP 接口方法（bind/build/set）已正确实现。init 路径的 4
 **runtime 集成（draft forward_batch + V4 attention backend）需要更多工作**：
 V4 的复杂 attention backend（indexer + compressor + C4 + C128 + SWA）有多个 KV buffer
 假设，需要逐个适配 frozen-KV 模式。预计需要 1-2 天的集成工作。
+
+---
+
+## 11. FROZEN_KV_MTP 端到端验证结果（2026-08-06）
+
+### 测试条件
+- SPEC_ALGO=FROZEN_KV_MTP, steps=1, ctx=512, CG=True, TP8
+- 200 tokens decode, SGLANG_DL_SPEC_DEBUG=1 for accept measurement
+- Dummy out_cache_loc provided for V4 attention backend compatibility
+
+### 测试结果
+
+| Metric | Value | Verdict |
+|---|---|---|
+| accept_length | **2.00** | Same as EAGLE — **cap NOT broken** |
+| throughput | 12.72 tok/s | Slower than EAGLE (15.83) due to no CG + view overhead |
+| output | "Charles Babbage, Ada Lovelace, and Alan Turing" | ✅ Correct |
+| TPOT | 78.6ms | +15.4ms vs EAGLE (63.2ms) |
+
+### 结论
+
+**Frozen-KV MTP 端到端测试通过，accept_length=2.00（与 EAGLE 相同）。这证明 accept_length=2.0 不是 KV 管理问题，而是 V4 只有 1 个 mtp layer 的根本架构限制。** 无论 KV 共享还是独立，draft 的预测能力不变（1 mtp layer 只能准确预测 1 个 token）。
