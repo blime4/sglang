@@ -2215,6 +2215,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             import os as _os
 
+            # P1#12: cache contiguous weight scales ONCE per layer, BEFORE any path
+            # selection. All DLIN MoE paths (fused, GEMMEX, vLLM-exact) read these
+            # scales. Without caching, .contiguous() runs every forward step =
+            # ~80 redundant copy kernels/step × ~0.04ms = ~3ms TPOT.
+            if _is_dlin() and not hasattr(layer, "_dl_w13s"):
+                layer._dl_w13s = layer.w13_weight_scale_inv.contiguous()
+                layer._dl_w2s = layer.w2_weight_scale_inv.contiguous()
+
             # DL begin — DLIN fused blockwise FP8 MoE (SGLANG_DL_MOE_FUSED=1):
             # Handles BOTH prefill (M>1) and decode (M==1). invoke_fused_moe_opt is the
             # DLIN-native grouped FP8 GEMM (vLLM uses it). With cuda graph, metadata
@@ -2264,12 +2272,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 _G = torch.ops.sgl_kernel.invoke_fused_moe_opt  # DL: ported from _dl_C
                 from sglang.jit_kernel.activation import silu_and_mul as _silu_and_mul
-                # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
-                # not every forward step — was 80 redundant copy kernels/step × ~0.04ms
-                # = ~3ms TPOT overhead if scales not already contiguous).
-                if not hasattr(layer, "_dl_w13s"):
-                    layer._dl_w13s = layer.w13_weight_scale_inv.contiguous()
-                    layer._dl_w2s = layer.w2_weight_scale_inv.contiguous()
+                # P1#12: scales already cached above (before the fused gate).
                 # DL: skip .to()/.contiguous() if already correct dtype+layout (no-op
                 # avoids a captured CUDA kernel in CG).
                 _ti = topk_ids if (topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()) else topk_ids.to(torch.int32).contiguous()

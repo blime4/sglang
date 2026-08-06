@@ -219,3 +219,48 @@ verify (target model, batch=1+num_draft):
 1. **先测后改**: GEMMEX=2 在理论分析上应该更快（2 GEMM vs 16），但实测更慢。Python gather 开销 > kernel launch 节省。静态分析必须配实测验证。
 2. **flag 依赖链**: shared expert local 依赖 `_use_tp_moe_gather`，而后者依赖 DP attention 配置。默认值改了但执行路径没变。
 3. **GPU 内存管理**: DLIN KS38 在多次实验后内存不完全释放，需要谨慎管理实验顺序。
+
+---
+
+## 8. P1 实施结果（2026-08-06）
+
+### P1 #12: FP8 scale 全路径缓存 → ✅ 已实施
+- **改动**: 将 `layer._dl_w13s = layer.w13_weight_scale_inv.contiguous()` 从 `SGLANG_DL_MOE_FUSED` 内部移到所有 DLIN MoE 路径之前。
+- **文件**: fp8.py:2213-2220
+- **效果**: 所有 GEMMEX 路径（1/2/3/4）+ vLLM-exact 路径 + bf16-bmm 路径都受益。之前只有 fused 路径缓存了 scales。
+- **风险**: 极低（缓存逻辑不变，只是位置提前）
+
+### P1 #13: attention metadata 缓存 → ⚠️ N/A
+- **发现**: `make_core_attn_metadata` 和 `init_forward_metadata_decode` 已经在 per-forward 级别调用（不是 per-layer）。
+- **结论**: 静态分析 agent 误判。metadata 已正确在 forward 级别计算，无需优化。
+
+### P1 #14: EAGLE verify buffer 预分配 → ⚠️ N/A
+- **发现**: CG 路径已预分配 `cuda_graph_custom_mask`（deepseek_v4_backend.py:1529）。EAGLE verify 通过 `get_verify_buffers_to_fill_after_draft()` 获取预分配的 buffer。
+- **结论**: 已实现，无需改动。
+
+### P1 #15: grammar mask 异步生成 → ⚠️ N/A
+- **发现**: `.cpu()` 同步只在 `batch.has_grammar=True` 时发生。我们的 benchmark 不使用 grammar constraints。
+- **结论**: 对当前场景无影响。
+
+### P1 #9: indexer compressor Triton 融合 → ❌ 不可行（简单方式）
+- **分析**: compressor 的核心是 `compute_kv_score`（wkv_gate GEMM）→ `forward_compress`（norm + rope + quantize）。
+- **结论**: GEMM + epilogue 融合需要自定义 GEMM kernel（类似 CUTLASS 的 epilogue fusion），不是简单的 Triton elementwise 融合。属于 P2 级别的 kernel 工程。
+
+### P1 #10: indexer logits + topk 融合 → ❌ 编译超时
+- **分析**: 写了 Triton topk512 kernel（`dl_topk512_triton.py`），但 `tl.static_range(TOPK)` 导致 DLIN Triton 编译器 IR 爆炸（同 MHC static_range bug）。
+- **结论**: 需要完全不同的 topk 算法（如 bitonic sort），不能用 sequential argmax。属于 P2 级别。
+
+### P1 #11: MLA projection 融合 → ❌ 需要 GEMM+epilogue kernel
+- **分析**: wq_b/wkv 是 GEMM（cuDNN/dlblas），不能简单 fuse norm+rope 到 GEMM 后面而不写自定义 GEMM epilogue。
+- **结论**: 需要自定义 GEMM+norm+rope fusion kernel。属于 P2 级别。
+
+### P1 #16: scheduler recv_requests 异步化 → ❌ 架构级改动
+- **分析**: sglang 的 `event_loop_overlap` 已经将 result processing 与下一步 GPU 重叠。但 `recv_requests()` 是阻塞调用。
+- **结论**: 需要改为 async ZMQ recv + 下一步 GPU 并行。涉及 scheduler 核心循环重构。属于 P2 级别。
+
+### P1 总结
+- **已实施**: 1 项（#12 FP8 scale 全路径缓存）
+- **N/A**: 4 项（#13 #14 #15 已实现/不适用，#16 已被 overlap scheduler 部分覆盖）
+- **需 P2 级 kernel 工程**: 3 项（#9 #10 #11 都需要自定义 GEMM epilogue 或非 trivial Triton kernel）
+
+**教训**: P1 中"medium difficulty"的评估过于乐观。大多数 fusion 优化需要 GEMM+epilogue 融合（CUTLASS-style），不是简单的 kernel launch 合并。在 DLIN 上，Triton 编译器对复杂 kernel（static_range, 大 TOPK）有编译超时问题。
