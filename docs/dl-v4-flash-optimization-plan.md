@@ -345,3 +345,36 @@ verify (target model, batch=1+num_draft):
 | 20 | DLIN CG stream capture | ❌ 不实施 | DLIN SDK bug，需 SDK 团队修复。 |
 
 **关键成果**: P2 #17 的 Frozen-KV MTP 接口代码已就位。一旦 GPU 可用，运行 `SPEC_ALGO=FROZEN_KV_MTP` 即可测试。如果 accept_length > 2.0（因为 frozen KV 消除了 draft-target KV 不一致），这是突破 20 tps 的最可行路径。
+
+---
+
+## 10. P2 #17 FROZEN_KV_MTP 端到端调试记录（2026-08-06）
+
+### 已修复的 bug（4 轮迭代）
+
+1. **kv_cache_configurator.py:928** — `swa_max_total_num_tokens=None` → 默认 0
+2. **frozen_kv_mtp_worker_v2.py:179** — `MemoryPoolConfig` 缺 SWA/full 字段 → 添加 `swa_max_total_num_tokens=512`
+3. **deepseek_v4.py bind_frozen_kv_context** — `self.model.layers` 不存在（V4 NextN 用 `self.model.decoder`）→ 添加 hasattr 检查
+4. **deepseek_v4.py build_frozen_kv_mtp_context** — 同上 `len(self.model.layers)` → 用 `hasattr` 检查 NextN 结构
+
+### 当前阻塞（第 5 轮）
+
+**Error**: `out_cache_loc` is None in `deepseek_v4_backend.py:677 init_forward_metadata_decode`
+
+**根因**: Frozen-KV MTP draft worker 不拥有 KV cache，所以 `forward_batch.out_cache_loc=None`。
+但 V4 的 attention backend (`DeepseekV4AttnBackend`) 在 `init_forward_metadata_decode`
+中断言 `out_cache_loc.shape[0]`，需要非 None。
+
+**需要的修复**: 在 draft forward_batch 上提供一个 dummy `out_cache_loc`（或让 V4 backend
+在 `is_kv_shared_layer=True` 时跳过 `out_cache_loc` 检查）。
+
+**影响范围**: 这是 V4 attention backend 与 Frozen-KV MTP worker 的集成层。
+V4 backend 有 indexer/compressor/SWA/C4/C128 多个 KV buffer，每个都假设 `out_cache_loc` 非空。
+完整适配需要修改 V4 backend 的 `init_forward_metadata_decode` 和 `forward` 方法。
+
+### 结论
+
+Frozen-KV MTP 接口方法（bind/build/set）已正确实现。init 路径的 4 个 bug 已修复。
+**runtime 集成（draft forward_batch + V4 attention backend）需要更多工作**：
+V4 的复杂 attention backend（indexer + compressor + C4 + C128 + SWA）有多个 KV buffer
+假设，需要逐个适配 frozen-KV 模式。预计需要 1-2 天的集成工作。

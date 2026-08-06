@@ -3175,7 +3175,17 @@ class DeepseekV4ForCausalLM(nn.Module):
     # P2#17: Frozen-KV MTP interface — draft model reuses target's KV cache.
     def bind_frozen_kv_context(self, ctx: "FrozenKVMTPContext") -> None:
         """Bind draft attention to target-owned KV and suppress draft KV writes."""
-        for assistant_logical, layer in enumerate(self.model.layers):
+        # V4 NextN model has self.model.decoder (single layer), not self.model.layers
+        draft_model = self.model
+        if hasattr(draft_model, 'layers'):
+            layers = draft_model.layers
+        elif hasattr(draft_model, 'decoder'):
+            layers = [draft_model.decoder]
+        else:
+            raise AttributeError(
+                f"Cannot find layers in {type(draft_model).__name__} for Frozen-KV MTP bind"
+            )
+        for assistant_logical, layer in enumerate(layers):
             target_phys = ctx.get_physical_layer_id(assistant_logical)
             attn = layer.self_attn
             attn.is_kv_shared_layer = True
@@ -3200,9 +3210,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
 
         num_target_layers = target_model.config.num_hidden_layers
-        # Draft layer 0 → target layer (num_target_layers - 1)
+        # V4 NextN has 1 draft layer (self.model.decoder), not self.model.layers
+        draft_model = self.model
+        if hasattr(draft_model, 'layers'):
+            num_draft_layers = len(draft_model.layers)
+        elif hasattr(draft_model, 'decoder'):
+            num_draft_layers = 1
+        else:
+            num_draft_layers = 1
+        # Map each draft layer to the LAST target layer
         physical: dict = {}
-        for i in range(len(self.model.layers)):
+        for i in range(num_draft_layers):
             physical[i] = num_target_layers - 1
 
         return FrozenKVMTPContext(

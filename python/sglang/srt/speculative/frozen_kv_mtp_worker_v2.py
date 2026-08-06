@@ -177,8 +177,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
         self.draft_pool_config = MemoryPoolConfig(
-            max_total_num_tokens=64,  # Dummy value
+            max_total_num_tokens=512,  # Enough for init; draft reuses target KV at runtime
             max_running_requests=memory_pool_config.max_running_requests,
+            # P2#17: SWA pool must be > 0 for the tp_worker validation
+            # (max_req_len = min(ctx-1, effective_max_total_num_tokens-1)).
+            # Draft reuses target KV at runtime; this just passes init checks.
+            swa_max_total_num_tokens=512,
+            full_max_total_num_tokens=512,
         )
 
         # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
