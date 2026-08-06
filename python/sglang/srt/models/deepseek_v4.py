@@ -153,6 +153,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import is_dlin as _is_dlin_module
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -216,8 +217,12 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
-# SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
-_SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+# SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default ON for DLIN
+# (saves ~15-25% MoE FLOPs in decode by computing shared expert on local tokens).
+_SHARED_EXPERT_LOCAL = get_bool_env_var(
+    "SGLANG_DP_SHARED_EXPERT_LOCAL",
+    default="1" if _is_dlin_module() else "0",
+)
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 

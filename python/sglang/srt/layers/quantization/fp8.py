@@ -2274,10 +2274,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # avoids a captured CUDA kernel in CG).
                 _ti = topk_ids if (topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()) else topk_ids.to(torch.int32).contiguous()
                 _tw = topk_weights if (topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()) else topk_weights.to(torch.float32).contiguous()
-                # DL: GEMMEX=4 — V4 FP4 per-expert via gptq_dlblas_gemmex(quant_type=0,
-                # bit=4), matching vLLM mxfp4_dlblas. Before the mabs call (per-expert
-                # uses topk_ids, not mabs dispatch).
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "4" and M == 1:
+                # DL: GEMMEX paths are opt-in; the default fused path (invoke_fused_moe_opt
+                # with DLEOL_CACHE_SIZE=1024) is already optimal at M=1. GEMMEX=2 measured
+                # 11% SLOWER (14.08 vs 15.83 EAGLE tok/s) due to Python-side weight gather.
+                _dl_moe_gemmex = _os.environ.get("SGLANG_DL_MOE_GEMMEX")
+                if _dl_moe_gemmex == "4" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)
                     _w13_g = layer.w13_weight[_ti1d]
@@ -2311,7 +2312,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # same FP8 GEMM) and produces garbage (routing bug). gptq_dlblas_gemmex is the fast
                 # FP8 GEMM used by the model's linear layers — VERIFIED correct ("Paris!") and CG-
                 # compatible (GPU-indexed gather, no .item() sync). For decode M==1 only.
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "1" and M == 1:
+                if _dl_moe_gemmex == "1" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)  # [topk] — expert ids for this token
                     _w13_g = layer.w13_weight[_ti1d]  # [topk, 2*inter, hidden]
@@ -2332,7 +2333,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     return StandardCombineInput(hidden_states=out)
                 # DL: GEMMEX=2 — BATCHED: stack all topk experts into single GEMM calls
                 # (2 GEMMs per layer instead of 16 → 80 launches instead of 640)
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "2" and M == 1:
+                if _dl_moe_gemmex == "2" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)  # [topk]
                     _w13_cat = layer.w13_weight[_ti1d].reshape(
@@ -2358,7 +2359,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     return StandardCombineInput(hidden_states=out)
                 # DL: GEMMEX=3 — HYBRID: batched w1 (shared input → correct) + per-expert w2
                 # (different hidden per expert → MUST loop). 9 GEMMs/layer (1+8) vs 16 (GEMMEX=1).
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "3" and M == 1:
+                if _dl_moe_gemmex == "3" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)  # [topk]
                     # w1 batched: stack [topk, 2*inter, hidden] → [topk*2*inter, hidden]
