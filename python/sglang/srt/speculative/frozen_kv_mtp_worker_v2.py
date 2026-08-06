@@ -548,6 +548,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         # Seed + recurrent iters share the same `seq_lens - 1` rope position,
         # so one init covers the loop. Must run even at num_steps == 1.
+        # P2#17: V4 attention backend asserts out_cache_loc.shape[0] in
+        # init_forward_metadata_decode. Frozen-KV sets it to None (line 490).
+        # Provide a dummy before metadata init so the shape check passes.
+        if forward_batch.out_cache_loc is None:
+            forward_batch.out_cache_loc = torch.zeros(
+                forward_batch.seq_lens.shape[0], dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
         if forward_batch.needs_forward_metadata_init():
             self._init_frozen_kv_metadata(forward_batch)
 
@@ -565,6 +573,15 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         forward_batch.input_ids = seed_input_ids
         forward_batch.spec_info.hidden_states = seed_prev_hidden
+        # P2#17: V4 attention backend asserts out_cache_loc.shape[0] in
+        # init_forward_metadata_decode. Frozen-KV draft sets it to None (line 490)
+        # because it never writes KV. Provide a dummy so the backend's shape check
+        # passes — the actual write is suppressed by is_kv_shared_layer=True.
+        if forward_batch.out_cache_loc is None:
+            forward_batch.out_cache_loc = torch.zeros(
+                seed_input_ids.shape[0], dtype=torch.int32,
+                device=seed_input_ids.device,
+            )
         # DL begin — Frozen-KV MTP on DLIN: ForwardBatch.init_new borrows the
         # verify-tree-sized out_cache_loc (len = num_draft_tokens+bonus+...) from
         # the ScheduleBatch, but the draft model runner's static token buffer is
