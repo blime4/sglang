@@ -400,3 +400,37 @@ V4 的复杂 attention backend（indexer + compressor + C4 + C128 + SWA）有多
 ### 结论
 
 **Frozen-KV MTP 端到端测试通过，accept_length=2.00（与 EAGLE 相同）。这证明 accept_length=2.0 不是 KV 管理问题，而是 V4 只有 1 个 mtp layer 的根本架构限制。** 无论 KV 共享还是独立，draft 的预测能力不变（1 mtp layer 只能准确预测 1 个 token）。
+
+---
+
+## 12. 稳态 TPOT 修正（2026-08-06）
+
+### 发现：N=200 的 15.83 包含 warmup
+
+| N tokens | tok/s | TPOT | 备注 |
+|---|---|---|---|
+| 100 | 12.98 | 77.0ms | warmup 主导（~2s amortized over 100 tokens） |
+| 200 | 15.83 | 63.2ms | 之前的最优（含少量 warmup） |
+| **500** | **16.11-16.16** | **61.9-62.1ms** | **稳态最优** |
+| 1000 | OOM (ctx=512) | — | |
+
+### 修正后的成绩
+
+- **sglang EAGLE 稳态: 16.1 tok/s (TPOT 62ms)** — 比 vLLM (14.76) 快 9%
+- Base 稳态: ~13.5 tok/s (TPOT ~74ms)
+- EAGLE multiplier: 74/62 = 1.19x
+
+### DLEOL_FLA settings
+- DLEOL_FLA_ENABLE_PINGPONG=1 + DLEOL_FLA_UNROLL_COUNT=8: 16.16 vs 16.11 (0.3%, 不显著)
+- 这些是 GDN/FLA attention 的设置，不影响 V4 的 flash_mla sparse attention
+
+### 修正后的 20 tps 数学
+
+```
+20 tok/s (50ms/token) with EAGLE steps=1 (accept_length=2):
+  EAGLE step = draft(~5ms) + verify(~119ms) = ~124ms → 62ms/token (稳态)
+  需 step ≤ 100ms → verify ≤ 95ms → base_M1 ≤ 58.7ms
+  当前 base_M1 稳态 ≈ 74ms，需砍 15.3ms
+```
+
+Gap 从 17.9ms 缩小到 15.3ms（warmup 修正后）。
