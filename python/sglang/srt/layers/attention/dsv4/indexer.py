@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
 
 import torch
@@ -599,19 +600,22 @@ class C4IndexerBackendMixin:
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
+        from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_idx_t  # DL
         if enable_multi_stream:
-            q_indexer, weights = self._forward_prepare_multi_stream(
-                x=x,
-                q_lora=q_lora,
-                c4_indexer=c4_indexer,
-                positions=positions,
-                forward_batch=forward_batch,
-                alt_streams=alt_streams,
-                q_lora_ready=q_lora_ready,
-            )
+            with _dl_idx_t("idx_prep"):  # DL
+                q_indexer, weights = self._forward_prepare_multi_stream(
+                    x=x,
+                    q_lora=q_lora,
+                    c4_indexer=c4_indexer,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    alt_streams=alt_streams,
+                    q_lora_ready=q_lora_ready,
+                )
         else:
             assert q_lora_ready is None
-            q_indexer, weights = self._forward_prepare_normal(
+            with _dl_idx_t("idx_prep"):  # DL
+                q_indexer, weights = self._forward_prepare_normal(
                 x=x,
                 q_lora=q_lora,
                 c4_indexer=c4_indexer,
@@ -644,13 +648,31 @@ class C4IndexerBackendMixin:
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
             fn = _aiter_fp8_paged_mqa_logits
-        elif is_dlin():
+        elif is_dlin() and os.environ.get("SGLANG_DL_IDX_TRITON"):
+            # DL: custom valid-only Triton kernel (processes ctx_lens entries, not
+            # the padded max_c4_seq_len the DL op grids on). ~3-30x faster at M=1.
+            # See jit_kernel/dsv4/dl_mqa_logits_triton.py.
+            def fn(q, kv_cache, weights, context_lens, block_tables, sched_meta,
+                   max_model_len, clean):
+                from sglang.jit_kernel.dsv4.dl_mqa_logits_triton import (
+                    dl_mqa_logits_triton,
+                )
+                _q = q if isinstance(q, torch.Tensor) else q[0]
+                kv_u8 = kv_cache.reshape(kv_cache.shape[0], -1)
+                logits = dl_mqa_logits_triton(
+                    _q, kv_u8, weights, block_tables,
+                    context_lens.reshape(-1), int(max_model_len),
+                )
+                return logits
+        elif is_dlin() and not os.environ.get("SGLANG_DL_IDX_TORCH"):
             # DL begin: route the V4 indexer to the vendored DL op (the torch
             # fallback is ~400ms/decode-step = the decode bottleneck; deep_gemm is
             # absent on DLIN). Matches vLLM's deep_gemm_patch.fp8_fp4_paged_mqa_logits.
             # FP8 path (V4 KV cache is fp8_e4m3) -> q_scale=None. schedule_metadata
             # (deep_gemm_metadata) is None on DLIN; the DL op computes SM scheduling
             # internally, so pass an empty int32 placeholder.
+            # SGLANG_DL_IDX_TORCH=1 -> skip this branch, fall through to the
+            # verified torch ref (SGLANG_FP8_PAGED_MQA_LOGITS_TORCH) for A/B test.
             def fn(q, kv_cache, weights, context_lens, block_tables, sched_meta,
                    max_model_len, clean):
                 _q = q if isinstance(q, torch.Tensor) else q[0]
@@ -727,16 +749,17 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            with _dl_idx_t("idx_logits"):  # DL: the fp8_fp4_paged_mqa_logits DL op
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -760,33 +783,34 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
-            topk_transform_512_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
-            topk_transform_512_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
-        else:
-            topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+        with _dl_idx_t("idx_topk"):  # DL: topk page-index transform
+            if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+                topk_transform_512_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+                topk_transform_512_v2(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                )
+            else:
+                topk_transform_512(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[

@@ -3701,6 +3701,8 @@ class ServerArgs:
             # DL begin — on DLIN, torch.compile (decode full) + tc_piecewise (prefill)
             # coexist (verified for dual compile+CG; they wrap different forwards).
             # Don't auto-disable prefill tc_piecewise just because decode compile is on.
+            # DL: torch.compile on DLIN measured 12.89 vs 13.05 without — combo_kernels
+            # fusion does NOT help (DLIN Triton fused code < manual fused kernels). Keep disabled.
             ("full torch.compile mode", lambda: self.enable_torch_compile and not current_platform.is_dlin()),
             # DL end
             ("pipeline parallelism (pp_size > 1)", lambda: self.pp_size > 1),

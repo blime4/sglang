@@ -361,6 +361,11 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
+        # DL: direct accept-rate log. accept_length = 1 + num_correct_drafts/bs.
+        import os as _os
+        if _os.environ.get("SGLANG_DL_SPEC_DEBUG"):
+            print(f"[DL_SPEC_METRICS] bs={bs} num_correct_drafts={num_correct_drafts} "
+                  f"accept_length={1 + num_correct_drafts / max(bs, 1):.2f}", flush=True)
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts

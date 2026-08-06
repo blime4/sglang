@@ -56,7 +56,8 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert server_args.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
-        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+            "FROZEN_KV_MTP",
+        ), f"Only EAGLE, DSPARK, and FROZEN_KV_MTP speculative algorithms are supported for {model_arch}"
         if server_args.speculative_algorithm == "EAGLE":
             assert (
                 server_args.speculative_eagle_topk == 1

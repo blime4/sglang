@@ -2215,6 +2215,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             import os as _os
 
+            # P1#12: cache contiguous weight scales ONCE per layer, BEFORE any path
+            # selection. All DLIN MoE paths (fused, GEMMEX, vLLM-exact) read these
+            # scales. Without caching, .contiguous() runs every forward step =
+            # ~80 redundant copy kernels/step × ~0.04ms = ~3ms TPOT.
+            if _is_dlin() and not hasattr(layer, "_dl_w13s"):
+                layer._dl_w13s = layer.w13_weight_scale_inv.contiguous()
+                layer._dl_w2s = layer.w2_weight_scale_inv.contiguous()
+
             # DL begin — DLIN fused blockwise FP8 MoE (SGLANG_DL_MOE_FUSED=1):
             # Handles BOTH prefill (M>1) and decode (M==1). invoke_fused_moe_opt is the
             # DLIN-native grouped FP8 GEMM (vLLM uses it). With cuda graph, metadata
@@ -2264,20 +2272,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 _G = torch.ops.sgl_kernel.invoke_fused_moe_opt  # DL: ported from _dl_C
                 from sglang.jit_kernel.activation import silu_and_mul as _silu_and_mul
-                # DL: cache contiguous weight scales (do .contiguous() ONCE per layer,
-                # not every forward step — was 80 redundant copy kernels/step × ~0.04ms
-                # = ~3ms TPOT overhead if scales not already contiguous).
-                if not hasattr(layer, "_dl_w13s"):
-                    layer._dl_w13s = layer.w13_weight_scale_inv.contiguous()
-                    layer._dl_w2s = layer.w2_weight_scale_inv.contiguous()
+                # P1#12: scales already cached above (before the fused gate).
                 # DL: skip .to()/.contiguous() if already correct dtype+layout (no-op
                 # avoids a captured CUDA kernel in CG).
                 _ti = topk_ids if (topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()) else topk_ids.to(torch.int32).contiguous()
                 _tw = topk_weights if (topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()) else topk_weights.to(torch.float32).contiguous()
-                # DL: GEMMEX=4 — V4 FP4 per-expert via gptq_dlblas_gemmex(quant_type=0,
-                # bit=4), matching vLLM mxfp4_dlblas. Before the mabs call (per-expert
-                # uses topk_ids, not mabs dispatch).
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "4" and M == 1:
+                # DL: GEMMEX paths are opt-in; the default fused path (invoke_fused_moe_opt
+                # with DLEOL_CACHE_SIZE=1024) is already optimal at M=1. GEMMEX=2 measured
+                # 11% SLOWER (14.08 vs 15.83 EAGLE tok/s) due to Python-side weight gather.
+                _dl_moe_gemmex = _os.environ.get("SGLANG_DL_MOE_GEMMEX")
+                if _dl_moe_gemmex == "4" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)
                     _w13_g = layer.w13_weight[_ti1d]
@@ -2311,7 +2315,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 # same FP8 GEMM) and produces garbage (routing bug). gptq_dlblas_gemmex is the fast
                 # FP8 GEMM used by the model's linear layers — VERIFIED correct ("Paris!") and CG-
                 # compatible (GPU-indexed gather, no .item() sync). For decode M==1 only.
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "1" and M == 1:
+                if _dl_moe_gemmex == "1" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)  # [topk] — expert ids for this token
                     _w13_g = layer.w13_weight[_ti1d]  # [topk, 2*inter, hidden]
@@ -2332,7 +2336,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     return StandardCombineInput(hidden_states=out)
                 # DL: GEMMEX=2 — BATCHED: stack all topk experts into single GEMM calls
                 # (2 GEMMs per layer instead of 16 → 80 launches instead of 640)
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "2" and M == 1:
+                if _dl_moe_gemmex == "2" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)  # [topk]
                     _w13_cat = layer.w13_weight[_ti1d].reshape(
@@ -2358,7 +2362,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     return StandardCombineInput(hidden_states=out)
                 # DL: GEMMEX=3 — HYBRID: batched w1 (shared input → correct) + per-expert w2
                 # (different hidden per expert → MUST loop). 9 GEMMs/layer (1+8) vs 16 (GEMMEX=1).
-                if _os.environ.get("SGLANG_DL_MOE_GEMMEX") == "3" and M == 1:
+                if _dl_moe_gemmex == "3" and M == 1:
                     _ensure_dl_C()
                     _ti1d = _ti.reshape(-1)  # [topk]
                     # w1 batched: stack [topk, 2*inter, hidden] → [topk*2*inter, hidden]
@@ -2557,20 +2561,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     or _os.environ.get("SGLANG_DL_MOE_FP4") == "1"
                 )
                 _qf = (False, False, False, True) if _use_mxfp4 else (True, False, False, False)
-                _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
-                   _tw, _ti,
-                   _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
-                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
+                # DL begin — deferred-sync MoE profiling (SGLANG_DL_DECODE_PROFILE=1)
+                from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_t, maybe_flush as _dl_flush
+                with _dl_t("moe_w13"):
+                    _G(x, layer.w13_weight, c13, None, layer._dl_w13s, None,
+                       _tw, _ti,
+                       _srt, _eid, _npp, False, topk, _BM, _BN, _BK,
+                       _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], M)
+                # DL end
                 he = _silu_and_mul(c13.reshape(-1, 2 * inter)).reshape(M, topk, inter)
                 _M2 = M * topk
                 _ti_w2 = _ti.reshape(-1, 1)  # [M*topk, 1]
                 _tw_w2 = _tw.reshape(-1, 1)  # [M*topk, 1]
                 c2 = torch.empty(_M2, 1, hidden, dtype=x.dtype, device=x.device)
                 # DL: pass _srt/_eid/_npp from real mabs (or trivial) for w2 too
-                _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
-                   _tw_w2, _ti_w2.to(torch.int32),
-                   _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
-                   _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
+                # DL begin — deferred-sync MoE profiling
+                with _dl_t("moe_w2"):
+                    _G(he.reshape(_M2, inter), layer.w2_weight, c2, None, layer._dl_w2s, None,
+                       _tw_w2, _ti_w2.to(torch.int32),
+                       _srt, _eid, _npp, True, 1, _BM, _BN, _BK,
+                       _qf[0], _qf[1], _qf[2], _qf[3], [128, 128], _M2)
+                _dl_flush()
+                # DL end
                 out = c2.reshape(M, topk, hidden).sum(dim=1)
                 return StandardCombineInput(hidden_states=out)
                 # DL end (use_moe_cu)
