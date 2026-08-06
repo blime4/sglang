@@ -409,6 +409,9 @@ class MqaAttentionBase(nn.Module):
         self.attn_tp_size: int = attn_tp_size
 
         self.layer_id = layer_id
+        # P2#17: Frozen-KV MTP — when True, layer READS target KV and SKIPS writes.
+        self.is_kv_shared_layer = False
+        self.kv_shared_layer_index: Optional[int] = None
         self.dim = config.hidden_size
         self.hidden_size = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -938,6 +941,9 @@ class MQALayer(MqaAttentionBase):
         do_fused_store = (unified and is_decode) or (
             not unified and self.use_fused_qk_norm_rope
         )
+        # P2#17: Frozen-KV MTP — skip KV writes for shared layers (draft reads target KV)
+        if self.is_kv_shared_layer:
+            do_fused_store = False
 
         if do_fused_store:
             if _is_gfx95_supported:
@@ -1069,8 +1075,9 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             else:
-                self._compute_kv_to_cache(
-                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                if not self.is_kv_shared_layer:
+                    self._compute_kv_to_cache(
+                        x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
                 )
                 kv = None
 
@@ -3164,6 +3171,44 @@ class DeepseekV4ForCausalLM(nn.Module):
         # accessor so this works on both CUDA/HIP and NPU.
         torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
+
+    # P2#17: Frozen-KV MTP interface — draft model reuses target's KV cache.
+    def bind_frozen_kv_context(self, ctx: "FrozenKVMTPContext") -> None:
+        """Bind draft attention to target-owned KV and suppress draft KV writes."""
+        for assistant_logical, layer in enumerate(self.model.layers):
+            target_phys = ctx.get_physical_layer_id(assistant_logical)
+            attn = layer.self_attn
+            attn.is_kv_shared_layer = True
+            attn.kv_shared_layer_index = target_phys
+            # Redirect KV reads to target's layer_id
+            if hasattr(attn, 'attn'):
+                attn.attn.layer_id = target_phys
+            # Indexer reads target's compressed KV
+            if hasattr(attn, 'indexer') and attn.indexer is not None:
+                attn.indexer.layer_id = target_phys
+
+    def build_frozen_kv_mtp_context(
+        self,
+        target_model,
+        target_token_to_kv_pool,
+    ) -> "FrozenKVMTPContext":
+        """Map each draft layer to the target physical layer that owns its K/V.
+
+        V4-Flash: draft (mtp.0) is a single layer architecturally identical to
+        target decoder layers. Map it to the LAST target layer (num_hidden_layers-1).
+        """
+        from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
+
+        num_target_layers = target_model.config.num_hidden_layers
+        # Draft layer 0 → target layer (num_target_layers - 1)
+        physical: dict = {}
+        for i in range(len(self.model.layers)):
+            physical[i] = num_target_layers - 1
+
+        return FrozenKVMTPContext(
+            target_token_to_kv_pool=target_token_to_kv_pool,
+            physical_layer_ids=physical,
+        )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

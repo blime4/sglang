@@ -264,3 +264,84 @@ verify (target model, batch=1+num_draft):
 - **需 P2 级 kernel 工程**: 3 项（#9 #10 #11 都需要自定义 GEMM epilogue 或非 trivial Triton kernel）
 
 **教训**: P1 中"medium difficulty"的评估过于乐观。大多数 fusion 优化需要 GEMM+epilogue 融合（CUTLASS-style），不是简单的 kernel launch 合并。在 DLIN 上，Triton 编译器对复杂 kernel（static_range, 大 TOPK）有编译超时问题。
+
+---
+
+## 9. P2 实施结果（2026-08-06）
+
+### P2 #17: V4 Frozen-KV MTP 接口 → ✅ 已实施（代码层面）
+
+**已实现的代码改动**:
+
+1. **`deepseek_v4.py:411-414`** — DeepseekV4Attention 添加 Frozen-KV 属性:
+   ```python
+   self.is_kv_shared_layer = False
+   self.kv_shared_layer_index: Optional[int] = None
+   ```
+
+2. **`deepseek_v4.py:944-946`** — `_forward_prepare` 中 Frozen-KV 写入抑制:
+   ```python
+   if self.is_kv_shared_layer:
+       do_fused_store = False  # 跳过 fused_qk_norm_rope_store
+   ```
+
+3. **`deepseek_v4.py:1078-1080`** — 非 fused 路径也跳过 KV 写入:
+   ```python
+   if not self.is_kv_shared_layer:
+       self._compute_kv_to_cache(...)
+   ```
+
+4. **`deepseek_v4.py:3168-3205`** — 三个 Frozen-KV MTP 接口方法:
+   - `bind_frozen_kv_context(ctx)` — 设置 draft attention 层的 `is_kv_shared_layer=True` + `kv_shared_layer_index=target_phys`，redirect indexer.layer_id
+   - `build_frozen_kv_mtp_context(target_model, kv_pool)` — 映射 draft layer 0 → target layer N-1
+   - `set_embed_and_head(embed, head)` — 已存在（line 3158）
+
+5. **`deepseek_v4_hook.py:56-59`** — 允许 `FROZEN_KV_MTP` spec algorithm
+
+**验证状态**:
+- ✅ 语法检查通过
+- ✅ Import 成功（方法存在）
+- ⚠️ **未做端到端 GPU 测试**（需要 `SPEC_ALGO=FROZEN_KV_MTP` 实际运行，但上次 OOM 阻止了测试）
+
+**预期效果**:
+- Draft model 不分配/管理独立 KV cache
+- Draft forward 跳过 KV 写入（`store_cache` + `fused_qk_norm_rope_store`）
+- Indexer 读取 target 的 compressed KV（layer_id redirected）
+- 预期节省 3-8ms/verify（draft KV 管理 + 写入开销消除）
+
+**剩余工作（需 GPU 测试）**:
+1. 运行 `SPEC_ALGO=FROZEN_KV_MTP` 端到端测试
+2. 验证 draft attention correctness（`is_kv_shared_layer` + `kv_shared_layer_index`）
+3. 测量 accept_length（可能 > 2.0 因为 frozen KV 消除了 draft-target KV 不一致）
+4. 测量 TPOT 提升
+
+### P2 #18: V4 NextN draft-only forward → ⚠️ 部分实施
+
+**已实现**: Frozen-KV 的 `is_kv_shared_layer` 检查已加入 `_forward_prepare`（P2 #17 的一部分）。当 `is_kv_shared_layer=True` 时，KV 写入被跳过。
+
+**未实现**: Indexer/compressor 在 draft forward 中的跳过。这需要额外的条件检查（`if not self.is_kv_shared_layer:` around indexer/compressor calls in forward path）。
+
+**原因**: 跳过 indexer 需要 draft 层的 attention 不依赖 sparse routing（直接 dense attention 或复用 target 的 page indices）。这需要 attention backend 的支持，不只是 model-level 改动。
+
+### P2 #19: sglang in-process TP mode → ❌ 不实施
+
+**分析**: sglang 的 multi-process 架构（Scheduler subprocess ↔ TokenizerManager subprocess via ZMQ）是核心设计。改为 in-process 需要重构整个调度器，影响所有模型（不只是 V4）。
+
+**结论**: 超出本 session 范围。需 sglang 核心团队评估。
+
+### P2 #20: DLIN CG stream capture for MTP → ❌ 不实施
+
+**分析**: `cudaErrorStreamCaptureInvalidated` 发生在 vLLM MTP CG capture 期间。这是 DLIN SDK 的 stream capture 实现问题（可能与 multi-stream overlap 冲突）。
+
+**结论**: 需要 Denglin SDK 团队修复。sglang 侧无法解决。
+
+### P2 总结
+
+| # | 优化 | 状态 | 详情 |
+|---|---|---|---|
+| 17 | V4 Frozen-KV MTP 接口 | ✅ 代码已实施 | 3 个接口方法 + KV 写入抑制 + hook 允许。待 GPU 测试。 |
+| 18 | NextN draft-only forward | ⚠️ 部分 | KV 写入跳过已实现（#17 一部分）。Indexer/compressor 跳过需 backend 支持。 |
+| 19 | in-process TP mode | ❌ 不实施 | 架构级重构，超出范围。 |
+| 20 | DLIN CG stream capture | ❌ 不实施 | DLIN SDK bug，需 SDK 团队修复。 |
+
+**关键成果**: P2 #17 的 Frozen-KV MTP 接口代码已就位。一旦 GPU 可用，运行 `SPEC_ALGO=FROZEN_KV_MTP` 即可测试。如果 accept_length > 2.0（因为 frozen KV 消除了 draft-target KV 不一致），这是突破 20 tps 的最可行路径。
