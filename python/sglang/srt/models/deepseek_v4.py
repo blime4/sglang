@@ -1628,13 +1628,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         # ~once/step). Zero-cost when SGLANG_DL_DECODE_PROFILE unset.
         from sglang.srt.layers.quantization.dl_moe_profile import maybe_flush as _dl_flush  # DL
         _dl_flush()
-        # DL: one-shot — log the verify batch M (is the bonus reprocessed?)
-        if os.environ.get("SGLANG_DL_SPEC_DEBUG") and not globals().get("_dl_vm_dbg"):
-            globals()["_dl_vm_dbg"] = True
-            _fm = forward_batch.forward_mode
-            print(f"[DL_VERIFY_M] layer0 batch_size={forward_batch.batch_size} "
-                  f"mode={_fm} is_decode={_fm.is_decode()} is_target_verify={getattr(_fm,'is_target_verify',lambda:None)()}",
-                  flush=True)
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:

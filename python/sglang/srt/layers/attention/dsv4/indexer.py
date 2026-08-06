@@ -663,20 +663,6 @@ class C4IndexerBackendMixin:
                     _q, kv_u8, weights, block_tables,
                     context_lens.reshape(-1), int(max_model_len),
                 )
-                if os.environ.get("SGLANG_DL_IDX_TRITON_VERIFY"):
-                    globals()["_dl_ab_n"] = globals().get("_dl_ab_n", 0) + 1
-                    if globals()["_dl_ab_n"] <= 5:
-                        _sm = torch.empty(0, dtype=torch.int32, device=_q.device)
-                        ref = torch.ops.sgl_kernel.fp8_fp4_paged_mqa_logits(
-                            _q.contiguous(), None, kv_cache, weights.float(),
-                            context_lens, block_tables, _sm,
-                            int(max_model_len), clean,
-                        )
-                        md = (logits.float() - ref.float()).abs()
-                        print(f"[DL_IDX_AB #{globals()['_dl_ab_n']}] "
-                              f"max_diff={md.max():.4f} mean={md.mean():.6f} "
-                              f"triton_sum={logits.sum():.3f} ref_sum={ref.sum():.3f}",
-                              flush=True)
                 return logits
         elif is_dlin() and not os.environ.get("SGLANG_DL_IDX_TORCH"):
             # DL begin: route the V4 indexer to the vendored DL op (the torch
