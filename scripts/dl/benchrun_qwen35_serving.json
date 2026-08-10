@@ -1,0 +1,5 @@
+{
+  "server_params": {"tensor_parallel_size":2,"attention_backend":"fa3","page_size":16,"dtype":"bfloat16","mem_fraction_static":0.60,"disable_cuda_graph":false,"chunked_prefill_size":16,"cuda_graph_max_bs":2,"trust_remote_code":""},
+  "client_params": {"dataset_name":"random-ids","random_input_len":[512],"random_output_len":[128],"num_prompts":[8],"temperature":0,"max_concurrency":[1],"profile":[false]},
+  "fixed_params": {"mode":"serving","model":"/LocalRun/xi.chen/Qwen3.5-35B-A3B-FP8","port":30001,"time_out":700,"output_file":"benchrun_result_sg.json","output_dir":"/tmp/sg_br_out","ci_log_format":false,"output_json_format":false}
+}
