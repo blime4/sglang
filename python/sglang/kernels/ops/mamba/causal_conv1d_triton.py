@@ -988,6 +988,8 @@ def _causal_conv1d_update_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+# DL: compile _causal_conv1d_update_kernel (arg-order/USE_GDC constexpr mismatch with
+# DL: triton_kernel_wrap.generate_ttir — breaks enable_torch_compile/tc_piecewise on
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1133,7 +1135,13 @@ def causal_conv1d_update(
     else:
         stride_retrieve_parent_token_seq = stride_retrieve_parent_token_token = 0
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # DL begin — pass USE_GDC as an EXPLICIT constexpr (not via **pdl_kwargs) so
+    # torch.compile's triton_kernel_wrap.generate_ttir sees it provided. The old
+    # `**pdl_kwargs` dict (empty on DLIN since is_arch_support_pdl()==False) left
+    # USE_GDC unset, which broke enable_torch_compile (the known arg-order/USE_GDC
+    # mismatch documented at the causal_conv1d_update comment). launch_pdl is a
+    # launcher kwarg (triton-side), kept conditional.
+    _dl_supports_pdl = is_arch_support_pdl()
 
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
@@ -1194,7 +1202,9 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
-        **pdl_kwargs,
+        USE_GDC=_dl_supports_pdl,  # DL: explicit constexpr for torch.compile
+        **({"launch_pdl": True} if _dl_supports_pdl else {}),
+        # DL end
     )
     if unsqueeze:
         out = out.squeeze(-1)

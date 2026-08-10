@@ -159,8 +159,69 @@ inline auto dtype_bytes(DLDataType dtype) -> std::size_t {
   return static_cast<std::size_t>(dtype.bits / 8);
 }
 
+// DL begin
+#if defined(SGL_ON_DLIN)
+// clang-15 + libstdc++-12 cannot compile C++20 std::ranges. Provide a minimal
+// non-ranges shim covering only the operations the JIT headers use (utils.h,
+// tensor.h, ffi.h): plain std:: algorithms + a simple iota range.
+#include <algorithm>
+namespace stdr {
+template <typename R>
+inline bool empty(R& r) {
+  return r.begin() == r.end();
+}
+template <typename R>
+inline auto begin(R& r) {
+  return r.begin();
+}
+template <typename R>
+inline auto end(R& r) {
+  return r.end();
+}
+template <typename R, typename V>
+inline auto find(R& r, const V& v) {
+  return ::std::find(r.begin(), r.end(), v);
+}
+template <typename R, typename F>
+inline bool any_of(R& r, F&& f) {
+  return ::std::any_of(r.begin(), r.end(), ::std::forward<F>(f));
+}
+template <typename R>
+inline auto max(R& r) {
+  return *::std::max_element(r.begin(), r.end());
+}
+template <typename I, typename N, typename O>
+inline auto copy_n(I first, N n, O out) {
+  return ::std::copy_n(first, n, out);
+}
+}  // namespace stdr
+namespace stdv {
+template <typename T>
+struct iota_view {
+  T cur_, end_;
+  struct iter {
+    T v;
+    T operator*() const { return v; }
+    iter& operator++() {
+      ++v;
+      return *this;
+    }
+    bool operator!=(const iter& o) const { return v != o.v; }
+  };
+  iota_view(T s, T e) : cur_(s), end_(e) {}
+  iter begin() const { return {cur_}; }
+  iter end() const { return {end_}; }
+};
+template <typename T>
+inline iota_view<T> iota(T start, T end) {
+  return iota_view<T>(start, end);
+}
+}  // namespace stdv
+#else
+// DL end
 namespace stdr = std::ranges;
 namespace stdv = stdr::views;
+#endif
 
 /// \brief Python-style integer range: `irange(n)` -> `[0, n)`.
 template <std::integral T>

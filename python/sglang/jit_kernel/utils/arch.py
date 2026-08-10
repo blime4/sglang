@@ -18,6 +18,34 @@ from sglang.srt.utils.common import get_cuda_version
 
 logger = logging.getLogger(__name__)
 
+# DL begin — shim triton Hopper-PDL primitives (tl.extra.cuda.gdc_wait /
+# gdc_launch_dependents) ABSENT in DLIN Triton. Lives here because the FLA/conv/ssm
+# kernels import is_arch_support_pdl from this module — so the inductor compile
+# subprocess (which re-imports triton fresh, losing main-process monkeypatches)
+# picks the shim up. The kernels reference these inside `if USE_GDC:` branches;
+# inductor generates TTIR for the whole kernel, so gdc_wait gets called — provide
+# @triton.jit no-op device functions (lower to nothing). At runtime USE_GDC=False
+# on DLIN so the branch is skipped.
+try:
+    import triton as _dl_triton
+    import triton.language.extra.cuda as _dl_tl_cuda_extra
+
+    @_dl_triton.jit
+    def _dl_gdc_wait():
+        pass
+
+    @_dl_triton.jit
+    def _dl_gdc_launch_dependents():
+        pass
+
+    if not hasattr(_dl_tl_cuda_extra, "gdc_wait"):
+        _dl_tl_cuda_extra.gdc_wait = _dl_gdc_wait
+    if not hasattr(_dl_tl_cuda_extra, "gdc_launch_dependents"):
+        _dl_tl_cuda_extra.gdc_launch_dependents = _dl_gdc_launch_dependents
+except Exception:
+    pass
+# DL end
+
 
 @dataclass
 class ArchInfo:
@@ -86,6 +114,15 @@ def get_default_target_flags() -> List[str]:
             flags.append("-DHIP_FP8_TYPE_E4M3=1")
         return flags
     else:
+        # DL begin
+        # DLIN's dlcc: no nvcc-only `--expt-relaxed-constexpr`; the JIT shared
+        # header needs SGL_CUDA_ARCH=700 (dlgput64 __CUDA_ARCH__) and SGL_ON_DLIN
+        # to take the DLIN launch path (no cudaLaunchKernelEx / cluster / PDL).
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+
+        if _is_dlin():
+            return ["-DSGL_CUDA_ARCH=700", "-DSGL_ON_DLIN=1", "-std=c++20", "-O3"]
+        # DL end
         return [
             get_jit_cuda_arch().jit_flag,
             "-std=c++20",
@@ -116,4 +153,14 @@ def get_jit_cuda_arch() -> ArchInfo:
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
+    # DL begin: DLIN has no Hopper PDL — gdc_wait/gdc_launch_dependents are absent
+    # from DLIN Triton, so the FLA linear-attn kernels must compile without GDC.
+    try:
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+
+        if _is_dlin():
+            return False
+    except Exception:
+        pass
+    # DL end
     return get_jit_cuda_arch().major >= 9

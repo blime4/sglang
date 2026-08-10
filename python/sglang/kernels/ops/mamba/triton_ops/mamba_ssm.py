@@ -495,7 +495,8 @@ def selective_state_update(
         else None
     )
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # DL: explicit USE_GDC constexpr (not **pdl_kwargs) for torch.compile compat.
+    _dl_supports_pdl = is_arch_support_pdl()  # DL:
 
     with torch.get_device_module(x.device).device(x.device.index):
         _selective_scan_update_kernel[grid](
@@ -564,5 +565,6 @@ def selective_state_update(
             USE_RS_ROUNDING=enable_stochastic_rounding,
             PHILOX_ROUNDS=cache_philox_rounds,
             num_warps=num_warps,
-            **pdl_kwargs,
+            USE_GDC=_dl_supports_pdl,  # DL:
+            **({"launch_pdl": True} if _dl_supports_pdl else {}),  # DL:
         )

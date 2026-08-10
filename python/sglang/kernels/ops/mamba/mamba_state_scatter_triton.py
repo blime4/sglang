@@ -41,8 +41,11 @@ def track_mamba_state_if_needed_kernel(
     track_mask = tl.load(mamba_track_mask_ptr + batch_idx)
 
     # Early exit if we don't need to track
-    if not track_mask:
+    # DL begin: DLIN Triton rejects the implicit int64->bool bitcast in `if not <int64>:`
+    # ("Cannot bitcast data-type of size 8 to size 1"). Use an explicit equality compare.
+    if track_mask == 0:
         return
+    # DL end
 
     # Cast indices to int64 before they multiply the row stride. The
     # page-granularity envelope layout makes the conv/ssm row stride large

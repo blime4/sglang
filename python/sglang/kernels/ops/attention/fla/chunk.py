@@ -10,6 +10,13 @@ from einops import rearrange
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
+# DL: unfused intra ops (vLLM's algorithm) — used when SGLANG_DL_CHUNK_UNFUSED=1
+# to bypass the fused chunk_gated_delta_rule_fwd_intra (suspected quality bug).
+from sglang.kernels.ops.attention.fla.chunk_scaled_dot_kkt import (
+    chunk_scaled_dot_kkt_fwd as _dl_kkt,
+)
+from sglang.kernels.ops.attention.fla.solve_tril import solve_tril as _dl_solve_tril
+from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd as _dl_recompute_w_u
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
@@ -50,14 +57,26 @@ def chunk_gated_delta_rule_fwd(
     )
 
     # fused kkt + solve_tril + recompute_w_u
-    w, u, A = chunk_gated_delta_rule_fwd_intra(
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
+    # DL: SGLANG_DL_CHUNK_UNFUSED=1 → use vLLM's 3-op unfused intra (kkt+solve_tril+
+    # recompute_w_u) instead of the fused chunk_gated_delta_rule_fwd_intra, which is
+    # suspected to diverge from vLLM → wrong first token. g is already cumsum'd above.
+    import os as _os
+    if _os.environ.get("SGLANG_DL_CHUNK_UNFUSED"):
+        A = _dl_kkt(k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens)
+        A = _dl_solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = _dl_recompute_w_u(
+            k=k, v=v, beta=beta, g_cumsum=g, A=A,
+            cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        )
+    else:
+        w, u, A = chunk_gated_delta_rule_fwd_intra(
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,

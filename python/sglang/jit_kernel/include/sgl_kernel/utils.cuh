@@ -115,7 +115,10 @@ namespace device {
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
-#if defined(__CUDA_ARCH__)
+#if defined(__CUDA_ARCH__) && !defined(SGL_ON_DLIN)
+// DL: skipped on DLIN — dlgput64/dlgpux64 map __CUDA_ARCH__ to 700/800
+// respectively, which need not equal the injected SGL_CUDA_ARCH (used only for
+// arch gating, where 700 == pre-Hopper is correct for both DLIN variants).
 static_assert(
     __CUDA_ARCH__ == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
 #endif
@@ -279,8 +282,13 @@ struct LaunchKernel {
       DLDevice device,
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
+#if defined(SGL_ON_DLIN)
+      : m_grid(grid_dim), m_block(block_dim), m_stream(resolve_device(device)),
+        m_smem(dynamic_shared_mem_bytes), m_location(location) {}
+#else
       : m_config(s_make_config(grid_dim, block_dim, resolve_device(device), dynamic_shared_mem_bytes)),
         m_location(location) {}
+#endif
 
   explicit LaunchKernel(
       dim3 grid_dim,
@@ -288,7 +296,12 @@ struct LaunchKernel {
       cudaStream_t stream,
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
+#if defined(SGL_ON_DLIN)
+      : m_grid(grid_dim), m_block(block_dim), m_stream(stream),
+        m_smem(dynamic_shared_mem_bytes), m_location(location) {}
+#else
       : m_config(s_make_config(grid_dim, block_dim, stream, dynamic_shared_mem_bytes)), m_location(location) {}
+#endif
 
   LaunchKernel(const LaunchKernel&) = delete;
   LaunchKernel& operator=(const LaunchKernel&) = delete;
@@ -298,7 +311,10 @@ struct LaunchKernel {
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
-#ifdef USE_ROCM
+#if defined(SGL_ON_DLIN)
+    // DL: no PDL (programmatic dependent launch) on DLIN; no-op.
+    (void)enabled;
+#elif defined(USE_ROCM)
     (void)enabled;
     m_config.numAttrs = 0;
 #else
@@ -313,7 +329,10 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
-#ifdef USE_ROCM
+#if defined(SGL_ON_DLIN)
+    // DL: no cluster launch on DLIN; no-op.
+    (void)cluster_dim;
+#elif defined(USE_ROCM)
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
@@ -340,7 +359,16 @@ struct LaunchKernel {
 
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
-#ifdef USE_ROCM
+#if defined(SGL_ON_DLIN)
+    // DL: DLIN lacks cudaLaunchKernelEx; launch via the C cudaLaunchKernel with
+    // packed arg pointers (no PDL/cluster attributes).
+    void* arg_ptrs[sizeof...(Args)] = {(void*)std::addressof(args)...};
+    RuntimeDeviceCheck(
+        ::cudaLaunchKernel(
+            reinterpret_cast<const void*>(kernel), m_grid, m_block, arg_ptrs,
+            static_cast<std::size_t>(m_smem), m_stream),
+        m_location);
+#elif defined(USE_ROCM)
     hipLaunchKernelGGL(
         std::forward<T>(kernel),
         m_config.gridDim,
@@ -360,6 +388,7 @@ struct LaunchKernel {
   }
 
  private:
+#if !defined(SGL_ON_DLIN)
   static auto s_make_config(  // Make a config for kernel launch
       dim3 grid_dim,
       dim3 block_dim,
@@ -373,10 +402,18 @@ struct LaunchKernel {
     config.numAttrs = 0;
     return config;
   }
+#endif
 
+#if defined(SGL_ON_DLIN)
+  dim3 m_grid;
+  dim3 m_block;
+  cudaStream_t m_stream;
+  std::size_t m_smem;
+#else
   cudaLaunchConfig_t m_config;
-  const DebugInfo m_location;
   cudaLaunchAttribute m_attrs[2];
+#endif
+  const DebugInfo m_location;
 };
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
