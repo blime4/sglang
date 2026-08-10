@@ -367,6 +367,10 @@ class Flags(_FlagGroupBase):
     by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
     """
 
+    # Set for the duration of decode/spec graph capture (model_capture_mode).
+    # While set, dispose_tensor() is a no-op so deep_gemm's pre-permute does not
+    # free hidden_states that the dual-stream MoE shared expert reads afterward.
+    disable_dispose_tensor: bool = False
     capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
     moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)

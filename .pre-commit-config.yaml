@@ -117,6 +117,14 @@ repos:
         language: system
         files: ^experimental/sgl-router/.*\.rs$
         pass_filenames: false
+      # DL begin
+      - id: dl-markers
+        name: DLIN marker check (# DL begin/end)
+        entry: python3 scripts/dl/check_dl_markers.py
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      # DL end
       - id: mint-broken-links
         name: check docs_new links (Mintlify; opt-in, requires `mint` on PATH)
         entry: bash -c 'cd docs_new && mint broken-links --check-anchors --check-redirects'

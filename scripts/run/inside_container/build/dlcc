@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_DLCC="$(which dlcc)"
+CCACHE="$(which ccache)"
+
+for arg in "$@"; do
+  case "$arg" in
+    -M|-MM)
+      exec "$REAL_DLCC" "$@"
+      ;;
+  esac
+done
+
+exec "$CCACHE" "$REAL_DLCC" "$@"

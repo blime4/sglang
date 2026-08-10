@@ -20,6 +20,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
+# DL begin
+from sglang.srt.platforms.dlin import DlinSRTPlatform
+# DL end
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
@@ -31,6 +34,19 @@ _current_platform: SRTPlatform | None = None
 
 def _is_cuda_available() -> bool:
     return bool(torch.cuda.is_available() and torch.version.hip is None)
+
+
+# DL begin
+def _is_dlin_available() -> bool:
+    # DLIN is CUDA-shaped, so this must be checked BEFORE _is_cuda_available()
+    # in the fallback chain (otherwise a DLIN box resolves to CudaSRTPlatform).
+    # Inlined (not via common.is_dlin) to avoid a circular import.
+    return bool(
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and getattr(torch.version, "dl", None) is not None
+    )
+# DL end
 
 
 def _is_rocm_available() -> bool:
@@ -116,6 +132,14 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        # DL begin
+        # DLIN is CUDA-shaped: check it before the generic CUDA fallback so a
+        # DLIN box resolves to DlinSRTPlatform (and current_platform.is_dlin()
+        # is True).
+        if _is_dlin_available():
+            logger.debug("DLIN (DLIN) GPU detected. Using DlinSRTPlatform.")
+            return DlinSRTPlatform()
+        # DL end
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."

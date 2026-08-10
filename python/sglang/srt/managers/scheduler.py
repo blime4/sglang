@@ -1496,6 +1496,13 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        # DL begin — allow disabling the WAR barrier (schedule_stream waits for
+        # forward_stream) for A/B. With async-replay's wait_prev handling buffer
+        # safety, the WAR wait may be redundant and add latency.
+        import os as _dl_war_os
+        if _dl_war_os.environ.get("SGLANG_DL_NO_WAR_BARRIER") == "1":
+            self._war_barrier_enabled = False
+        # DL end
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
@@ -1567,8 +1574,24 @@ class Scheduler(
                 break
 
             # Receive requests
+            # DL begin — phase timing: recv_requests + process_input_requests
+            import os as _dl_rc_os
+            _dl_rc_pt = _dl_rc_os.environ.get("SGLANG_DL_PHASE_TIME") == "1"
+            if _dl_rc_pt:
+                import time as _dl_rc_t
+                _dl_rc_t0 = _dl_rc_t.perf_counter()
+            # DL end
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            # DL begin — phase timing tail
+            if _dl_rc_pt:
+                if not hasattr(self, "_dl_recv_times"):
+                    self._dl_recv_times = []
+                self._dl_recv_times.append((_dl_rc_t.perf_counter() - _dl_rc_t0) * 1000)
+                if len(self._dl_recv_times) % 64 == 0:
+                    _ts = sorted(self._dl_recv_times[-64:])
+                    print(f"[DL recv+getbatch] median64={_ts[32]:.3f}ms p90={_ts[57]:.3f}ms", flush=True)
+            # DL end
             if self._engine_paused:
                 continue
 
@@ -1598,12 +1621,36 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # DL begin — time run_batch (includes sync replay + load_batch + sample)
+                import os as _dl_rb_os
+                _dl_rb = _dl_rb_os.environ.get("SGLANG_DL_PHASE_TIME") == "1"
+                if _dl_rb:
+                    import time as _dl_rb_t
+                    _dl_rb_t0 = _dl_rb_t.perf_counter()
                 batch_result = self.run_batch(batch)
+                if _dl_rb:
+                    if not hasattr(self, "_dl_rb_times"):
+                        self._dl_rb_times = []
+                    self._dl_rb_times.append((_dl_rb_t.perf_counter() - _dl_rb_t0) * 1000)
+                    if len(self._dl_rb_times) % 64 == 0:
+                        _ts = sorted(self._dl_rb_times[-64:])
+                        print(f"[DL run_batch] median64={_ts[32]:.3f}ms p90={_ts[57]:.3f}ms max={_ts[-1]:.3f}ms", flush=True)
+                # DL end
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+
+            # DL begin — phase timing in overlap loop (env-gated). run_batch above
+            # includes the (synchronous on DLIN) cudaGraphLaunch; the code below is
+            # the serial host work. Settles how much host time is reclaimable.
+            import os as _dl_pt_os
+            _dl_pt = _dl_pt_os.environ.get("SGLANG_DL_PHASE_TIME") == "1"
+            if _dl_pt:
+                import time as _dl_pt_t
+                _dl_pt_t0 = _dl_pt_t.perf_counter()
+            # DL end
 
             # Process the last batch
             if self.last_batch:
@@ -1617,6 +1664,16 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            # DL begin — phase timing
+            if _dl_pt:
+                if not hasattr(self, "_dl_host_times"):
+                    self._dl_host_times = []
+                self._dl_host_times.append((_dl_pt_t.perf_counter() - _dl_pt_t0) * 1000)
+                if len(self._dl_host_times) % 64 == 0:
+                    _ts = sorted(self._dl_host_times[-64:])
+                    print(f"[DL host-phase] median64={_ts[32]:.3f}ms p90={_ts[57]:.3f}ms max={_ts[-1]:.3f}ms", flush=True)
+            # DL end
 
             # Update last_batch
             self.last_batch = batch
@@ -3324,12 +3381,31 @@ class Scheduler(
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
+                    # DL begin — time wait_stream + resolve (the run_batch overhead)
+                    import os as _dl_wo_os, time as _dl_wo_t
+                    _dl_wo = _dl_wo_os.environ.get("SGLANG_DL_PHASE_TIME") == "1"
+                    if _dl_wo:
+                        _dl_w0 = _dl_wo_t.perf_counter()
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    if _dl_wo:
+                        _dl_w_ms = (_dl_wo_t.perf_counter() - _dl_w0) * 1000
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
+                    if _dl_wo:
+                        _dl_r_ms = (_dl_wo_t.perf_counter() - _dl_w0) * 1000 - _dl_w_ms
+                        if not hasattr(self, "_dl_wait_times"):
+                            self._dl_wait_times = []
+                            self._dl_resolve_times = []
+                        self._dl_wait_times.append(_dl_w_ms)
+                        self._dl_resolve_times.append(_dl_r_ms)
+                        if len(self._dl_wait_times) % 64 == 0:
+                            _sw = sorted(self._dl_wait_times[-64:])
+                            _sr = sorted(self._dl_resolve_times[-64:])
+                            print(f"[DL wait_stream] med={_sw[32]:.3f}ms p90={_sw[57]:.3f}ms | [DL resolve] med={_sr[32]:.3f}ms", flush=True)
+                    # DL end
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -3351,6 +3427,21 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        # DL begin — multi-step: advance seq_lens for extra tokens
+                        # before publish, so next iter's prepare_for_decode starts
+                        # at the correct position.
+                        _dl_extra = getattr(batch_result, '_dl_extra_steps', 0)
+                        if _dl_extra > 0:
+                            batch.seq_lens = batch.seq_lens + _dl_extra
+                            if batch.seq_lens_cpu is not None:
+                                batch.seq_lens_cpu = batch.seq_lens_cpu + _dl_extra
+                            if hasattr(batch, 'orig_seq_lens') and batch.orig_seq_lens is not None:
+                                batch.orig_seq_lens = batch.orig_seq_lens + _dl_extra
+                            batch.seq_lens_sum = None
+                            for _dl_req in batch.reqs:
+                                _dl_req.decode_batch_idx += _dl_extra
+                                _dl_req.kv_committed_len += _dl_extra
+                        # DL end
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3444,6 +3535,19 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                # DL begin — multi-step: advance seq_lens for extra tokens
+                _dl_extra = getattr(batch_result, '_dl_extra_steps', 0)
+                if _dl_extra > 0:
+                    batch.seq_lens.add_(_dl_extra)
+                    if batch.seq_lens_cpu is not None:
+                        batch.seq_lens_cpu.add_(_dl_extra)
+                    if hasattr(batch, 'orig_seq_lens') and batch.orig_seq_lens is not None:
+                        batch.orig_seq_lens.add_(_dl_extra)
+                    batch.seq_lens_sum = None
+                    for _dl_req in batch.reqs:
+                        _dl_req.decode_batch_idx += _dl_extra
+                        _dl_req.kv_committed_len += _dl_extra
+                # DL end
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -4588,6 +4692,18 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # DL begin — optionally disable Python GC in the scheduler subprocess.
+    # Hypothesis: periodic gc collections cause the ~27ms wall-gap spikes seen
+    # between decode graph replays (median gap 3.2ms but periodic 27ms tails,
+    # ~3ms/step amortized = bulk of the sglang vs vLLM host gap). Gated off by
+    # default; enable with SGLANG_DL_NO_GC=1 for A/B.
+    import os as _dl_gc_os
+    if _dl_gc_os.environ.get("SGLANG_DL_NO_GC") == "1":
+        import gc as _dl_gc
+        _dl_gc.disable()
+        if tp_rank == 0:
+            print("[DL gc] disabled Python gc in scheduler process", flush=True)
+    # DL end
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,

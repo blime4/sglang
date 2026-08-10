@@ -145,6 +145,14 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
+    # DL begin — MTP CG capture passes indices=None for the draft's full-attn
+    # layers (the draft uses its own KV, not the target's out_cache_loc). Use
+    # dummy zeros so store_cache (a compiled TVM kernel) doesn't crash on None.
+    # At replay the real indices are set; during capture only the graph structure
+    # is recorded, so the dummy values are harmless.
+    if indices is None:
+        indices = torch.zeros(k.shape[0], dtype=torch.int32, device=k.device)
+    # DL end
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
             k.view(-1, row_dim),

@@ -91,7 +91,6 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -144,6 +143,29 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 @lru_cache(maxsize=1)
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda is not None
+
+
+# DL begin
+# Denglin (DLIN) DLIN detection. DLIN's patched torch exposes `torch.version.dl`
+# (e.g. "11.7"); upstream torch does not have this attribute. Ensure it always
+# exists so is_dlin() and any direct `torch.version.dl` access is safe on every
+# build. Mirrors vLLM's vllm/torch_dl_version.py shim.
+if not hasattr(torch.version, "dl"):
+    setattr(torch.version, "dl", None)
+
+
+@lru_cache(maxsize=1)
+def is_dlin() -> bool:
+    """True when running on a Denglin (DLIN/DLIN) GPU.
+
+    DLIN is CUDA-shaped: device_type is "cuda", torch.cuda.* works, CUDA_VISIBLE_DEVICES
+    is honored, and is_cuda() is also True. Use is_dlin() to route hot operators to
+    DLIN-optimized implementations (see platforms/dlin.py and DLIN_INTEGRATION_PLAN.md).
+    """
+    return torch.version.dl is not None
+
+
+# DL end
 
 
 @lru_cache(maxsize=1)
@@ -1627,6 +1649,14 @@ def _load_image(
         image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
+            # DL begin
+            # Imported lazily: torchvision's native extension can crash at import
+            # time on some backends (e.g. DLIN, where the torchvision wheel's ABI
+            # mismatches the runtime SDK). Deferring keeps `import sglang` working;
+            # this GPU JPEG path is only reached for image/multimodal inputs.
+            from torchvision.io import decode_jpeg
+            # DL end
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -1855,12 +1885,10 @@ def suppress_noisy_warnings():
 def suppress_other_loggers():
     suppress_noisy_warnings()
 
-    try:
-        from vllm.logger import logger as vllm_default_logger
-    except ImportError:
-        return
-
-    vllm_default_logger.setLevel(logging.WARN)
+    # DL begin: Phase 3 — use stdlib logging instead of importing vllm.logger
+    # (vllm.logger.logger is itself logging.getLogger("vllm"), so this is
+    # equivalent and no longer hard-requires vllm at this call site).
+    logging.getLogger("vllm").setLevel(logging.WARN)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
@@ -1868,6 +1896,7 @@ def suppress_other_loggers():
         logging.WARN
     )
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
+    # DL end
 
 
 _KERNEL_VERSION_CHECK_PACKAGES = frozenset(

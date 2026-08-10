@@ -1,0 +1,40 @@
+--- a/tvm_ffi/cpp/extension.py
++++ b/tvm_ffi/cpp/extension.py
+@@ -170,7 +170,7 @@
+             if len(arch.split(".")) != 2:
+                 raise ValueError(f"Invalid CUDA architecture: {arch}")
+             major, minor = arch.split(".")
+-            flags.append(f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}")
++            flags.append("--cuda-gpu-arch=dlgput64")  # DL: DLIN arch
+         return " ".join(flags)
+     else:
+         try:
+@@ -411,8 +411,8 @@
+             default_cuda_cflags = ["-Xcompiler", "-fPIC", *default_cuda_cflags]
+             default_cuda_cflags += [_get_cuda_target()]
+             default_ldflags += [
+-                "-L{}".format(str(Path(_find_cuda_home()) / "lib64")),
+-                "-lcudart",  # cuda runtime library
++                "-L{}".format(str(Path(_find_cuda_home()) / "lib")),  # DL: DLIN SDK has lib/, not lib64
++                "-lcurt",  # DL: DLIN cuda runtime is libcurt
+             ]
+ 
+     extra_cflags_list = [flag.strip() for flag in extra_cflags]
+@@ -444,7 +444,7 @@
+         if with_hip:
+             ninja.append("nvcc = {}".format(str(Path(_find_rocm_home()) / "bin" / "hipcc")))
+         if with_cuda:
+-            ninja.append("nvcc = {}".format(str(Path(_find_cuda_home()) / "bin" / "nvcc")))
++            ninja.append("nvcc = {}".format(str(Path(_find_cuda_home()) / "bin" / "dlcc")))  # DL: dlcc direct -> host+device ELF .o
+         ninja.append("cuda_cflags = {}".format(" ".join(cuda_cflags)))
+     ninja.append("ldflags = {}".format(" ".join(ldflags)))
+ 
+@@ -479,7 +479,7 @@
+             ninja.append("  command = $nvcc $cuda_cflags -c $in -o $out")
+         else:
+             ninja.append(
+-                "  command = $nvcc  --generate-dependencies-with-compile --dependency-output $out.d $cuda_cflags -c $in -o $out"
++                "  command = $nvcc -MMD -MF $out.d $cuda_cflags -c $in -o $out"  # DL: clang-style deps for dlcc
+             )
+         ninja.append("")
+ 

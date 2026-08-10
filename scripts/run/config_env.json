@@ -1,0 +1,57 @@
+{
+  "docker_images": {
+    "build": {
+      "x86_64": "artifactory.denglin.com:8082/ci-docker-images/c-31:manylinux_2_28-amd64-20260629",
+      "aarch64": "artifactory.denglin.com:8082/ci-docker-images/c-30:manylinux_2_28-aarch64-20260629",
+      "loongarch64": "artifactory.denglin.com:8082/ci-docker-images/c-41:manylinux_2_38-loongarch64-20260629"
+    },
+    "runtime": {
+      "x86_64": {
+        "ubuntu22_04": "artifactory.denglin.com:8082/ci-docker-images/dl_framework/dl-v0.21.0:v0.1"
+      },
+      "aarch64": {
+        "ubuntu22_04": "artifactory.denglin.com:8082/ci-docker-images/r-47:ubuntu22.04-arm64-python3.12-20260611"
+      },
+      "loongarch64": {
+        "openeuler": "artifactory.denglin.com:8082/ci-docker-images/c-41:manylinux_2_38-loongarch64-20260612"
+      }
+    }
+  },
+  "wheel_required": {
+    "build": {
+      "x86_64": [],
+      "aarch64": [],
+      "loongarch64": []
+    },
+    "runtime": {
+      "x86_64": [
+        "torch-2.9.1+dl19.sdk202603121743-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "triton-3.3.0+git0f83b16e-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "sglang-0.5.16-py3-none-any.whl",
+        "torchvision-0.24.1+dl1.sdk202603121743-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "torchaudio-2.9.1+dl9.sdk202603121743-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "flash_attn-2.8.4+dl5.torch291.sdk202603121743-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "xformers-0.0.26.post1+dl25.torch291.sdk202603121743-cp312-cp312-manylinux_2_28_x86_64.whl"
+      ],
+      "aarch64": [
+        "torch-2.9.1+dl19.sdk202603121743-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "triton-3.3.0+git0f83b16e-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "sglang-0.5.16-py3-none-any.whl",
+        "torchvision-0.24.1+dl1.sdk202603121743-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "torchaudio-2.9.1+dl9.sdk202603121743-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "flash_attn-2.8.4+dl5.torch291.sdk202603121743-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "xformers-0.0.26.post1+dl25.torch291.sdk202603121743-cp312-cp312-manylinux_2_28_aarch64.whl"
+      ],
+      "loongarch64": [
+        "torch-2.9.1+dl19.sdk202603121743-cp312-cp312-manylinux_2_38_loongarch64.whl",
+        "triton-3.3.0+git0f83b16e-cp312-cp312-manylinux_2_38_loongarch64.whl",
+        "sglang-0.5.16-py3-none-any.whl",
+        "torchvision-0.24.1+dl3.sdk202603121743-cp312-cp312-manylinux_2_38_loongarch64.whl",
+        "torchaudio-2.9.1+dl10.sdk202603121743-cp312-cp312-manylinux_2_38_loongarch64.whl",
+        "flash_attn-2.8.4+torch291.sdk202603121743-cp312-cp312-manylinux_2_38_loongarch64.whl",
+        "xformers-0.0.26.post1+dl25.torch291.sdk202603121743-cp312-cp312-manylinux_2_38_loongarch64.whl"
+      ]
+    }
+  },
+  "checkpoint_path": "/mars/aebox/LLM/model"
+}

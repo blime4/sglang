@@ -1,0 +1,6 @@
+[submodule ".dlci/devops-scripts"]
+	path = .dlci/devops-scripts
+	url = ../devops-scripts.git
+[submodule "kernel-optimize"]
+	path = kernel-optimize
+	url = ../kernel-optimize.git

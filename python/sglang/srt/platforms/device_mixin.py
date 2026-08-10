@@ -132,6 +132,19 @@ class DeviceMixin:
     def is_mps(self) -> bool:
         return self._enum == PlatformEnum.MPS
 
+    # DL begin
+    def is_dlin(self) -> bool:
+        """True for Denglin (DLIN/DLIN) GPUs.
+
+        DLIN is CUDA-shaped and reuses PlatformEnum.CUDA (so is_cuda() is also
+        True); override this to True on DlinSRTPlatform. Code that needs a
+        DLIN-specific fast path should branch on current_platform.is_dlin().
+        Mirrors vLLM's Platform.is_dl().
+        """
+        return False
+
+    # DL end
+
     def is_cuda_alike(self) -> bool:
         """True for CUDA, ROCm, or MUSA (all expose CUDA-like APIs)."""
         return self._enum in (

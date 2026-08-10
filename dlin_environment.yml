@@ -1,0 +1,95 @@
+# =============================================================================
+# DLIN (DLIN) environment manifest for sglang
+# -----------------------------------------------------------------------------
+# Pin record for the sglang commit below. Use this to:
+#   - reproduce the uv venv (exact DLIN wheels + hashes),
+#   - trace which SDK / wheel build a bug came from.
+#
+# Reproduce:   ./run_sglang.sh setup && ./run_sglang.sh install && ./run_sglang.sh test
+# Full context: DLIN_INTEGRATION_PLAN.md   |   Dep set: python/pyproject_dl.toml (srt_dl)
+# =============================================================================
+# Generated: 2026-06-25
+
+sglang:
+  repo: /LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sglang
+  commit: 5deca2d39ffb6189ee2187dd992fd679a6d4699f        # git rev-parse HEAD
+  short: 5deca2d39f
+  branch: dl-main
+  commit_subject: "[DOC] [NPU] Update features on Ascend NPU (#28643)"
+
+host:
+  hardware: "12× Denglin KS38 QUAD (32 GB each)"
+  driver: "2.3.26 (DL-SMI 12.0)"
+
+sdk:
+  dir: /LocalRun/shaobo.xie/2_Pytorch/docker/test/debug/sdk
+  version: MRrc-4.2.0-202606161052                        # sdk/version.txt (1st line)
+  env_script: "$SDK_DIR/env.sh"
+  # DLIN runtime libs (libhcrt.so, libLLVM-15.so, libcurt.so, libdlblas.so, ...)
+  # all live in $SDK_DIR/lib. LD_LIBRARY_PATH must contain ONLY this dir.
+
+python: "3.12"
+
+indexes:
+  # artifactory method (dl-env skill): dl-pypi-remote is the PyPI proxy (generic
+  # packages); dl-virtual holds the DLIN (+dl/+sdk) wheels.
+  primary:    "http://ext-artifactory.denglin.com:8082/artifactory/api/pypi/dl-pypi-remote/simple"
+  dl_virtual: "http://ext-artifactory.denglin.com:8082/artifactory/api/pypi/dl-virtual/simple"
+  trusted_host: ext-artifactory.denglin.com   # http, not https
+
+# ---------------------------------------------------------------------------
+# Exact DLIN wheels. Install with:  uv pip install <url>   (or spec via dl-virtual)
+# Verify with:                      curl -sL <url> | sha256sum    (compare below)
+# ---------------------------------------------------------------------------
+wheels:
+  - name: torch
+    version: 2.9.1+dl24.sdk202606031721
+    spec: "torch==2.9.1+dl24.sdk202606031721"
+    file: torch-2.9.1+dl24.sdk202606031721-cp312-cp312-manylinux_2_28_x86_64.whl
+    url: "http://ext-artifactory.denglin.com:8082/artifactory/dl-virtual/torch/torch-2.9.1%2Bdl24.sdk202606031721-cp312-cp312-manylinux_2_28_x86_64.whl"
+    sha256: 30f9c6340861e9fb1ac68dcf2b4e785a918e1e722cb30d7864456d42c7409a0e
+    size_mb: 329
+    note: >
+      DLIN-patched torch; exposes torch.version.dl == "11.7" (== the dlcc CUDA
+      compat version). Vanilla upstream 2.9.1 does NOT expose it and must not be
+      used (it also pulls a conflicting libLLVM). Built against SDK sdk202606031721.
+
+  - name: triton
+    version: "3.3.0+git0f83b16e"
+    spec: "triton==3.3.0+git0f83b16e"
+    file: triton-3.3.0+git0f83b16e-cp312-cp312-manylinux_2_28_x86_64.whl
+    url: "http://ext-artifactory.denglin.com:8082/artifactory/sw-triton/V2_SOFTWARE_master_202607201723/cp312-cp312-manylinux_2_28_x86_64/triton-3.3.0%2Bgit0f83b16e-cp312-cp312-manylinux_2_28_x86_64.whl"
+    sha256: TBD
+    note: >
+      DLIN triton 3.3.0 with dlgpu backend — compiles @triton.jit kernels to
+      dlgput64 format that the DLIN driver can load. Without this, Triton kernels
+      produce NVIDIA ELF -> "Unsupported elf format" at CG capture.
+
+  - name: torchvision
+    version: 0.24.1+sdk202606031721
+    spec: "torchvision==0.24.1+sdk202606031721"
+    file: torchvision-0.24.1+sdk202606031721-cp312-cp312-manylinux_2_28_x86_64.whl
+    url: "http://ext-artifactory.denglin.com:8082/artifactory/dl-virtual/torchvision/torchvision-0.24.1%2Bsdk202606031721-cp312-cp312-manylinux_2_28_x86_64.whl"
+    sha256: 9db21ec54141125d858b97347097cdc748dc044c44b6e71de1d9096499a96e04
+    note: >
+      Built vs SDK sdk202606031721. Its _C.so import is made lazy in
+      sglang/srt/utils/common.py (_load_image) so it never blocks `import sglang`
+      on the host runtime; only the GPU JPEG path touches it.
+
+# ---------------------------------------------------------------------------
+runtime:
+  # CRITICAL: overwrite, never prepend. A second SDK lib dir (e.g. a stale
+  # sdk-0401) loads duplicate libhcrt/libLLVM and the DLIN JIT crashes in an LLVM
+  # PassBuilder static initializer on first kernel compile.
+  ld_library_path: "$SDK_DIR/lib"
+  env:
+    DLI_V2: "ON"            # SDK activation flag (env.sh exports it too)
+    CUDA_HOME: "$SDK_DIR"   # so CMake/dlcc + load_utils find the toolkit
+    CUDA_VISIBLE_DEVICES: "0"
+
+# ---------------------------------------------------------------------------
+reproduce:
+  setup:    "./run_sglang.sh setup     # source env.sh; uv venv py3.12; install the 3 wheels + build deps"
+  install:  "./run_sglang.sh install   # editable sglang via python/pyproject_dl.toml (srt_dl)"
+  test:     "./run_sglang.sh test      # gating: torch.version.dl + GPU matmul + import sglang + DlinSRTPlatform"
+  verify_hash: "curl -sL <wheel.url> | sha256sum      # must equal the sha256 field above"

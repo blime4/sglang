@@ -1,0 +1,332 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+    - if: '$CI_COMMIT_TAG'
+      when: always
+    - when: never
+
+variables:
+  SDK_TAG: V2_SOFTWARE_master_202607101443  # Unified SDK version supporting multiple architectures
+  SDK_TYPE: test  # Use test SDK type (extract only, no installation required)
+  GIT_SUBMODULE_STRATEGY: recursive # Enable recursive submodule cloning strategy
+  GIT_DEPTH: "0"             # Full clone so setuptools-scm resolves the real version from tags (avoids 0.0.0.dev fallback + build/smoke name mismatch)
+  GIT_FETCH_TAGS: "true"     # Fetch tags for setuptools-scm version computation
+  PAGES_BRANCH: "gh-pages"
+  # SDK workspace path structure
+  # Add CI_RUNNER_SHORT_TOKEN and CI_CONCURRENT_ID to isolate SDK per runner and concurrent job
+  SDK_STORE_ROOT: "${CI_BUILDS_DIR}/${CI_RUNNER_SHORT_TOKEN}/${CI_PROJECT_PATH_SLUG}/sdk_store/${CI_CONCURRENT_ID}"
+  SDK_WORKSPACE: "${SDK_STORE_ROOT}/${SDK_TAG}"
+  CCACHE_DIR: "${CI_BUILDS_DIR}/${CI_RUNNER_SHORT_TOKEN}/CCACHE"
+  UV_CACHE_DIR: "${CI_BUILDS_DIR}/${CI_RUNNER_SHORT_TOKEN}/UV_CACHE"
+  UV_HTTP_TIMEOUT: "500"
+  SDK_PATH: "${SDK_WORKSPACE}/sdk"
+  export_sglang_whl_path: "${SDK_WORKSPACE}/sdk"
+  # JFrog repository for sglang wheel upload (dl-pypi/<pkg>/)
+  JFROG_SGLANG_REPO: "dl-pypi"
+
+stages:
+  - compile_test_sglang
+  - bundle
+  - deploy
+
+compile_test_sglang:
+  stage: compile_test_sglang
+  tags:
+    - build-x86_64
+  rules:
+    - when: on_success
+  script:
+    - bash .dlci/devops-scripts/tools/check-forbidden-words.sh
+    # Environment check using devops-scripts common script
+    # (includes x86_64 container cleanup pre-check: dlsmi -r → docker stop → kill → restart)
+    - bash .dlci/devops-scripts/linux/check-env.sh
+    # SDK preparation using devops-scripts common script
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    # Pre-download triton wheel to SDK_PATH (outside Docker where JFrog CLI is configured)
+    - bash -c 'source scripts/run/triton_utils.sh && ensure_triton_from_sdk_tag download "${SDK_PATH}" "$(uname -m)" "${SDK_TAG}"'
+    # GitLab automatically clones repository, display current branch and recent commits
+    - "git branch && git log --oneline -n 5"
+    - export REPO_PATH="$CI_PROJECT_DIR"
+    - export SGLANG_USE_LOCAL_MODEL_PATH=/mars/aebox/LLM/model
+    - "echo Starting sglang compilation at: $(pwd)"
+    - "cd ${REPO_PATH}/scripts/commands/build && bash run_build.sh"
+    - "echo Starting tests at: $(pwd)"
+    - "cd ${REPO_PATH}/scripts/commands/unittests && bash run_smoke.sh"
+  after_script:
+    - echo "Adjusting permissions for CI_PROJECT_DIR parent directory..."
+    - sudo chown -R $(id -u):$(id -g) $(dirname $CI_PROJECT_DIR)
+    - echo "Cleaning old wheel packages (keeping only files from last 24 hours)..."
+    - find ${export_sglang_whl_path} -name "sglang*.whl" -mtime +1 -delete 2>/dev/null || true
+    - echo "Processing wheel package..."
+    # Use quotes to prevent shell wildcard expansion, let process_whl.sh handle it
+    - bash ${CI_PROJECT_DIR}/.dlci/process_whl.sh --verbose --output-dir ${CI_PROJECT_DIR}/processed_wheels/${CI_PIPELINE_ID} --sdk-tag ${SDK_TAG} "${export_sglang_whl_path}/sglang-*.whl"
+    # Use command substitution directly instead of temporary file to avoid permission issues
+    - export PROCESSED_WHL=$(find ${CI_PROJECT_DIR}/processed_wheels/${CI_PIPELINE_ID} -name "sglang-*.whl" | head -1)
+    - echo "Found processed wheel:" && echo "$PROCESSED_WHL"
+    - echo "Uploading wheel package:"
+    - bash ${CI_PROJECT_DIR}/.dlci/upload_to_jfrog.sh --verbose "$PROCESSED_WHL"
+  artifacts:
+    when: always
+    paths:
+      - processed_wheels/${CI_PIPELINE_ID}/sglang-*.whl
+      - scripts/run/docker_sglang_build_None.log
+      - scripts/run/docker_sglang_unittests_smoke_unittests.log
+    expire_in: 7 days
+
+compile_test_sglang_aarch64:
+  stage: compile_test_sglang
+  tags:
+    - build-aarch64  # Use aarch64 architecture runner
+  rules:
+    - when: on_success
+  script:
+    # Environment check using devops-scripts common script
+    - bash .dlci/devops-scripts/linux/check-env.sh
+    # SDK preparation using devops-scripts common script
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    # Pre-download triton wheel to SDK_PATH (outside Docker where JFrog CLI is configured)
+    - bash -c 'source scripts/run/triton_utils.sh && ensure_triton_from_sdk_tag download "${SDK_PATH}" "$(uname -m)" "${SDK_TAG}"'
+    # GitLab automatically clones repository, display current branch and recent commits
+    - "git branch && git log --oneline -n 5"
+    - export REPO_PATH="$CI_PROJECT_DIR"
+    - export SGLANG_USE_LOCAL_MODEL_PATH=/mars/aebox/LLM/model
+    - "echo Starting sglang compilation for aarch64 at: $(pwd)"
+    - "cd ${REPO_PATH}/scripts/commands/build && bash run_build.sh"
+    - "echo Starting tests for aarch64 at: $(pwd)"
+    - "cd ${REPO_PATH}/scripts/commands/unittests && bash run_smoke.sh"
+  after_script:
+    - echo "Adjusting permissions for CI_PROJECT_DIR parent directory..."
+    - sudo chown -R $(id -u):$(id -g) $(dirname $CI_PROJECT_DIR)
+    - echo "Cleaning old wheel packages (keeping only files from last 24 hours)..."
+    - find ${export_sglang_whl_path} -name "sglang*.whl" -mtime +1 -delete 2>/dev/null || true
+    - echo "Processing wheel package..."
+    - bash ${CI_PROJECT_DIR}/.dlci/process_whl.sh --verbose --output-dir ${CI_PROJECT_DIR}/processed_wheels/${CI_PIPELINE_ID} --sdk-tag ${SDK_TAG} "${export_sglang_whl_path}/sglang-*.whl"
+    - export PROCESSED_WHL=$(find ${CI_PROJECT_DIR}/processed_wheels/${CI_PIPELINE_ID} -name "sglang-*.whl" | head -1)
+    - echo "Found processed wheel:" && echo "$PROCESSED_WHL"
+    - echo "Uploading wheel package:"
+    - bash ${CI_PROJECT_DIR}/.dlci/upload_to_jfrog.sh --verbose "$PROCESSED_WHL"
+  artifacts:
+    when: always
+    paths:
+      - processed_wheels/${CI_PIPELINE_ID}/sglang-*.whl
+      - scripts/run/docker_sglang_build_None.log
+      - scripts/run/docker_sglang_unittests_smoke_unittests.log
+    expire_in: 7 days
+
+compile_test_sglang_loongarch64:
+  stage: compile_test_sglang
+  tags:
+    - build-loongarch64
+  # loongarch64 is best-effort for now: sglang[srt_dl] pulls outlines →
+  # outlines-core, a Rust extension with no prebuilt loongarch64 wheel on
+  # dl-virtual, and the runtime image has no Rust compiler, so the wheel build
+  # fails ('can't find Rust compiler'). x86_64 + aarch64 fully gate the MR.
+  # Flip to required once outlines-core (or a loong Rust toolchain) is available.
+  allow_failure: true
+  rules:
+    - when: on_success
+  script:
+    - bash .dlci/devops-scripts/linux/check-env.sh
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    # Pre-download triton wheel to SDK_PATH (outside Docker where JFrog CLI is configured)
+    - bash -c 'source scripts/run/triton_utils.sh && ensure_triton_from_sdk_tag download "${SDK_PATH}" "$(uname -m)" "${SDK_TAG}"'
+    - "git branch && git log --oneline -n 5"
+    - export REPO_PATH="$CI_PROJECT_DIR"
+    - export SGLANG_USE_LOCAL_MODEL_PATH=/mars/aebox/LLM/model
+    - "echo Starting sglang compilation for loongarch64 at: $(pwd)"
+    - "cd ${REPO_PATH}/scripts/commands/build && bash run_build.sh"
+    - "echo Starting tests for loongarch64 at: $(pwd)"
+    - "cd ${REPO_PATH}/scripts/commands/unittests && bash run_smoke.sh"
+  after_script:
+    - echo "Adjusting permissions for CI_PROJECT_DIR parent directory..."
+    - sudo chown -R $(id -u):$(id -g) $(dirname $CI_PROJECT_DIR)
+    - echo "Cleaning old wheel packages (keeping only files from last 24 hours)..."
+    - find ${export_sglang_whl_path} -name "sglang*.whl" -mtime +1 -delete 2>/dev/null || true
+    - echo "Processing wheel package..."
+    - bash ${CI_PROJECT_DIR}/.dlci/process_whl.sh --verbose --output-dir ${CI_PROJECT_DIR}/processed_wheels/${CI_PIPELINE_ID} --sdk-tag ${SDK_TAG} "${export_sglang_whl_path}/sglang-*.whl"
+    - export PROCESSED_WHL=$(find ${CI_PROJECT_DIR}/processed_wheels/${CI_PIPELINE_ID} -name "sglang-*.whl" | head -1)
+    - echo "Found processed wheel:" && echo "$PROCESSED_WHL"
+    - echo "Uploading wheel package:"
+    - bash ${CI_PROJECT_DIR}/.dlci/upload_to_jfrog.sh --verbose "$PROCESSED_WHL"
+  variables:
+    DOCKER_REPO_URL: "http://gitlab-ci-token:${CI_JOB_TOKEN}@ext-gitlab.denglin.com:81/software/ci/docker.git"
+  timeout: 6h
+  artifacts:
+    when: always
+    paths:
+      - processed_wheels/${CI_PIPELINE_ID}/sglang-*.whl
+      - scripts/run/docker_sglang_build_None.log
+      - scripts/run/docker_sglang_unittests_smoke_unittests.log
+    expire_in: 7 days
+
+ut_cpu_sglang:
+  stage: compile_test_sglang
+  tags:
+    - build-x86_64
+  # Runs sglang's full CPU UT suite (base-a/b/c-test-cpu, ~371 GPU-free files)
+  # via test/run_suite.py — sglang's base unit-test layer (logic, parsing,
+  # reference impls). Best-effort (allow_failure). Restricted to the
+  # release/default branch so the long (~30min) job doesn't run on every MR
+  # push and congest the shared x86 runner (it was blocking the required
+  # compile_test_sglang gate). Remove allow_failure to gate once stable.
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dl-dev-v0.5.16-release"'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+  script:
+    - bash .dlci/devops-scripts/linux/check-env.sh
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    - bash -c 'source scripts/run/triton_utils.sh && ensure_triton_from_sdk_tag download "${SDK_PATH}" "$(uname -m)" "${SDK_TAG}"'
+    - export REPO_PATH="$CI_PROJECT_DIR"
+    - "cd ${REPO_PATH}/scripts/commands/build && bash run_build.sh"
+    - "cd ${REPO_PATH}/scripts/commands/unittests && bash run_cpu.sh"
+  timeout: 1h 30min
+  artifacts:
+    when: always
+    paths:
+      - scripts/run/docker_sglang_build_None.log
+      - scripts/run/docker_sglang_unittests_cpu_unittests.log
+    expire_in: 7 days
+
+pages:
+  stage: deploy
+  tags:
+    - pages
+  script:
+    - bash .dlci/deploy-docs.sh
+  artifacts:
+    paths:
+      - public
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_TAG
+  after_script:
+    - echo "Documentation deployment completed"
+    - pwd && ls -al
+
+# =============================================================================
+# Tag-triggered .run bundle packaging
+# =============================================================================
+# When a tag is pushed, package the freshly-built sglang wheel together with
+# torch/triton/etc. dependencies into a self-extracting .run installer.
+# Reuses packaging scripts from the devops-scripts submodule.
+#
+# Each bundle job collects deps, creates the .run, and publishes directly to
+# JFrog (no artifact upload — x86_64 bundles exceed GitLab's artifact size
+# limit).
+# =============================================================================
+
+bundle:x86_64:
+  stage: bundle
+  tags:
+    - build-x86_64
+  needs:
+    - job: compile_test_sglang
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - bash .dlci/bundle-run.sh --arch x86_64
+
+bundle:aarch64:
+  stage: bundle
+  tags:
+    - build-aarch64
+  needs:
+    - job: compile_test_sglang_aarch64
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true
+  script:
+    - bash .dlci/bundle-run.sh --arch aarch64
+
+bundle:loongarch64:
+  stage: bundle
+  tags:
+    - build-loongarch64
+  needs:
+    - job: compile_test_sglang_loongarch64
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  allow_failure: true
+  script:
+    - bash .dlci/bundle-run.sh --arch loongarch64
+
+# =============================================================================
+# Retrigger bundle jobs (manual, no compile dependency)
+# =============================================================================
+# Use these jobs to re-run bundle packaging for an existing tag without
+# re-running the full compile+test pipeline.
+#
+# How to use:
+#   1. Trigger a new pipeline on the target tag via GitLab UI or API.
+#   2. In the pipeline, manually start the desired bundle:*:retrigger job.
+#   3. Set CI variable SGLANG_WHL_FILENAME to the sglang wheel filename on JFrog,
+#      e.g. sglang-0.5.16.dev560+g692b5c460.sdk202607101443-cp312-cp312-manylinux_2_28_x86_64.whl
+# =============================================================================
+
+bundle:x86_64:retrigger:
+  stage: bundle
+  tags:
+    - build-x86_64
+  needs: []
+  rules:
+    - when: manual
+      allow_failure: true
+  variables:
+    SGLANG_WHL_FILENAME: ""
+  script:
+    - |
+      if [[ -z "${SGLANG_WHL_FILENAME}" ]]; then
+        echo "ERROR: SGLANG_WHL_FILENAME must be set to the sglang wheel filename on JFrog"
+        echo "  e.g. sglang-0.5.16.dev560+g692b5c460.sdk202607101443-cp312-cp312-manylinux_2_28_x86_64.whl"
+        exit 1
+      fi
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    - bash .dlci/bundle-run.sh --arch x86_64 --sglang-whl-from-jfrog "${SGLANG_WHL_FILENAME}"
+
+bundle:aarch64:retrigger:
+  stage: bundle
+  tags:
+    - build-aarch64
+  needs: []
+  rules:
+    - when: manual
+      allow_failure: true
+  variables:
+    SGLANG_WHL_FILENAME: ""
+  script:
+    - |
+      if [[ -z "${SGLANG_WHL_FILENAME}" ]]; then
+        echo "ERROR: SGLANG_WHL_FILENAME must be set to the sglang wheel filename on JFrog"
+        echo "  e.g. sglang-0.5.16.dev560+g692b5c460.sdk202607101443-cp312-cp312-manylinux_2_28_aarch64.whl"
+        exit 1
+      fi
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    - bash .dlci/bundle-run.sh --arch aarch64 --sglang-whl-from-jfrog "${SGLANG_WHL_FILENAME}"
+
+bundle:loongarch64:retrigger:
+  stage: bundle
+  tags:
+    - build-loongarch64
+  needs: []
+  rules:
+    - when: manual
+      allow_failure: true
+  variables:
+    SGLANG_WHL_FILENAME: ""
+  script:
+    - |
+      if [[ -z "${SGLANG_WHL_FILENAME}" ]]; then
+        echo "ERROR: SGLANG_WHL_FILENAME must be set to the sglang wheel filename on JFrog"
+        echo "  e.g. sglang-0.5.16.dev560+g692b5c460.sdk202607101443-cp312-cp312-manylinux_2_38_loongarch64.whl"
+        exit 1
+      fi
+    - bash .dlci/devops-scripts/common/prepare-sdk.sh
+    - bash .dlci/bundle-run.sh --arch loongarch64 --sglang-whl-from-jfrog "${SGLANG_WHL_FILENAME}"

@@ -925,6 +925,12 @@ class KVCacheConfigurator:
             c4_state_pool_size = c4_state_pool_size
             c128_state_pool_size = c128_state_pool_size
 
+        # P2#17: FROZEN_KV_MTP draft worker — swa_max_total_num_tokens is None
+        # when not hybrid_swa (line 258). DSV4 pool constructor does arithmetic
+        # with it. Default to 0 for draft (draft reuses target KV, no own SWA).
+        if swa_max_total_num_tokens is None:
+            swa_max_total_num_tokens = 0
+
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token

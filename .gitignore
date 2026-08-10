@@ -9,6 +9,14 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
+# DL CI: keep DengLin GitLab CI scripts tracked even though they live under build/ dirs.
+# (Un-ignore the dir first so git traverses into it, then its contents.)
+!requirements/build/
+!requirements/build/**
+!scripts/commands/build/
+!scripts/commands/build/**
+!scripts/run/inside_container/build/
+!scripts/run/inside_container/build/**
 **/develop-eggs/
 **/dist/
 **/downloads/
@@ -128,6 +136,15 @@ celerybeat.pid
 env/
 venv/
 ENV/
+
+# DL begin
+# run_sglang.sh install (python/) and build-kernel (sgl-kernel/) phases back up
+# the CUDA pyproject before swapping in pyproject_dl.toml — transient local
+# artifacts, not source. The glob covers BOTH swap dirs so a regenerated backup
+# is never accidentally git-added. (sgl-kernel/pyproject.toml.cuda-bak was
+# committed once by mistake; removed, and this prevents recurrence.)
+**/pyproject.toml.cuda-bak
+# DL end
 env.bak/
 venv.bak/
 
@@ -283,6 +300,19 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+*.fatbin
+*.fatbin.bak
+
+# DLIN auto-generated AOT compiler rule dumps — never commit (see scripts/run_*)
+*_aot_rules.r
+
+# DLIN local-only dev artifacts — never commit. These are environment / asset
+# files that must exist on disk for local runs (source .../env.sh, model weights,
+# vLLM comparison wheels) but are NOT build dependencies of sglang itself.
+/sdk-dlop-*/
+/vllm-new-overlay/
+/models-dl/
+/whl-for-compare/
 
 # Internal, non-published docs
 internal-docs/

@@ -1,0 +1,48 @@
+# DL begin
+# DLIN (DLIN) build variant for sgl-kernel. Mirrors pyproject_rocm.toml:
+# setuptools backend (NOT scikit-build/CMake — CMake's enable_language(CUDA)
+# can't see dlcc). The actual extension is defined in setup_dl.py (a curated
+# flashinfer/CUTLASS-free source subset compiled with dlcc via torch's
+# dl-aware CUDAExtension). Build via: python setup_dl.py build_ext --inplace
+# (wrapped by run_sglang.sh build-kernel).
+[build-system]
+requires = [
+  "setuptools>=75.0",
+  "torch>=2.8.0",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-kernel"
+version = "0.4.5"
+description = "Kernel Library for SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: GPU :: NVIDIA CUDA"
+]
+dependencies = []
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[tool.wheel]
+exclude = [
+  "dist*",
+  "tests*",
+]
+
+# Package discovery for setuptools backend (no setup.py on this path; the .so is
+# built separately by setup_dl.py and lands in python/sgl_kernel/).
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["sgl_kernel*"]
+
+[tool.setuptools.package-data]
+sgl_kernel = ["*.so"]
+# DL end

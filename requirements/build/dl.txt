@@ -1,0 +1,11 @@
+# sglang DLIN (DLIN) build dependencies.
+# Installed inside the manylinux build container before `python -m build --wheel`.
+# DLIN framework wheels (torch/triton/...) are NOT listed here — they come from
+# scripts/run/config_env.json (wheel_required) and the SDK.
+setuptools>=61.0
+setuptools-scm>=8.0
+wheel
+build
+packaging
+ninja
+cmake
