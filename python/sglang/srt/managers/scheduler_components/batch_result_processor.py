@@ -705,8 +705,23 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             is_spec = not batch.spec_algorithm.is_none()
 
-            req.output_ids.extend(next_token_id)
-            new_accept_len = len(next_token_id)
+            # DL begin — multi-step decode: batch the GPU->CPU transfer into ONE
+            # sync (was N .item() syncs, each stalling the GPU; cost ~N * forward_latency).
+            # When multi-step is active, result._dl_all_token_ids (set in tp_worker)
+            # holds every step's tokens; extend them all at once. Otherwise fall
+            # through to the unified extend path (1 token for non-spec, the verified
+            # run for spec — upstream v0.5.15 collapsed the is_spec branch).
+            _dl_all = getattr(result, '_dl_all_token_ids', None)
+            if _dl_all is not None and i == 0:
+                _dl_ids = torch.stack(
+                    [t[i] if t.dim() > 0 else t.unsqueeze(0) for t in _dl_all]
+                ).tolist()
+                req.output_ids.extend(_dl_ids)
+                new_accept_len = len(_dl_all)
+            else:
+                req.output_ids.extend(next_token_id)
+                new_accept_len = len(next_token_id)
+            # DL end
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
             req.time_stats.set_last_decode_finish_time()

@@ -49,7 +49,9 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
-  const void* __restrict__ ptrs[8];
+  // DL: removed __restrict__ from array member — dlcc (unlike nvcc) rejects
+  // __restrict__ on array elements, treating the type as pointer-to-array.
+  const void* ptrs[8];
 };
 
 struct __align__(16) RankSignals {
@@ -153,10 +155,12 @@ DINLINE O downcast(array_t<float, O::size> val) {
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #ifdef USE_MUSA
   volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-  asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 #else
-  asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+  // DL: replaced NVIDIA PTX (st.release.sys) with portable CUDA builtin.
+  // dlcc rejects PTX inline asm; __threadfence_system provides equivalent
+  // system-scope release semantics (prior writes visible cross-GPU before store).
+  __threadfence_system();
+  *(volatile FlagType*)flag_addr = flag;
 #endif
 }
 
@@ -164,25 +168,22 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
 #ifdef USE_MUSA
   flushInv_byp();
   return (uint32_t)volatile_load((uint32_t*)flag_addr);
-#endif
-
-  FlagType flag;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
 #else
-  asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" : "=r"(flag) : "l"(flag_addr));
-#endif
+  // DL: replaced NVIDIA PTX (ld.acquire.sys) with portable CUDA builtin.
+  FlagType flag = *(volatile FlagType*)flag_addr;
+  __threadfence_system();
   return flag;
+#endif
 }
 
 static DINLINE void st_flag_volatile(FlagType* flag_addr, FlagType flag) {
-  asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
+  // DL: replaced PTX st.volatile.global with plain volatile store.
+  *(volatile FlagType*)flag_addr = flag;
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
-  FlagType flag;
-  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
-  return flag;
+  // DL: replaced PTX ld.volatile.global with plain volatile load.
+  return *(volatile FlagType*)flag_addr;
 }
 
 // is_start: whether this is the very first synchronization barrier.

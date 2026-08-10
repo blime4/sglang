@@ -870,6 +870,15 @@ class GroupCoordinator:
         return out
 
     def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        # DL begin — use torch.distributed.all_reduce (ProcessGroupNCCL) instead
+        # of pynccl. ProcessGroupNCCL has CG integration (records allreduce as a
+        # graph node, optimized replay); pynccl's direct ncclAllReduce has no CG
+        # integration (higher per-call overhead in graph replay).
+        import os as _dl_os
+        if _dl_os.environ.get("SGLANG_DL_USE_DIST_AR") == "1":
+            torch.distributed.all_reduce(input_, group=self.device_group)
+            return
+        # DL end
         pynccl_comm = self.pynccl_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
