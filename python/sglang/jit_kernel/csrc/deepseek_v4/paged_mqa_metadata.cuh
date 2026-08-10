@@ -76,8 +76,16 @@ template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
+#ifdef SGL_ON_DLIN
+    // DL: cudaFuncSetAttribute for >48KB dynamic smem exceeds the DLIN device
+    // limit -> cudaErrorInvalidValue. The metadata kernel's actual smem is
+    // (batch_size+1)*4B (decode batch=1 -> 8B), well within the default 48KB, so
+    // the attribute raise is unnecessary here.
+    return ::cudaSuccess;
+#else
     const auto fptr = std::bit_cast<const void*>(f);
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }

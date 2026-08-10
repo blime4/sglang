@@ -69,7 +69,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_dlin, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -81,6 +81,7 @@ if TYPE_CHECKING:
 _is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_dlin = is_dlin()  # DL: DLIN routes MLA decode to the vendored sgl_kernel op
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,12 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if _is_sm120 or _is_xpu:
         return None
+    # DL begin: DLIN's vendored flash_mla_with_kvcache computes tile scheduling
+    # internally (no flashmla_metadata) — and sgl_kernel.flash_mla (the Python
+    # wrapper) loads the NVIDIA-only flashmla_ops ext -> ImportError on DLIN.
+    if _is_dlin:
+        return None
+    # DL end
     import sgl_kernel.flash_mla as flash_mla
 
     return flash_mla.get_mla_metadata()[0]
@@ -1726,6 +1733,32 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
+            elif _is_dlin:
+                # DL begin: route MLA decode to the vendored dldnn flash_mla_with_kvcache
+                # (raw op — the sgl_kernel.flash_mla Python wrapper loads NVIDIA flashmla_ops).
+                # causal=False in sparse mode (indices provided, block_table/cache_seqlens=None):
+                # causal=True forces a dense-causal path reading the None descriptors -> garbage
+                # across all MLA layers -> gibberish (V4 correctness bug #1). Matches vLLM +
+                # our sm120/NVIDIA paths (which omit causal -> False) and the op docstring.
+                from sglang.srt.layers.quantization.dl_moe_profile import dl_timer as _dl_fk  # DL
+                with _dl_fk("flash_kernel"):  # DL: isolate the MLA kernel vs prep
+                    o = torch.ops.sgl_kernel.flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        block_table=None,
+                        cache_seqlens=None,
+                        head_dim_v=self.head_dim_v,
+                        softmax_scale=self.softmax_scale,
+                        causal=False,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_cache=extra_indices,
+                        topk_length=swa_topk_lengths,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
+                # DL end
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
@@ -1772,7 +1805,25 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        # DL begin: DLIN's vendored sparse-prefill MLA op (raw). The
+        # sgl_kernel.flash_mla Python wrapper loads the NVIDIA flashmla_ops ext
+        # -> ImportError on DLIN. Wrap to match flash_mla_sparse_fwd's (o, _, _) return.
+        if _is_dlin:
+
+            def flash_mla_sparse_fwd(
+                q, kv, indices, sm_scale, d_v, attn_sink=None, topk_length=None, out=None
+            ):
+                return (
+                    torch.ops.sgl_kernel.flash_mla_sparse_prefill_fwd(
+                        q, kv, indices, sm_scale, d_v, attn_sink, topk_length, out
+                    )[0],
+                    None,
+                    None,
+                )
+
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+        # DL end
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)

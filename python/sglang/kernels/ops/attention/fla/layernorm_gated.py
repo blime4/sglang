@@ -254,16 +254,10 @@ def _layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # DL: explicit USE_GDC constexpr (not **pdl_kwargs) for torch.compile compat.
+    _dl_supports_pdl = is_arch_support_pdl()  # DL:
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
-    # in that release — it creates a DynamoConfigPatchProxy that
-    # SourcelessBuilder cannot wrap, causing a hard error under
-    # torch.compile(fullgraph=True).  The device context is a functional no-op
-    # for Triton kernel launches (device is determined by the tensor, not the
-    # surrounding context), so we simply skip it when Dynamo is tracing.
-    # PyTorch main already has the proper fix (XPUDeviceVariable registered in
-    # torch/_dynamo/variables/ctx_manager.py analogous to CUDADeviceVariable).
-    # TODO: remove this branch once we upgrade from PyTorch 2.12.
+    # in that release (no-op on DLIN where torch.compile is disabled).
     device_ctx = (
         nullcontext()
         if x.device.type == "xpu" and torch.compiler.is_compiling()
@@ -292,7 +286,8 @@ def _layer_norm_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
             ACTIVATION=activation,
-            **pdl_kwargs,
+            USE_GDC=_dl_supports_pdl,  # DL:
+            **({"launch_pdl": True} if _dl_supports_pdl else {}),  # DL:
         )
     return out, mean, rstd
 

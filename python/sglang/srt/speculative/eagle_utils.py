@@ -44,6 +44,80 @@ _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
+# DL begin — DLIN sgl_kernel build omits verify_tree_greedy (greedy tree-verify
+# sampler for spec decoding). Direct CPU-offloaded port of VerifyTreeGreedy
+# (sgl-kernel/csrc/speculative/eagle_utils.cu). Tensors are tiny (bs*num_draft),
+# so one batched host transfer + numpy walk beats per-element .item() GPU syncs.
+_DL_TREE_GREEDY_PROBED = None
+
+
+def _dl_tree_greedy_needs_fallback() -> bool:
+    global _DL_TREE_GREEDY_PROBED
+    if _DL_TREE_GREEDY_PROBED is None:
+        try:
+            _ = torch.ops.sgl_kernel.verify_tree_greedy
+            _DL_TREE_GREEDY_PROBED = False
+        except AttributeError:
+            _DL_TREE_GREEDY_PROBED = True
+    return _DL_TREE_GREEDY_PROBED
+
+
+def _verify_tree_greedy_torch(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+):
+    import numpy as _np
+
+    bs, D = candidates.shape
+    S = accept_index.shape[1]
+    dev = predicts.device
+    cand = candidates.reshape(-1).cpu().numpy()
+    ri = retrive_index.reshape(-1).cpu().numpy()
+    rnt = retrive_next_token.reshape(-1).cpu().numpy()
+    rns = retrive_next_sibling.reshape(-1).cpu().numpy()
+    tp = target_predict.reshape(-1).cpu().numpy()
+    pred = predicts.reshape(-1).cpu().numpy().copy()
+    ai = accept_index.cpu().numpy().copy()
+    atn = accept_token_num.cpu().numpy().copy()
+    for bx in range(bs):
+        base = bx * D
+        last = int(ri[base])
+        ai[bx, 0] = last
+        num_acc = 0
+        cur = 0
+        for _j in range(1, S):
+            cur = int(rnt[base + cur])
+            while cur != -1:
+                draft_index = int(ri[base + cur])
+                draft_token = int(cand[base + cur])
+                target_token = int(tp[last])
+                if draft_token == target_token:
+                    pred[last] = target_token
+                    num_acc += 1
+                    ai[bx, num_acc] = draft_index
+                    last = draft_index
+                    break
+                else:
+                    cur = int(rns[base + cur])
+            if cur == -1:
+                break
+        atn[bx] = num_acc
+        pred[last] = int(tp[last])
+    predicts.copy_(torch.as_tensor(pred, dtype=predicts.dtype, device=dev))
+    accept_index.copy_(torch.as_tensor(ai, dtype=accept_index.dtype, device=dev))
+    accept_token_num.copy_(
+        torch.as_tensor(atn, dtype=accept_token_num.dtype, device=dev)
+    )
+
+
+# DL end
+
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
@@ -129,6 +203,106 @@ class TreeMaskMode(IntEnum):
     FULL_MASK = 0
     QLEN_ONLY = 1
     QLEN_ONLY_BITPACKING = 2
+
+
+# DL begin — build_tree_kernel_efficient torch fallback (DLIN sgl_kernel omits the
+# C op). CPU-offloaded port of the build_tree_efficient kernel (FULL_MASK path; the
+# MTP default). See sgl-kernel/csrc/speculative/eagle_utils.cu:34.
+_dl_build_tree_probe = None
+
+
+def _dl_build_tree_needs_fallback() -> bool:
+    global _dl_build_tree_probe
+    if _dl_build_tree_probe is None:
+        try:
+            _ = torch.ops.sgl_kernel.build_tree_kernel_efficient
+            _dl_build_tree_probe = False
+        except AttributeError:
+            _dl_build_tree_probe = True
+    return _dl_build_tree_probe
+
+
+def _build_tree_efficient_torch(
+    parent_list, selected_index, verified_seq_len, tree_mask, positions,
+    retrieve_index, retrieve_next_token, retrieve_next_sibling,
+    topk, depth, draft_token_num, tree_mask_mode,
+):
+    import numpy as _np
+
+    bs = parent_list.shape[0]
+    D = int(draft_token_num)
+    dev = tree_mask.device
+    pl = parent_list.reshape(-1).cpu().numpy()
+    si = selected_index.reshape(-1).cpu().numpy()
+    vsl = verified_seq_len.cpu().numpy()
+    tm = tree_mask.cpu().numpy().copy()
+    pos = positions.reshape(-1).cpu().numpy().copy()
+    ri = retrieve_index.reshape(-1).cpu().numpy().copy()
+    rnt = retrieve_next_token.reshape(-1).cpu().numpy().copy()
+    rns = retrieve_next_sibling.reshape(-1).cpu().numpy().copy()
+    pl_stride = int(topk * (depth - 1) + 1)
+    FULL = int(TreeMaskMode.FULL_MASK)
+    for bid in range(bs):
+        seq_tree_idx = D * D * bid
+        for k in range(bid):
+            seq_tree_idx += int(vsl[k]) * D
+        seq_len = int(vsl[bid])
+        for tid in range(D):
+            if tree_mask_mode == FULL:
+                token_tree_idx = seq_tree_idx + (seq_len + D) * tid + seq_len + 1
+            else:
+                token_tree_idx = D * D * bid + D * tid + 1
+            tm[token_tree_idx - 1] = True
+            for k in range(D - 1):
+                tm[token_tree_idx + k] = False
+            if tid == 0:
+                pos[bid * D] = seq_len
+                for i in range(D - 1, 0, -1):
+                    ri[bid * D + i] = bid * D + i
+                    parent_tb_idx = int(si[bid * (D - 1) + i - 1]) // topk
+                    parent_position = 0
+                    if parent_tb_idx > 0:
+                        parent_token_idx = int(pl[bid * pl_stride + parent_tb_idx])
+                        for pp in range(D):
+                            if int(si[bid * (D - 1) + pp]) == parent_token_idx:
+                                parent_position = pp + 1
+                                break
+                    if parent_position == D:
+                        continue
+                    if rnt[bid * D + parent_position] == -1:
+                        rnt[bid * D + parent_position] = i
+                    else:
+                        origin = rnt[bid * D + parent_position]
+                        rnt[bid * D + parent_position] = i
+                        rns[bid * D + i] = origin
+                ri[bid * D] = bid * D
+            else:
+                cur_position = tid - 1
+                position = 0
+                while True:
+                    position += 1
+                    tm[token_tree_idx + cur_position] = True
+                    parent_tb_idx = int(si[bid * (D - 1) + cur_position]) // topk
+                    if parent_tb_idx == 0:
+                        break
+                    token_idx = int(pl[bid * pl_stride + parent_tb_idx])
+                    nxt = -1
+                    for cp in range(D):
+                        if int(si[bid * (D - 1) + cp]) == token_idx:
+                            nxt = cp
+                            break
+                    if nxt < 0:
+                        break
+                    cur_position = nxt
+                pos[bid * D + tid] = position + seq_len
+    tree_mask.copy_(torch.as_tensor(tm, dtype=tree_mask.dtype, device=dev))
+    positions.copy_(torch.as_tensor(pos, dtype=positions.dtype, device=dev))
+    retrieve_index.copy_(torch.as_tensor(ri, dtype=retrieve_index.dtype, device=dev))
+    retrieve_next_token.copy_(torch.as_tensor(rnt, dtype=retrieve_next_token.dtype, device=dev))
+    retrieve_next_sibling.copy_(torch.as_tensor(rns, dtype=retrieve_next_sibling.dtype, device=dev))
+
+
+# DL end
 
 
 def default_tree_mask_mode() -> TreeMaskMode:
@@ -226,6 +400,17 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    # DL begin — DLIN sgl_kernel omits build_tree_kernel_efficient; use the torch port
+    elif _dl_build_tree_needs_fallback():
+        _build_tree_efficient_torch(
+            parent_list.to(dtype=torch.int64),
+            top_scores_index.to(dtype=torch.int64),
+            seq_lens.to(dtype=torch.int64),
+            tree_mask, positions,
+            retrieve_index, retrieve_next_token, retrieve_next_sibling,
+            int(topk), int(spec_steps), int(num_verify_tokens), int(tree_mask_mode),
+        )
+    # DL end
     elif _is_xpu:
         sgl_build_tree_kernel_triton(
             parent_list,
@@ -374,6 +559,20 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
+    # DL begin — DLIN falls back to the torch port when the sgl_kernel op is absent.
+    if _dl_tree_greedy_needs_fallback():
+        _verify_tree_greedy_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+        return predicts, accept_index, accept_token_num
+    # DL end
     if _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
 
@@ -647,9 +846,76 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    # DL begin — On DLIN, the sampling verify path (tree_speculative_sampling_target_only)
+    # is None (sgl_kernel C++ op missing) and falls back to chain_speculative_sampling_triton
+    # with draft_probs=zeros → always-accept → output = draft's garbage tokens. When this
+    # fallback would produce garbage (DLIN + no rejection sampling), force greedy verify
+    # (argmax match) for correct output. Accept stays at the draft-capacity limit (~10-21%)
+    # but the output is coherent (target's argmax tokens), not garbage.
+    _dl_force_greedy = False
+    if not sampling_info.is_all_greedy:
+        try:
+            torch.ops.sgl_kernel.top_k_renorm_probs  # raises if missing (DLIN)
+        except AttributeError:
+            if not get_global_server_args().speculative_use_rejection_sampling:
+                _dl_force_greedy = True
+    # DL end
+    # DL begin — DLIN fallback forces greedy verify to avoid always-accept garbage output.
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu or _dl_force_greedy:
+    # DL end
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        # DL begin — one-shot debug: dump draft candidates vs target verify argmax.
+        # Answers "does the DRAFT propose coherent tokens, and does the TARGET
+        # verify agree?" — the decisive evidence for greedy low-accept root cause.
+        # Guarded by SGLANG_DL_MTP_DEBUG_VERIFY; fires for the first N verify calls.
+        import os as _os
+        _dl_dbg = _os.environ.get("SGLANG_DL_MTP_DEBUG_VERIFY", "")
+        if _dl_dbg:
+            _n = int(_dl_dbg)
+            if not hasattr(eagle_sample, "_dl_verify_ct"):
+                eagle_sample._dl_verify_ct = 0
+            if eagle_sample._dl_verify_ct < _n:
+                eagle_sample._dl_verify_ct += 1
+                _cand = candidates[0].tolist()
+                _tpred = target_predict[0].tolist()
+                _match = [int(a == b) for a, b in zip(_cand, _tpred)]
+                _pos = (
+                    verify_input.positions.tolist()
+                    if getattr(verify_input, "positions", None) is not None
+                    else None
+                )
+                # Tree mask check: for topk=1 chain, bonus (tree token 0) should
+                # attend to prefix (all True) + itself only (tree row = [1,0,0,...]).
+                # Layout (FULL_MASK): each row = [seq_len prefix + D tree] entries.
+                _cm = getattr(verify_input, "custom_mask", None)
+                _cm_info = None
+                if _cm is not None:
+                    _D = verify_input.draft_token_num
+                    _row_len = None
+                    try:
+                        _cm_cpu = _cm.detach().cpu()
+                        _ntot = _cm_cpu.numel()
+                        _nrows = bs * _D
+                        _row_len = _ntot // _nrows if _nrows else 0
+                        # bonus row = row 0; tree part = last D entries
+                        _bonus_tree = _cm_cpu[_row_len - _D:_row_len].tolist() if _row_len else None
+                        _d0_tree = _cm_cpu[_row_len + _row_len - _D : 2*_row_len].tolist() if _row_len else None
+                    except Exception:
+                        _bonus_tree = _d0_tree = None
+                    _cm_info = f"mask_nelem={_cm.numel()} row_len={_row_len} bonus_tree_row={_bonus_tree} d0_tree_row={_d0_tree}"
+                import sys as _sys
+                print(
+                    f"[DL-MTP-VERIFY#{eagle_sample._dl_verify_ct}] "
+                    f"draft_candidates={_cand} "
+                    f"target_predict={_tpred} "
+                    f"match={_match} "
+                    f"verify_positions={_pos} "
+                    f"{_cm_info} "
+                    f"acc_scaling_penalties={'None' if sampling_info.acc_scaling_penalties is None else 'set'}",
+                    file=_sys.stderr, flush=True,
+                )
+        # DL end
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -662,11 +928,60 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        # DL begin — DLIN sgl_kernel's top_k_renorm_prob Python wrapper imports fine
+        # but calls torch.ops.sgl_kernel.top_k_renorm_probs (C++ op, missing on DLIN).
+        # Probe the C++ op; if absent, use inline torch fallbacks (NOT sampler.py's
+        # which also re-exports the sgl_kernel wrapper).
+        _dl_use_renorm_fallback = None
+        try:
+            _ = torch.ops.sgl_kernel.top_k_renorm_probs
+            _dl_use_renorm_fallback = False
+        except AttributeError:
+            _dl_use_renorm_fallback = True
+
+        if _dl_use_renorm_fallback:
+            def top_k_renorm_prob(probs, top_ks):
+                if not isinstance(top_ks, torch.Tensor):
+                    top_ks = torch.tensor([top_ks] * probs.shape[0], device=probs.device, dtype=torch.int64)
+                out = probs.clone()
+                for i in range(probs.shape[0]):
+                    k = int(top_ks[i].item())
+                    if k <= 0 or k >= probs.shape[1]:
+                        continue
+                    topk_vals, topk_idx = probs[i].topk(k)
+                    mask = torch.zeros_like(probs[i])
+                    mask[topk_idx] = 1.0
+                    out[i] = probs[i] * mask
+                    out[i] = out[i] / out[i].sum()
+                return out
+
+            def top_p_renorm_prob(probs, top_ps):
+                if not isinstance(top_ps, torch.Tensor):
+                    top_ps = torch.tensor([top_ps] * probs.shape[0], device=probs.device, dtype=probs.dtype)
+                out = probs.clone()
+                for i in range(probs.shape[0]):
+                    p = float(top_ps[i].item())
+                    if p >= 1.0:
+                        continue
+                    sorted_vals, sorted_idx = probs[i].sort(descending=True)
+                    cumsum = sorted_vals.cumsum(dim=-1)
+                    mask_vals = (cumsum - sorted_vals) < p
+                    mask = torch.zeros_like(probs[i])
+                    mask[sorted_idx[mask_vals]] = 1.0
+                    out[i] = probs[i] * mask
+                    s = out[i].sum()
+                    if s > 0:
+                        out[i] = out[i] / s
+                return out
+
+            tree_speculative_sampling_target_only = None
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
+        # DL end
 
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
@@ -727,6 +1042,11 @@ def eagle_sample(
             if use_rejection_sampling
             else tree_speculative_sampling_target_only
         )
+        # DL begin — if tree_speculative_sampling_target_only is None (DLIN),
+        # fall back to rejection sampling (chain_speculative_sampling_triton).
+        if sampling_fn is None:
+            sampling_fn = chain_speculative_sampling_triton
+        # DL end
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

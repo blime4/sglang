@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils.common import is_dlin
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,31 @@ def hc_split_sinkhorn(
     eps: float = 1e-6,
 ):
     b, s, _ = mixes.size()
+    # DL begin: tilelang absent on DLIN — torch Sinkhorn port (exact algorithm from
+    # the tilelang hc_split_sinkhorn_kernel; arg indexing matches the kernel). The
+    # nan_to_num guards prevent NaN propagation -> empty/garbage output.
+    if is_dlin():
+        n_mix = (2 + hc_mult) * hc_mult
+        mf = torch.nan_to_num(mixes.reshape(-1, n_mix).float())
+        pre = torch.sigmoid(mf[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+        post = 2 * torch.sigmoid(
+            mf[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+        )
+        comb = mf[:, 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]
+        comb = comb.reshape(-1, hc_mult, hc_mult)
+        comb = torch.exp(comb - comb.max(dim=-1, keepdim=True).values)
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        comb = torch.nan_to_num(comb)
+        return (
+            pre.reshape(b, s, hc_mult).to(mixes.dtype),
+            post.reshape(b, s, hc_mult).to(mixes.dtype),
+            comb.reshape(b, s, hc_mult, hc_mult).to(mixes.dtype),
+        )
+    # DL end
     pre = mixes.new_empty(b, s, hc_mult)
     post = mixes.new_empty(b, s, hc_mult)
     comb = mixes.new_empty(b, s, hc_mult, hc_mult)

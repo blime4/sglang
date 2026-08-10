@@ -55,7 +55,14 @@ def fused_gdn_gating(
     stride_b = b.stride(0)
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+    # DL begin — OPT-3: return beta as bf16 (b.dtype) matching vLLM, eliminating
+    # the per-GDN-layer beta.to(bf16) in DLinGDNKernel.decode (-30 kernels/step).
+    # Gated by SGLANG_DL_GDN_BF16_BETA=1 (default off — needs DLIN JIT fix for
+    # triton kernel output dtype change; see gap report §6).
+    import os as _dl_os
+    _beta_dtype = b.dtype if _dl_os.environ.get("SGLANG_DL_GDN_BF16_BETA") == "1" else torch.float32
+    beta_output = torch.empty(1, batch, num_heads, dtype=_beta_dtype, device=b.device)
+    # DL end
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,

@@ -79,7 +79,12 @@ _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
 if is_cuda():
-    import deep_gemm
+    # DL begin — deep_gemm not available on DLIN; guard import.
+    try:
+        import deep_gemm
+    except ImportError:
+        deep_gemm = None
+    # DL end
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
