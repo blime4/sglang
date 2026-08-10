@@ -788,7 +788,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
+            seq_lens_sum=int(seq_lens_cpu.sum()) if seq_lens_cpu is not None else seq_lens.sum().item(),  # DL: host sum (no D2H sync) — matches tbo_backend.py:195 pattern; .item() was a per-step GPU sync
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=None,
@@ -1069,6 +1069,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.replay()
 
+        # DL begin — one-shot diagnostic: which load_batch path does decode take?
+        import os as _dl_os
+        if _dl_os.environ.get("SGLANG_DL_TRACE_LOADBATCH") == "1":
+            if not hasattr(self, "_dl_lb_ct"):
+                self._dl_lb_ct = 0
+                self._dl_lb_fill = 0
+                self._dl_lb_fast = 0
+            self._dl_lb_ct += 1
+            _fast = not forward_batch.needs_forward_metadata_init()
+            if _fast: self._dl_lb_fast += 1
+            else: self._dl_lb_fill += 1
+            if self._dl_lb_ct <= 80 and self._dl_lb_ct % 20 == 0:
+                print(f"[DL load_batch] step={self._dl_lb_ct} fast={self._dl_lb_fast} fill_from={self._dl_lb_fill} "
+                      f"needs_init={not _fast} bs={forward_batch.batch_size}", flush=True)
+        # DL end
+
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
@@ -1106,6 +1122,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
+
+        # DL begin — bs=1 fast-path: skip fill_from's full Python slot-loop +
+        # grouped foreach_copy_ and write only the scalars that change per step
+        # (input_ids/positions/seq_lens/out_cache_loc/req_pool_indices). For
+        # padded_bs==1 there is no padding to reset and post_fill hooks are
+        # no-ops in our config, so this is a safe subset of fill_from.
+        # Gate: SGLANG_DL_LB_FASTPATH=1. Falls through on any mismatch.
+        import os as _dl_lb_os
+        if (
+            _dl_lb_os.environ.get("SGLANG_DL_LB_FASTPATH") == "1"
+            and raw_bs == 1
+            and self.num_tokens_per_bs == 1
+            and not self.require_mlp_tp_gather
+            and not self.enable_two_batch_overlap
+            and forward_batch.input_ids is not None
+            and forward_batch.out_cache_loc is not None
+        ):
+            try:
+                fb = forward_batch
+                buffers.input_ids[0] = fb.input_ids[0]
+                buffers.positions[0] = fb.positions[0]
+                buffers.seq_lens[0] = fb.seq_lens[0]
+                buffers.out_cache_loc[0] = fb.out_cache_loc[0]
+                if hasattr(fb, "req_pool_indices") and fb.req_pool_indices is not None:
+                    buffers.req_pool_indices[0] = fb.req_pool_indices[0]
+                if hasattr(buffers, "seq_lens_cpu") and buffers.seq_lens_cpu is not None:
+                    buffers.seq_lens_cpu[0] = fb.seq_lens[0]
+                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+                variant_label = self._resolve_lora_variant(forward_batch)
+                stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+                self._replay_graph_key = self._make_graph_key(
+                    self.bs, stream_idx, variant_label
+                )
+                return
+            except Exception:
+                pass  # fall through to fill_from on any error
+        # DL end
 
         if is_ragged:
             raw_num_token = ragged_layout.graph_num_tokens
@@ -1235,6 +1288,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         with timer_ctx, self.backend.replay_session():
+            # DL begin — wait for previous async replay before load_batch touches
+            # the static input buffers (buffer-safety for SGLANG_DL_ASYNC_REPLAY).
+            if hasattr(self.backend, "dl_wait_prev_replay"):
+                self.backend.dl_wait_prev_replay()
+            # DL end
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(

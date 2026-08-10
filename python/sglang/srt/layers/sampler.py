@@ -28,14 +28,64 @@ from sglang.srt.utils.common import (
 )
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    # DL begin
+    # flashinfer and some sgl_kernel renorm ops are not available on DLIN. Guard
+    # the imports so the sampler module still loads; the "pytorch" sampling
+    # backend (top_k_top_p_min_p_sampling_from_probs_torch) handles sampling
+    # without flashinfer. Mirrors the is_musa()/aiter optional-import pattern.
+    try:
+        from flashinfer.sampling import (
+            min_p_sampling_from_probs,
+            top_k_top_p_sampling_from_probs,
+        )
+    except (ImportError, RuntimeError):
+        min_p_sampling_from_probs = None
+        top_k_top_p_sampling_from_probs = None
+    try:
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+        )
+    except (ImportError, AttributeError):
+        # DL begin — DLIN sgl_kernel omits top_k_renorm_prob / top_p_renorm_prob.
+        # Provide torch fallbacks (vectorized, same semantics as sgl_kernel).
+        def top_k_renorm_prob(probs, top_ks):
+            # probs: [bs, vocab], top_ks: [bs] (or scalar)
+            if not isinstance(top_ks, torch.Tensor):
+                top_ks = torch.tensor([top_ks] * probs.shape[0], device=probs.device, dtype=torch.int64)
+            out = probs.clone()
+            for i in range(probs.shape[0]):
+                k = int(top_ks[i].item())
+                if k <= 0 or k >= probs.shape[1]:
+                    continue
+                topk_vals, topk_idx = probs[i].topk(k)
+                mask = torch.zeros_like(probs[i])
+                mask[topk_idx] = 1.0
+                out[i] = probs[i] * mask
+                out[i] = out[i] / out[i].sum()
+            return out
+
+        def top_p_renorm_prob(probs, top_ps):
+            # probs: [bs, vocab], top_ps: [bs] (cumulative prob threshold)
+            if not isinstance(top_ps, torch.Tensor):
+                top_ps = torch.tensor([top_ps] * probs.shape[0], device=probs.device, dtype=probs.dtype)
+            out = probs.clone()
+            for i in range(probs.shape[0]):
+                p = float(top_ps[i].item())
+                if p >= 1.0:
+                    continue
+                sorted_vals, sorted_idx = probs[i].sort(descending=True)
+                cumsum = sorted_vals.cumsum(dim=-1)
+                mask_vals = (cumsum - sorted_vals) < p
+                mask = torch.zeros_like(probs[i])
+                mask[sorted_idx[mask_vals]] = 1.0
+                out[i] = probs[i] * mask
+                s = out[i].sum()
+                if s > 0:
+                    out[i] = out[i] / s
+            return out
+        # DL end
+    # DL end
 
 if is_musa():
     from sgl_kernel import (

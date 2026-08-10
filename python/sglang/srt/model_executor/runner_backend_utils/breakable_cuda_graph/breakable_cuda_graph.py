@@ -38,6 +38,16 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
     checkCudaErrors,
 )
 from sglang.srt.utils import is_hip
+# DL begin — DLIN: the DLIN CUDA driver does not implement cuda-python's
+# cudaStreamGetCaptureInfo (CUDA error 35 "driver version insufficient"),
+# which BreakableCudaGraph uses to check capture status. Route DLIN to the
+# portable torch API (same as the HIP path) so breakable piecewise CG works
+# without cuda-python. See docs/dl §7.38.
+try:
+    from sglang.srt.utils.common import is_dlin as _is_dlin
+except Exception:  # pragma: no cover
+    _is_dlin = lambda: False  # noqa: E731
+# DL end
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +99,8 @@ def _is_stream_capturing(stream: torch.cuda.Stream) -> bool:
     # (which maps to the HIP runtime). On NVIDIA, keep querying the CUDA runtime
     # directly via cuda-python: torch.cuda.is_current_stream_capturing() has
     # proven unreliable there, so we preserve the original behavior.
-    if is_hip():
+    # DL: DLIN driver lacks cudaStreamGetCaptureInfo (error 35) → use torch API.
+    if is_hip() or _is_dlin():  # DL:
         with torch.cuda.stream(stream):
             return torch.cuda.is_current_stream_capturing()
     return (
@@ -136,6 +147,16 @@ def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
 
 def _install_wait_stream_hook():
     global _original_wait_stream, _hook_refcount
+    # DL begin — DLIN: the wait_stream hook injects captured sync events that
+    # serialize concurrent streams → ~23ms idle gaps in the captured graph
+    # (breakable replay 50ms vs full-CG 27ms, same kernel times per dlPTI §7.39).
+    # For single-stream DLIN decode (no alt_stream side streams), the hook's
+    # fork-tracking is unnecessary. Env-gate to disable: SGLANG_DL_NO_BCG_HOOK=1.
+    import os as _dl_os
+    if _dl_os.environ.get("SGLANG_DL_NO_BCG_HOOK") == "1":
+        _hook_refcount += 1
+        return
+    # DL end
     with _hook_lock:
         if _hook_refcount == 0:
             _original_wait_stream = torch.cuda.Stream.wait_stream
@@ -147,8 +168,7 @@ def _uninstall_wait_stream_hook():
     global _original_wait_stream, _hook_refcount
     with _hook_lock:
         _hook_refcount -= 1
-        if _hook_refcount == 0:
-            assert _original_wait_stream is not None, "wait_stream hook not installed"
+        if _hook_refcount == 0 and _original_wait_stream is not None:  # DL:
             torch.cuda.Stream.wait_stream = _original_wait_stream  # type: ignore[assignment]
             _original_wait_stream = None
 
