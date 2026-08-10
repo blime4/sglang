@@ -127,35 +127,54 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
-@warmup("prefill_shapes")
-async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
-    """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
+# DL begin — DLIN capture-size-list warmup (vLLM-style) for SGLANG_DL_MOE_FUSED.
+# invoke_fused_moe_opt (fast fused FP8 MoE prefill kernel) is JIT-compiled by dlcc
+# PER prefill-M shape (~20-85s one-time each, cached at ~/.triton/cache). Without
+# warmup the first real request at each new M pays that spike. DLIN vLLM warms by
+# iterating its capture-size lists (vllm/v1/worker/gpu_worker.py:575 builds
+# warmup_sizes = compile_sizes + cg_capture_sizes; cudagraph_utils.py:134 does
+# `for num_tokens in capture_sizes`). This mirrors that: read the engine's OWN
+# capture-size lists (server_args.cuda_graph_config.{prefill,decode}.bs — the same
+# sizes cuda-graph capture / compile uses) and JIT-warm each, so the sizes the
+# engine actually serves are pre-compiled. Decode-batch sizes are also covered by
+# cuda-graph capture at startup; this warmup reinforces them and covers the
+# prefill sizes (prefill CG is disabled on DLIN, so capture doesn't warm them).
+# Override the list with SGLANG_DL_WARMUP_SHAPES (csv) for a subset. Enable via
+# `--warmups=dlin_capture_sizes`. NOTE: warming the full capture list is one-time
+# but slow (~20-85s/shape); use the env override or cache-shipping for faster startup.
+@warmup("dlin_capture_sizes")
+async def dlin_capture_sizes(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    import os
 
-    Uses power-of-2 sizes plus intermediate points to cover the shape space
-    that fused_moe, attention extend, and other Triton kernels may encounter.
-    """
-    page_size = 64
-    sizes = set()
-    base = 64
-    while base <= 32768:
-        sizes.add(base)
-        mid = base * 3 // 2
-        mid = (mid + page_size - 1) // page_size * page_size
-        if mid <= 32768:
-            sizes.add(mid)
-        base *= 2
-    sizes = sorted(sizes)
-
-    for size in tqdm.tqdm(sizes, desc="Warmup prefill shapes (up to 32K)"):
+    sa = tokenizer_manager.server_args
+    cfg = getattr(sa, "cuda_graph_config", None)
+    prefill_bs = (
+        list(getattr(getattr(cfg, "prefill", None), "bs", []) or [])
+    )  # e.g. [4,8,...,2048]
+    decode_bs = list(getattr(getattr(cfg, "decode", None), "bs", []) or [])  # e.g. [1,2]
+    env_shapes = os.environ.get("SGLANG_DL_WARMUP_SHAPES")
+    if env_shapes:
+        sizes = [int(x) for x in env_shapes.split(",") if x.strip()]
+        logger.info("DL dlin_capture_sizes: env override SGLANG_DL_WARMUP_SHAPES=%s", sizes)
+    else:
+        sizes = sorted(set(prefill_bs + decode_bs))  # both capture lists, deduped
+    logger.info(
+        "DL dlin_capture_sizes warmup: capture lists prefill.bs=%s decode.bs=%s -> "
+        "sweeping %d sizes %s (~20-85s/shape first time; dlcc JIT cached at ~/.triton/cache)",
+        prefill_bs, decode_bs, len(sizes), sizes[:12] + (["..."] if len(sizes) > 12 else []),
+    )
+    for size in tqdm.tqdm(sizes):
         generate_req_input = GenerateReqInput(
             input_ids=(np.random.randint(2**16, size=[size])).tolist(),
-            sampling_params={
-                "max_new_tokens": 1,
-                "temperature": 0.0,
-            },
+            # max_new_tokens=1: the prefill forward through the MoE is what triggers
+            # the M-shape dlcc compile; one decode step is enough and keeps it fast.
+            sampling_params={"max_new_tokens": 1, "temperature": 0, "min_p": 0.0},
         )
         if disaggregation_mode != "null":
             generate_req_input.bootstrap_room = 0
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
-
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+    logger.info("DL dlin_capture_sizes warmup done.")
+    # DL end
