@@ -58,7 +58,19 @@ _is_musa = is_musa()
 
 
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce
+    # DL begin: DLIN's sgl_kernel build lacks moe_sum_reduce; use the triton
+    # fallback (imported unconditionally above) so the standard MoE combine path
+    # (prefill/profiling) works. Decode uses the DL bf16-bmm branch which bypasses it.
+    try:
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+
+        if _is_dlin():
+            moe_sum_reduce = moe_sum_reduce_triton
+        else:
+            from sgl_kernel import moe_sum_reduce
+    except Exception:
+        from sgl_kernel import moe_sum_reduce
+    # DL end
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
@@ -71,8 +83,9 @@ elif _is_hip:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    # Note: vllm_ops is not needed for HIP when _use_aiter=False
-    # because the code uses moe_sum_reduce_triton as fallback (line 619)
+    # DL begin: HIP uses sgl_kernel for silu/gelu; moe_sum on HIP falls back to
+    # moe_sum_reduce_triton when _use_aiter=False (vllm_ops removed in Phase 1).
+    # DL end
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
 elif _is_musa:
@@ -80,16 +93,10 @@ elif _is_musa:
 
     _silu_and_mul_musa = torch.nn.SwishGLU()
 
-# Try to import vllm_ops for non-CUDA/HIP/XPU platforms
-_has_vllm_ops = False
-if not _is_cuda and not _is_hip and not _is_xpu:
-    try:
-        from vllm import _custom_ops as vllm_ops
-
-        _has_vllm_ops = True
-    except ImportError:
-        # Fallback: vllm not available, will use native PyTorch implementations
-        _has_vllm_ops = False
+# DL begin: Phase 1 — removed vllm._custom_ops (vllm_ops) import + _has_vllm_ops
+# gate; non-GPU fallbacks below now always use native PyTorch / triton (the vllm
+# CUDA ops were never callable on a non-CUDA/HIP/XPU platform anyway).
+# DL end
 
 padding_size = get_moe_padding_size(_use_aiter)
 
@@ -645,15 +652,10 @@ def _fused_moe_kernel_sequence(
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
-            if _has_vllm_ops:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-            else:
-                # Fallback: native PyTorch silu_and_mul
-                x = intermediate_cache1.view(-1, N)
-                d = x.shape[-1] // 2
-                intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
+            # DL: Phase 1 — vllm._custom_ops removed; native PyTorch silu_and_mul.
+            x = intermediate_cache1.view(-1, N)
+            d = x.shape[-1] // 2
+            intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
     elif activation == "gelu" and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
@@ -668,15 +670,10 @@ def _fused_moe_kernel_sequence(
             else:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
-            if _has_vllm_ops:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
-            else:
-                # Fallback: native PyTorch gelu_and_mul
-                x = intermediate_cache1.view(-1, N)
-                d = x.shape[-1] // 2
-                intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
+            # DL: Phase 1 — vllm._custom_ops removed; native PyTorch gelu_and_mul.
+            x = intermediate_cache1.view(-1, N)
+            d = x.shape[-1] // 2
+            intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
@@ -811,18 +808,12 @@ def _fused_moe_kernel_sequence(
                 routed_scaling_factor,
             )
     else:
-        if _has_vllm_ops:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-            )
-        else:
-            # Fallback: use triton moe_sum_reduce when vllm is not available
-            moe_sum_reduce_triton(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-                routed_scaling_factor,
-            )
+        # DL: Phase 1 — vllm._custom_ops removed; triton moe_sum_reduce.
+        moe_sum_reduce_triton(
+            intermediate_cache3.view(*intermediate_cache3.shape),
+            out_hidden_states,
+            routed_scaling_factor,
+        )
 
     del intermediate_cache3
 

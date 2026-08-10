@@ -220,6 +220,14 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+    # DL begin: DLIN has no deep_gemm — torch fallback for the TF32 HC prenorm GEMM.
+    # out = x @ fn.T (FP32 matmul, TF32 approximated) + sqrsum = sum(x**2, -1).
+    if not ENABLE_JIT_DEEPGEMM:
+        x_f = x.float()
+        out[:] = torch.matmul(x_f, fn.t().float()).to(out.dtype)
+        sqrsum[:] = x_f.square().sum(-1)
+        return
+    # DL end
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
