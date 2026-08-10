@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+# DL begin
+import os
+# DL end
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -565,8 +568,150 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
+# DL begin — dlblas FP8 blockwise linear via sgl_kernel (ported from vLLM _dl_C).
+# Phase 4e: all _dl_C ops are now registered in sgl_kernel (Phase 4b/4d bulk port).
+# _ensure_dl_C() is kept as a no-op for backward compat (callers throughout codebase).
+_dl_C_loaded = False
+# DL: cache for blockwise->per-channel FP8 weight conversion (keyed by weight
+# data_ptr; computed once per weight on first call, reused after). Lets the
+# dlblas path run at full speed after the first forward.
+_dl_pc_cache: dict = {}
+
+
+def _ensure_dl_C():
+    """No-op: Phase 4e — all _dl_C ops live in sgl_kernel now."""
+    global _dl_C_loaded
+    if not _dl_C_loaded:
+        import sgl_kernel  # noqa: F401 — triggers op registration
+        _dl_C_loaded = True
+        # DL: register FakeTensor (meta) impls so torch.compile keeps the
+        # ops opaque (else inductor decomposes them → 82ms slow graph).
+        try:
+            from sglang.srt.layers.quantization.dl_compile_meta import (
+                dl_register_meta as _dl_meta,
+            )
+            _dl_meta()
+        except Exception:
+            pass
+
+
+def dlblas_w8a8_block_fp8_linear(
+    input, weight, block_size, weight_scale, input_scale=None, bias=None
+):
+    _ensure_dl_C()
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    N, K = weight.shape
+    # DL: DEFAULT = quant_type=1 (per-channel). The checkpoint is blockwise
+    # [128,128]; we dequant blockwise -> requantize PER-CHANNEL once (cached by
+    # weight data_ptr) and call gptq_dlblas_gemmex(quant_type=1). Verified
+    # rel_err ~0.003 vs bf16, correct + fast. This is the 39ms TPOT baseline
+    # (dense FP8 linear = attention QKV/O projections; NOT the decode bottleneck —
+    # the GDN kernel is, see docs/dl/sglang-vs-vllm-perf-gap.md §7.19).
+    #
+    # quant_type=2 (blockwise, hardware-fused dequant — what vLLM's fp8_dlblas
+    # uses) is opt-in via SGLANG_DL_FP8_Q2=1. Earlier crashed (SIGSEGV) because
+    # sglang added .contiguous() to weight.t()/scale; vLLM passes weight.t() as a
+    # NON-contiguous transposed view (the kernel hardcodes stride assumptions).
+    # Match vLLM fp8_dlblas.apply exactly: x.view (no contiguous) + weight.t() +
+    # weight_scale as-is. Scale layout is [N/128,K/128] in BOTH (verified vs
+    # vLLM's assert at fp8_dlblas.py:345). May also fix output degeneration
+    # (quant_type=1 per-channel requant loses blockwise precision).
+    import os as _os
+    if _os.environ.get("SGLANG_DL_FP8_Q2") == "1":
+        # DL: match vLLM fp8_dlblas.apply call layout (no .contiguous()).
+        # q2 op is VALID (runs in CG, 30.6ms). Earlier cudaErrorNotSupported
+        # seen on .cpu() sync / CUDA_LAUNCH_BLOCKING is a spurious DLIN runtime
+        # quirk (surfaces during init_model_parallel_group under blocking), NOT
+        # a q2 op error. Wrong output ("a majorly") is upstream GDN extend bug.
+        out = torch.ops.sgl_kernel.gptq_dlblas_gemmex(
+            input.view(-1, input.shape[-1]), weight.t(),
+            weight_scale, weight_scale, quant_type=2, bit=8
+        )
+    else:
+        key = (weight.data_ptr(), N, K)
+        cached = _dl_pc_cache.get(key)
+        if cached is None:
+            bn, bk = block_size[0], block_size[1]
+            sc_full = weight_scale.float().repeat_interleave(bn, 0).repeat_interleave(bk, 1)
+            w_bf = weight.float() * sc_full
+            pc = w_bf.abs().amax(dim=1).clamp(min=1e-6)
+            w_pc = (w_bf / pc.view(N, 1)).clamp(-1, 1).to(torch.float8_e4m3fn)
+            # DL: cache both [K,N] (for GEMM) and [N,K] (for M=1 GEMV) layouts
+            cached = (w_pc.t().contiguous(), w_pc.contiguous(),
+                      pc.to(torch.float32).view(N, 1).contiguous())
+            _dl_pc_cache[key] = cached
+        w_pc_t, w_pc_row, pc_scale = cached
+        # DL begin: M=1-optimized FP8 GEMV for decode projections. The dlblas GEMM
+        # (gptq_dlblas_gemmex) wastes 85%+ of the M-tile at M=1; this JIT GEMV
+        # (one warp per output N, coalesced weight-row read) is 2.3× faster
+        # (verified 0.170ms vs 0.391ms for N=512 K=4096).
+        if input_2d.shape[0] == 1:
+            from sglang.jit_kernel.fp8_gemv import fp8_gemv
+            out = fp8_gemv(input_2d.view(-1), w_pc_row, pc_scale.view(-1))
+            if bias is not None:
+                out = out + bias
+            return out.to(dtype=input.dtype).view(*input.shape[:-1], N)
+        # DL end
+        # DL begin — C-5 INVESTIGATION (NON-VIABLE, gated off). Attempted to expose
+        # a discrete per-token FP8 quant -> w8a8_matmul(pre-quantized FP8) so
+        # RMSNormQuantFusionPass could fuse norm+quant. Verified NON-VIABLE:
+        # w8a8_matmul is INT8 ("Activation must be ... int8 if a_is_quantized"),
+        # NOT FP8; and gptq_dlblas_gemmex (the only FP8 dense GEMM on DLIN)
+        # internal-quants its bf16 activation. There is NO FP8 GEMM on DLIN that
+        # accepts a pre-quantized FP8 activation -> norm_quant fusion has nowhere to
+        # land on the dense FP8 linear. See scripts/dl/c5_w8a8_microbench.py and
+        # memory dlin-sglang-torch-compile-phase2-plan.md. Kept (default off) to
+        # document the finding; the gemmex path remains the default.
+        if _os.environ.get("SGLANG_DL_FP8_W8A8") == "1":
+            # DL: per-token FP8 quant via vLLM _C op (sglang's scaled_fp8_quant
+            # falls back to a missing sgl_kernel op on DLIN). In-place into
+            # pre-allocated [M,K] fp8 + [M,1] fp32 scale. This discrete quant op
+            # is what RMSNormQuantFusionPass fuses with the preceding norm.
+            a_fp8 = torch.empty(
+                input_2d.shape, dtype=torch.float8_e4m3fn, device=input_2d.device
+            )
+            a_scale = torch.empty(
+                (input_2d.shape[0], 1), dtype=torch.float32, device=input_2d.device
+            )
+            torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                a_fp8, input_2d.contiguous(), a_scale, None
+            )
+            w8a8_out = torch.ops.sgl_kernel.w8a8_matmul(
+                a_fp8, w_pc_t, a_scale, pc_scale, True
+            )
+            if bias is not None:
+                w8a8_out = w8a8_out + bias
+            return w8a8_out.to(dtype=input.dtype).view(*input.shape[:-1], N)
+        # DL end
+        out = torch.ops.sgl_kernel.gptq_dlblas_gemmex(  # DL: ported from _dl_C
+            input_2d, w_pc_t, pc_scale, pc_scale, quant_type=1, bit=8
+        )
+    if bias is not None:
+        out = out + bias
+    return out.to(dtype=input.dtype).view(*input.shape[:-1], N)
+
+
+# DL end
+
+
 def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
+    # DL begin: on DLIN use dlblas FP8 GEMM (gptq_dlblas_gemmex). The checkpoint
+    # is blockwise [128,128] but the kernel's blockwise mode (quant_type=2) reads
+    # sglang's plain FP8 weight in the wrong order => gibberish. dlblas_w8a8_block_fp8_linear
+    # instead dequants blockwise -> requantizes PER-CHANNEL once (cached) and calls
+    # with quant_type=1 (verified rel_err ~0.003 vs bf16) — correct AND fast.
+    # Set SGLANG_DL_FP8_NO_DLBLAS=1 to fall back to the standard cutlass/triton
+    # blockwise path (correct but ~40x slower on DLIN).
+    try:
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+        import os as _os
+        if _is_dlin() and _os.environ.get("SGLANG_DL_FP8_NO_DLBLAS", "0") != "1":
+            return dlblas_w8a8_block_fp8_linear
+    except Exception:
+        pass
+    # DL end
+
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)

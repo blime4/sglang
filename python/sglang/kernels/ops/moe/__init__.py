@@ -80,7 +80,6 @@ def moe_align_block_size(
             num_tokens_post_pad,
             cumsum_buffer,
             pad_sorted_token_ids,
-            ignore_invalid_expert,
         )
     return kernel(
         topk_ids,

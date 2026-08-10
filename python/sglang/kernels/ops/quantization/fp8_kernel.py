@@ -940,7 +940,8 @@ def static_quant_fp8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
-    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    # DL: explicit USE_PDL constexpr (not **pdl_kwargs) for torch.compile compat.
+    _dl_supports_pdl = is_arch_support_pdl()  # DL:
     _static_quant_fp8[(M,)](
         x,
         x_q,
@@ -954,7 +955,8 @@ def static_quant_fp8(
         REPEAT_SCALE=repeat_scale,
         num_warps=num_warps,
         num_stages=num_stages,
-        **pdl_kwargs,
+        USE_PDL=_dl_supports_pdl,  # DL:
+        **({"launch_pdl": True} if _dl_supports_pdl else {}),  # DL:
     )
     x_s = x_s_repeat if repeat_scale else x_s
     return x_q, x_s

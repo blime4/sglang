@@ -80,7 +80,9 @@ if _is_cuda or _is_xpu or _is_musa:
                 return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
             _flashinfer_layernorm_available = True
-        except (ImportError, AttributeError):
+        # DL begin
+        except (ImportError, AttributeError, RuntimeError):
+        # DL end
             _flashinfer_layernorm_available = False
     else:
         _flashinfer_layernorm_available = False
@@ -91,6 +93,63 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
+    # DL begin — DLIN sgl_kernel has gemma_rmsnorm + standard rmsnorm since Phase 4a/4b.
+    # No need to load vLLM _dl_C.so anymore.
+    def _dl_has_op(_n):
+        try:
+            getattr(torch.ops.sgl_kernel, _n)
+            return True
+        except Exception:
+            return False
+
+    _dl_C_ok = True  # Phase 4e: sgl_kernel always has the gemma ops
+
+    def _dl_rms(input, weight, eps=1e-6, out=None, shift=0.0):
+        o = torch.empty_like(input) if out is None else out
+        xf = input.float()
+        r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+        o.copy_((xf * r).to(input.dtype) * (weight + shift))
+        return o
+
+    def _dl_fused(input, residual, weight, eps=1e-6, shift=0.0):
+        residual.add_(input)  # in-place: residual += input
+        rf = residual.float()
+        r = torch.rsqrt(rf.pow(2).mean(-1, keepdim=True) + eps)
+        input.copy_((rf * r).to(input.dtype) * (weight + shift))  # in-place into input
+
+    if _dl_C_ok:
+        # DLIN native fused kernels: gemma_rms_norm(out, input, weight, eps) [gemma=weight+1].
+        # These write IN-PLACE to `out` and return None, so wrap to return the tensor.
+        def _dl_gemma_rmsnorm(i, w, eps=1e-6, out=None, enable_pdl=None):
+            i = i.contiguous()
+            o = out if out is not None else torch.empty_like(i)
+            torch.ops.sgl_kernel.gemma_rmsnorm(o, i, w, eps)
+            return o
+
+        def _dl_gemma_fused_add_rmsnorm(i, r, w, eps=1e-6, enable_pdl=None):
+            i = i.contiguous()
+            r = r.contiguous()
+            torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(i, r, w, eps)
+            return i, r
+
+        gemma_rmsnorm = _dl_gemma_rmsnorm
+        gemma_fused_add_rmsnorm = _dl_gemma_fused_add_rmsnorm
+        # standard (non-gemma) rmsnorm/fused_add_rmsnorm: no _dl_C std variant -> torch fallback
+        if not _dl_has_op("rmsnorm"):
+            rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 0.0)
+        if not _dl_has_op("fused_add_rmsnorm"):
+            fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 0.0)
+    else:
+        # _dl_C not loadable: original torch fallbacks (only when sgl_kernel lacks the op)
+        if not _dl_has_op("gemma_rmsnorm"):
+            gemma_rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 1.0)
+        if not _dl_has_op("rmsnorm"):
+            rmsnorm = lambda i, w, eps=1e-6, out=None, enable_pdl=None: _dl_rms(i, w, eps, out, 0.0)
+        if not _dl_has_op("fused_add_rmsnorm"):
+            fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 0.0)
+        if not _dl_has_op("gemma_fused_add_rmsnorm"):
+            gemma_fused_add_rmsnorm = lambda i, r, w, eps=1e-6, enable_pdl=None: _dl_fused(i, r, w, eps, 1.0)
+    # DL end
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
@@ -273,6 +332,39 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
+        # DL begin
+        # DLIN: use the standalone sgl_kernel rmsnorm/fused_add_rmsnorm (built
+        # from csrc/elementwise/rmsnorm_dl.cu, no FlashInfer dep) for the
+        # standard bf16/fp16 path. Fall back to forward_native for edge cases
+        # that path doesn't cover (so DL stays correct, just not yet optimized).
+        from sglang.srt.utils.common import is_dlin
+
+        if is_dlin():
+            if (
+                self.variance_size_override is not None
+                or is_batch_invariant_mode_enabled()
+                or self.cast_x_before_out_mul
+                or getattr(self, "fp32_residual", False)
+                or x.dtype not in (torch.float16, torch.bfloat16)
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            needs_reshape_dl = x.dim() != 2 and residual is None
+            if needs_reshape_dl:
+                original_shape_dl = x.shape
+                x = x.contiguous().reshape(-1, original_shape_dl[-1])
+            else:
+                # DL: sgl_kernel rmsnorm requires contiguous input even when 2D.
+                x = x.contiguous()
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                return x, residual
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            if needs_reshape_dl:
+                out = out.reshape(original_shape_dl)
+            return out
+        # DL end
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:
@@ -933,6 +1025,16 @@ class Gemma4RMSNorm(MultiPlatformOp):
         return x * torch.pow(mean_squared, -0.5)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        # DL begin — use torch.nn.functional.rms_norm when available (1 fused op vs ~9 dispatches)
+        try:
+            import torch.nn.functional as _F
+            w = self.weight.float()
+            if self.with_scale:
+                w = w + self.scale_shift
+            return _F.rms_norm(x.float(), [x.shape[-1]], w, self.eps).to(x.dtype)
+        except Exception:
+            pass
+        # DL end
         normed_output = self._norm(x.float())
         if self.with_scale:
             normed_output = normed_output * (self.weight.float() + self.scale_shift)
