@@ -26,6 +26,40 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 
+# DL begin — Frozen-KV MTP on hybrid (full/linear) models (e.g. Qwen3.5): the draft
+# hybrid backend delegates full-attn layers to full_attn_backend and linear to
+# linear_attn_backend, each with its OWN token_to_kv_pool. Swapping only the
+# top-level draft_attn_backend.token_to_kv_pool leaves the sub-backends reading
+# the draft pool (whose full_attention_layer_id_mapping is the draft's {0}, not the
+# target's), so a remapped layer_id (target_phys) fails _transfer_full_attention_id.
+# These helpers swap/restore token_to_kv_pool on the backend AND its sub-backends.
+# See docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.2.
+
+
+def _swap_draft_kv_pool(draft_attn_backend, target_pool):
+    """Swap token_to_kv_pool on the draft backend AND its hybrid sub-backends."""
+    backends = [draft_attn_backend]
+    for sub_attr in ("full_attn_backend", "linear_attn_backend"):
+        sub = getattr(draft_attn_backend, sub_attr, None)
+        if sub is not None:
+            backends.append(sub)
+    saved = []
+    for b in backends:
+        pool = getattr(b, "token_to_kv_pool", None)
+        if pool is not None:
+            saved.append((b, pool))
+            b.token_to_kv_pool = target_pool
+    return saved
+
+
+def _restore_draft_kv_pool(saved):
+    for b, pool in saved:
+        b.token_to_kv_pool = pool
+
+
+# DL end
+
+
 @contextmanager
 def frozen_kv_target_view(
     forward_batch: ForwardBatch,
@@ -41,20 +75,25 @@ def frozen_kv_target_view(
     swap is seen by both readers (``get_token_to_kv_pool()`` and the
     backend's own ``self.token_to_kv_pool``).
     """
+    # DL begin — standard NextN: no frozen-KV pool swap needed
     if kv_context is None:
-        raise RuntimeError(
-            "Frozen-KV MTP target view called before the model was bound; "
-            "bind the frozen KV context first."
-        )
+        yield
+        return
+    # DL end
     saved_spec_info = forward_batch.spec_info
     forward_batch.spec_info = None
-    saved_backend_pool = draft_attn_backend.token_to_kv_pool
-    draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    # DL begin — swap sub-backends too (see _swap_draft_kv_pool)
+    saved_pools = _swap_draft_kv_pool(
+        draft_attn_backend, kv_context.target_token_to_kv_pool
+    )
+    # DL end
     try:
         yield
     finally:
+        # DL begin
+        _restore_draft_kv_pool(saved_pools)
+        # DL end
         forward_batch.spec_info = saved_spec_info
-        draft_attn_backend.token_to_kv_pool = saved_backend_pool
 
 
 @contextmanager
@@ -71,17 +110,22 @@ def target_kv_pool_view(
     ``get_attn_backend()``) and the backend's own ``self.token_to_kv_pool``
     reads (because ``self is draft_attn_backend``).
     """
+    # DL begin — standard NextN: no frozen-KV pool swap needed
     if kv_context is None:
-        raise RuntimeError(
-            "Frozen-KV MTP target KV pool view called before the model was bound; "
-            "bind the frozen KV context first."
-        )
-    saved_backend_pool = draft_attn_backend.token_to_kv_pool
-    draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
+        yield
+        return
+    # DL end
+    # DL begin — swap sub-backends too (see _swap_draft_kv_pool)
+    saved_pools = _swap_draft_kv_pool(
+        draft_attn_backend, kv_context.target_token_to_kv_pool
+    )
+    # DL end
     try:
         yield
     finally:
-        draft_attn_backend.token_to_kv_pool = saved_backend_pool
+        # DL begin
+        _restore_draft_kv_pool(saved_pools)
+        # DL end
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:

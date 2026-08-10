@@ -147,7 +147,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 type(self.draft_model_runner.model).__name__,
             )
 
+        # DL begin — standard NextN: draft uses its OWN KV (not frozen target KV).
+        # Qwen3.5's draft q_proj is independently trained (not cross-aligned with
+        # target k_proj), so frozen-KV Q·K can't align (accept ~0.04). The draft
+        # writes/reads its own KV at a separate layer (40) in the shared pool.
+        # See docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.7-10.9.
         self.kv_context: Optional[FrozenKVMTPContext] = None
+        # Don't call _bind_kv_context (frozen-KV) — draft uses own KV instead.
+        # DL end
 
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -170,8 +177,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
         self.draft_pool_config = MemoryPoolConfig(
-            max_total_num_tokens=64,  # Dummy value
+            max_total_num_tokens=512,  # Enough for init; draft reuses target KV at runtime
             max_running_requests=memory_pool_config.max_running_requests,
+            # P2#17: SWA pool must be > 0 for the tp_worker validation
+            # (max_req_len = min(ctx-1, effective_max_total_num_tokens-1)).
+            # Draft reuses target KV at runtime; this just passes init checks.
+            swa_max_total_num_tokens=512,
+            full_max_total_num_tokens=512,
         )
 
         # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
@@ -195,6 +207,39 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             TpModelWorker.init_attention_backends(self)
             self.draft_attn_backend = self._init_draft_attn_backend()
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+            # DL begin — standard NextN: add a draft KV layer to the shared pool.
+            # The draft writes/reads its own K/V at layer 40 (separate from the
+            # target's layers 0-39), so Q-K aligns (both draft q_proj/k_proj).
+            draft_model = self.draft_model_runner.model
+            pool = self.draft_attn_backend.token_to_kv_pool
+            if hasattr(pool, "full_kv_pool") and hasattr(pool, "full_attention_layer_id_mapping"):
+                full_pool = pool.full_kv_pool
+                draft_pool_idx = full_pool.layer_num
+                full_pool.k_buffer.append(torch.zeros_like(full_pool.k_buffer[0]))
+                full_pool.v_buffer.append(torch.zeros_like(full_pool.v_buffer[0]))
+                full_pool.layer_num += 1
+                full_pool.k_data_ptrs = torch.tensor(
+                    [x.data_ptr() for x in full_pool.k_buffer],
+                    dtype=torch.uint64, device=full_pool.device,
+                )
+                full_pool.v_data_ptrs = torch.tensor(
+                    [x.data_ptr() for x in full_pool.v_buffer],
+                    dtype=torch.uint64, device=full_pool.device,
+                )
+                full_pool.data_ptrs = torch.cat(
+                    [full_pool.k_data_ptrs, full_pool.v_data_ptrs], dim=0
+                )
+                virtual_layer = 40
+                pool.full_attention_layer_id_mapping[virtual_layer] = draft_pool_idx
+                for layer in draft_model.model.layers:
+                    layer.attn.layer_id = virtual_layer
+                if hasattr(self.draft_attn_backend, "full_attn_layers"):
+                    self.draft_attn_backend.full_attn_layers = [virtual_layer]
+                logger.info(
+                    "Frozen-KV MTP: standard NextN — draft own KV at layer %d (pool idx %d)",
+                    virtual_layer, draft_pool_idx,
+                )
+            # DL end
 
     def init_cuda_graphs(self):
         with (
@@ -283,7 +328,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         )
 
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
-        set_frozen_kv_positions(forward_batch, self.topk)
+        # DL begin — standard NextN: don't override positions (frozen-KV sets all
+        # to seq_lens-1, but standard NextN needs advancing positions per draft step
+        # so the draft writes K/V at correct positions in layer 40).
+        if self.kv_context is not None:
+            set_frozen_kv_positions(forward_batch, self.topk)
+        # DL end
 
     def _expand_for_topk_draft(self, forward_batch: ForwardBatch) -> None:
         expand_for_topk_draft(forward_batch, self.topk)
@@ -498,6 +548,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         # Seed + recurrent iters share the same `seq_lens - 1` rope position,
         # so one init covers the loop. Must run even at num_steps == 1.
+        # P2#17: V4 attention backend asserts out_cache_loc.shape[0] in
+        # init_forward_metadata_decode. Frozen-KV sets it to None (line 490).
+        # Provide a dummy before metadata init so the shape check passes.
+        if forward_batch.out_cache_loc is None:
+            forward_batch.out_cache_loc = torch.zeros(
+                forward_batch.seq_lens.shape[0], dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
         if forward_batch.needs_forward_metadata_init():
             self._init_frozen_kv_metadata(forward_batch)
 
@@ -515,6 +573,32 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         forward_batch.input_ids = seed_input_ids
         forward_batch.spec_info.hidden_states = seed_prev_hidden
+        # P2#17: V4 attention backend asserts out_cache_loc.shape[0] in
+        # init_forward_metadata_decode. Frozen-KV draft sets it to None (line 490)
+        # because it never writes KV. Provide a dummy so the backend's shape check
+        # passes — the actual write is suppressed by is_kv_shared_layer=True.
+        if forward_batch.out_cache_loc is None:
+            forward_batch.out_cache_loc = torch.zeros(
+                seed_input_ids.shape[0], dtype=torch.int32,
+                device=seed_input_ids.device,
+            )
+        # DL begin — Frozen-KV MTP on DLIN: ForwardBatch.init_new borrows the
+        # verify-tree-sized out_cache_loc (len = num_draft_tokens+bonus+...) from
+        # the ScheduleBatch, but the draft model runner's static token buffer is
+        # sized to the draft's num_tokens (== len(seed_input_ids)). The draft
+        # reads frozen target KV (save_kv_cache=False via is_kv_shared_layer), so
+        # out_cache_loc is not used for writes — slice it to the draft token count
+        # so the cuda_graph_buffer_registry copy shape matches. See
+        # docs/dl/dlin-sglang-mtp-vs-ngram-report.md §10.1.
+        if (
+            getattr(forward_batch, "out_cache_loc", None) is not None
+            and forward_batch.out_cache_loc.shape[0]
+            != seed_input_ids.shape[0]
+        ):
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc[
+                : seed_input_ids.shape[0]
+            ]
+        # DL end
         self._set_positions(forward_batch)
 
         with (
@@ -559,6 +643,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             forward_batch.input_ids = input_ids
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
+            # DL begin — standard NextN: advance position per draft step so K/V
+            # is written at the correct position in layer 40.
+            if self.kv_context is None and forward_batch.positions is not None:
+                forward_batch.positions = forward_batch.positions + 1
+            # DL end
 
             with (
                 self._target_kv_pool_view(forward_batch),
@@ -603,24 +692,88 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         """Seed for the first decode iter after prefill. Frozen draft writes no
         KV (reads target KV), so unlike EAGLE there is no draft-extend forward:
         just select the last prompt hidden + bonus token and stash the seed."""
-        del mm_input_embeds  # frozen seed needs no input embeds
+        # DL begin
+        del mm_input_embeds
         if batch.forward_mode.is_idle():
             return self._idle_seed()
+
+        # standard NextN: run draft on prompt tokens to fill draft KV
+        if (
+            self.kv_context is None
+            and hasattr(self, "draft_model_runner")
+            and target_hidden_states.shape[0] > 0
+        ):
+            from sglang.srt.model_executor.forward_batch_info import (
+                ForwardBatch,
+                ForwardMode,
+                CaptureHiddenMode,
+            )
+            from sglang.srt.speculative.frozen_kv_mtp_info import (
+                FrozenKVMTPDraftInput,
+            )
+
+            draft_runner = self.draft_model_runner
+            total_tokens = target_hidden_states.shape[0]
+            device = target_hidden_states.device
+
+            input_ids = batch.input_ids[:total_tokens]
+
+            positions = []
+            for i, elen in enumerate(batch.extend_lens):
+                start = batch.seq_lens[i] - elen
+                positions.extend(range(start, start + elen))
+            positions = torch.tensor(positions, dtype=torch.int64, device=device)
+
+            draft_fb = ForwardBatch.init_new(batch, draft_runner)
+            draft_fb.input_ids = input_ids
+            draft_fb.positions = positions
+            draft_fb.forward_mode = ForwardMode.EXTEND
+            draft_fb.capture_hidden_mode = CaptureHiddenMode.LAST
+
+            draft_spec = FrozenKVMTPDraftInput(
+                bonus_tokens=next_token_ids[: batch.batch_size()],
+                hidden_states=target_hidden_states,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+            draft_fb.spec_info = draft_spec
+
+            with (
+                self.draft_tp_context(draft_runner.tp_group),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+            ):
+                draft_runner.forward(draft_fb)
+
+            logger.info(
+                "Frozen-KV MTP: standard NextN draft prefill — processed %d "
+                "prompt tokens, wrote draft KV at layer 40",
+                total_tokens,
+            )
+        # DL end
+
         last_hidden = self._select_last_extend_hidden(batch, target_hidden_states)
         return self._build_seed_draft_input(next_token_ids, last_hidden)
 
+    # DL begin
     def _draft_extend_for_decode(self, batch: ScheduleBatch, batch_result) -> None:
-        """Frozen 'draft extend': no forward. Pull the last accepted token's
-        target hidden from the verify output and stash it as the next-iter seed.
-
-        Replaces verify's `EagleDraftInput` with a `FrozenKVMTPDraftInput` so the
-        next draft passes the FROZEN_KV_MTP attn-backend assertions.
-        """
+        """DL: standard NextN — draft_forward seed step already writes the accepted
+        token K/V to layer 40, so here we just stash the seed (same as original)."""
         if batch.forward_mode.is_idle():
             batch_result.next_draft_input = self._idle_seed()
             return
 
         bs = len(batch.seq_lens)
+        select_index = (
+            torch.arange(bs, device=self.device) * self.speculative_num_draft_tokens
+            + batch_result.accept_lens
+            - 1
+        )
+        last_hidden = batch_result.logits_output.hidden_states[select_index]
+
+        bonus_tokens = batch_result.next_draft_input.bonus_tokens
+        batch_result.next_draft_input = self._build_seed_draft_input(
+            bonus_tokens, last_hidden
+        )
+        # DL end
         # Same per-req select_index EAGLE uses on its draft-extend output: the
         # last accepted node (accept_lens - 1) in each per-req block of width
         # num_draft_tokens. Verify already compacted the accepted path to the

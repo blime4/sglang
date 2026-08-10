@@ -37,7 +37,36 @@ from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
+# DL begin — Frozen-KV MTP hooks (port from gemma4_mtp; Qwen3.5 was missing them,
+# so FROZEN_KV_MTP could not run — see docs/dl/dlin-sglang-mtp-vs-ngram-report.md)
+from typing import Dict
+
+from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
+# DL end
+
 logger = logging.getLogger(__name__)
+
+
+# DL begin — Frozen-KV MTP helpers (port from gemma4_mtp)
+def _get_text_config(model_or_config) -> PretrainedConfig:
+    """Normalize either a model or a (possibly wrapped) config to the text config."""
+    cfg = getattr(model_or_config, "config", model_or_config)
+    return getattr(cfg, "text_config", cfg)
+
+
+def _resolve_target_text_model(target_model):
+    """Locate the target trunk (``.language_model`` multimodal / ``.model`` text)."""
+    for attr in ("language_model", "model"):
+        candidate = getattr(target_model, attr, None)
+        if candidate is not None and hasattr(candidate, "layers"):
+            return candidate
+    raise AttributeError(
+        f"Frozen-KV MTP cannot locate the target trunk on "
+        f"{type(target_model).__name__}; expected ``.language_model`` "
+        "(multimodal) or ``.model`` (text-only) with a ``.layers`` attribute."
+    )
+# DL end
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -82,6 +111,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        # DL begin — Frozen-KV MTP cuda-graph runner reads `backbone_hidden_size`
+        # to size the recurrent hidden buffer (frozen_kv_mtp_worker_v2.py
+        # `_recurrent_hidden_size`). Qwen3.5 config has no `backbone_hidden_size`
+        # field (Gemma4-only), so expose the target hidden_size under that name;
+        # the draft consumes target hidden_states of this dimension (fc: 2*hidden).
+        self.backbone_hidden_size = config.hidden_size
+        # DL end
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
@@ -111,6 +147,56 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+
+        # DL begin — Frozen-KV MTP hooks (port from gemma4_mtp; Qwen3.5-specific)
+        self.kv_context: Optional[FrozenKVMTPContext] = None
+
+    def bind_frozen_kv_context(self, ctx: FrozenKVMTPContext) -> None:
+        """Bind the MTP draft layer to the target-owned KV (read-only, no draft KV write)."""
+        # Qwen3.5 AttentionDecoderLayer exposes ``.attn`` (RadixAttention) and
+        # ``.layer_id`` directly (no ``.self_attn`` wrapper). Setting layer_id to
+        # the target physical layer makes the draft READ that KV; save_kv_cache is
+        # suppressed via ``is_kv_shared_layer`` (see qwen3_5.py self_attention).
+        for assistant_logical, layer in enumerate(self.model.layers):
+            target_phys = ctx.get_physical_layer_id(assistant_logical)
+            layer.is_kv_shared_layer = True
+            layer.kv_shared_layer_index = target_phys
+            layer.attn.layer_id = target_phys
+            layer.layer_id = assistant_logical
+        self.kv_context = ctx
+
+    def build_frozen_kv_mtp_context(
+        self,
+        target_model,
+        target_token_to_kv_pool: KVCache,
+    ) -> FrozenKVMTPContext:
+        """Map the 1-layer MTP draft to the target's last full-attention physical layer.
+
+        Qwen3.5 layers are typed by ``config.layers_block_type`` ("attention" /
+        "linear"); the MTP draft is a single full-attention layer
+        (``mtp_config.full_attention_interval=1``), so it maps to the target's
+        final ``"attention"`` layer — the most recent full-attention KV.
+        """
+        target_text = _get_text_config(target_model)
+        types = getattr(target_text, "layers_block_type", None)
+        if types is None:
+            raise AttributeError(
+                "Frozen-KV MTP: target config has no layers_block_type; cannot "
+                "locate a full-attention layer."
+            )
+        full_attn_idx = [i for i, t in enumerate(types) if t == "attention"]
+        if not full_attn_idx:
+            raise ValueError(
+                "Frozen-KV MTP: target has no full-attention layer to share KV with."
+            )
+        last_full = full_attn_idx[-1]
+        # The draft has exactly one layer (logical 0, full-attention).
+        physical: Dict[int, int] = {0: last_full}
+        return FrozenKVMTPContext(
+            target_token_to_kv_pool=target_token_to_kv_pool,
+            physical_layer_ids=physical,
+        )
+        # DL end (Frozen-KV MTP hooks)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
