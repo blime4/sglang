@@ -3,7 +3,78 @@ from typing import List, Optional
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+# DL begin — DLIN sgl_kernel build omits reconstruct_indices_from_tree_mask
+# (tree-verify index reconstruction for NGRAM spec decoding). Probe the op at
+# import; if absent, use a vectorized torch fallback validated against the CUDA
+# reference (sgl-kernel/csrc/speculative/ngram_utils.cu) — see
+# scripts/dl/validate_reconstruct.py (official oracle + 3000 fuzz cases, 0 mismatches).
+try:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+
+    _ = torch.ops.sgl_kernel.reconstruct_indices_from_tree_mask  # probe (DLIN omits)
+except (ImportError, AttributeError):
+    _DL_RITM_BIG = 1 << 30
+
+    def reconstruct_indices_from_tree_mask(
+        tree_mask,
+        verified_seq_len,
+        positions,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        batch_size,
+        draft_token_num,
+    ):
+        # Pure-torch port of reconstructIndicesByTreeMask. Writes the mutable
+        # outputs in-place to match the C++ op contract.
+        bs = batch_size
+        D = draft_token_num
+        device = tree_mask.device
+        tm = tree_mask.view(bs, D, D).bool()
+        aD = torch.arange(D, device=device)
+        row = aD.view(1, D, 1)
+        col = aD.view(1, 1, D)
+        neg1_D = torch.full((bs, D), -1, device=device, dtype=torch.int64)
+
+        lower = col < row
+        parent_mask = tm & lower
+        depth = parent_mask.sum(-1)
+        pvals = torch.where(
+            parent_mask,
+            col.expand(bs, D, D),
+            torch.full((bs, D, D), -1, device=device, dtype=torch.int64),
+        )
+        parent_idx = pvals.max(-1).values
+
+        retrive_index.copy_(torch.arange(bs, device=device).view(bs, 1) * D + aD.view(1, D))
+        positions.copy_((depth + verified_seq_len.view(bs, 1)).reshape(-1))
+
+        upper = col > row  # next_token / next_sibling: candidate index > tid
+        tm_t = tm.transpose(1, 2)  # tm_t[b,tid,i] = tm[b,i,tid]
+        nt_vals = torch.where(
+            tm_t & upper,
+            col.expand(bs, D, D),
+            torch.full((bs, D, D), _DL_RITM_BIG, device=device, dtype=torch.int64),
+        )
+        nt_min = nt_vals.min(-1).values
+        retrive_next_token.copy_(torch.where(nt_min < _DL_RITM_BIG, nt_min, neg1_D))
+
+        # next_sibling: smallest i>tid sharing the SAME parent as tid (parent!=-1).
+        # parent_idx being the max-True column already guarantees the CUDA kernel's
+        # "no True strictly between parent and i" sub-condition, so equality of
+        # parent_idx suffices (verified by fuzzing vs the C++ reference).
+        sib_mask = (parent_idx.view(bs, 1, D) == parent_idx.view(bs, D, 1)) & upper & (
+            parent_idx.view(bs, D, 1) != -1
+        )
+        ns_vals = torch.where(
+            sib_mask,
+            col.expand(bs, D, D),
+            torch.full((bs, D, D), _DL_RITM_BIG, device=device, dtype=torch.int64),
+        )
+        ns_min = ns_vals.min(-1).values
+        retrive_next_sibling.copy_(torch.where(ns_min < _DL_RITM_BIG, ns_min, neg1_D))
+# DL end
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func as assign_extend_cache_locs_func,
