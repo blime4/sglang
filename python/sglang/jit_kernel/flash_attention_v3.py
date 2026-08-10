@@ -29,6 +29,61 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
 
 @cache_once
 def _load_fa3_kernels():
+    # DL begin
+    # DLIN (DLIN): use the DLIN Flash Attention (FA2) from the `flash_attn`
+    # package (Denglin build, pinned in pyproject_dl.toml). Mirrors vLLM's
+    # fa_utils `if current_platform.is_dl(): only flash attention 2`.
+    # The FA3 backend's call sites pass FA3-only kwargs (num_splits, sinks,
+    # scheduler_metadata, out=) that FA2 does not accept, so wrap the DLIN FA2
+    # funcs in adapters that strip FA3-only kwargs and honor `out=`. A dedicated
+    # DLIN FA2 backend (plan §2) can replace this for fuller control later.
+    from sglang.srt.utils.common import is_dlin
+
+    if is_dlin():
+        try:
+            # DL: import from submodule directly — flash_attn.__init__.py eagerly
+            # imports flash_attn_with_kvcache which crashes DLEOL LLVM JIT.
+            from flash_attn.flash_attn_interface import (
+                flash_attn_varlen_func as _fa2_varlen,
+            )
+            # DO NOT import flash_attn_with_kvcache — crashes DLEOL.
+            # Route through dl_flash_attn.flash_attn_with_kvcache (varlen fallback).
+            from sglang.srt.layers.attention.dl_flash_attn import (
+                flash_attn_with_kvcache as _fa2_kvcache,
+            )
+
+            # FA3-only kwargs the FA3 backend may pass that FA2 rejects.
+            _FA3_ONLY_KW = {
+                "num_splits", "scheduler_metadata", "sinks", "pack_gqa",
+                "only_qv", "sm_margin", "score_mod", "aux_tensors",
+            }
+
+            def _adapt(fn):
+                import functools
+
+                @functools.wraps(fn)
+                def _wrapper(*args, **kwargs):
+                    out = kwargs.pop("out", None)
+                    for k in _FA3_ONLY_KW:
+                        kwargs.pop(k, None)
+                    ret = fn(*args, **kwargs)
+                    # FA3 returns a tensor (or writes via out=); FA2 returns out [, lse].
+                    out_tensor = ret[0] if isinstance(ret, (tuple, list)) else ret
+                    if out is not None and out_tensor is not None:
+                        out.copy_(out_tensor)
+                    return out_tensor if out is not None else ret
+
+                return _wrapper
+
+            logger.info("DLIN: using Flash Attention 2 (flash_attn pkg) via FA3-kwarg adapters.")
+            return {
+                "flash_attn_with_kvcache": _adapt(_fa2_kvcache),
+                "flash_attn_varlen_func": _adapt(_fa2_varlen),
+            }
+        except ImportError as e:
+            logger.warning(f"DLIN: flash_attn package not available ({e}); falling through.")
+    # DL end
+
     # By default, we use the implementation from sgl-kernel,
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
@@ -82,6 +137,15 @@ def _load_fa3_kernel_from_sgl():
 
 @cache_once
 def _is_fa3_supported(device=None) -> bool:
+    # DL begin
+    # DLIN: `_load_fa3_kernels()` returns the DLIN FA2 funcs (from the flash_attn
+    # package) when is_dlin(), so treat FA as "supported" and let the DLIN FA2
+    # path run (the sm90+ NVIDIA-only FA3 never applies here).
+    from sglang.srt.utils.common import is_dlin
+
+    if is_dlin():
+        return True
+    # DL end
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
     #  hidden_dim or some special cases.
@@ -218,7 +282,7 @@ def flash_attn_varlen_func(
         # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
         # (e.g. ROCm, or CUDA < sm90)
         if cu_seqlens_q is not None:
-            from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func as fa2_flash_attn_varlen_func  # DL: FA2 fallback on non-FA3 targets
 
             return fa2_flash_attn_varlen_func(
                 q,
@@ -236,7 +300,7 @@ def flash_attn_varlen_func(
             )
         else:
             # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
-            from flash_attn import flash_attn_func as fa2_flash_attn_func
+            from flash_attn.flash_attn_interface import flash_attn_func as fa2_flash_attn_func  # DL: FA2 fallback on non-FA3 targets
 
             return fa2_flash_attn_func(
                 q,

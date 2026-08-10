@@ -6,6 +6,27 @@ from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_
 from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
 
 
+# DL begin
+# Probe (once) whether a WORKING DLIN vllm_flash_attn is importable: it must
+# have the compiled _vllm_fa2_C extension that exposes varlen_fwd (the plain
+# pure-python stub does NOT). When present, decode can take the clean graph-safe
+# varlen+block_table path (the one vLLM uses); otherwise sglang falls back to
+# the gather workaround. The .so is now built from source (Route B,
+# scripts/dl/build_dlin_vllm_flash_attn.sh); historically requested via
+# docs/dl/request-dl24-vllm-flash-attn-wheel.md.
+_DLIN_VLLM_FA_PROBED: Optional[bool] = None
+
+
+def _dlin_vllm_flash_attn_ok() -> bool:
+    # DL: vllm_flash_attn paged decode requires page_size >= 16.
+    # With page_size=1 (MambaRadixCache default for hybrid), it crashes.
+    # Only enable when page_size >= 16 is confirmed at the call site.
+    return False
+
+
+# DL end
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -138,6 +159,260 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
+    # DL begin
+    # DLIN: call FA2 (flash_attn pkg) directly with FA2 conventions, bypassing
+    # the FA3 shim (which passes FA3 positional args / num_splits / sinks that
+    # FA2 doesn't accept). The shim's named params map cleanly to FA2.
+    from sglang.srt.utils.common import is_dlin as _is_dlin
+
+    if _is_dlin():
+        _batch = cache_seqlens.shape[0] if torch.is_tensor(cache_seqlens) else 1
+        _seqq = q.shape[0] // _batch
+
+        # Prefer the CLEAN, graph-safe path when a compiled DLIN vllm_flash_attn
+        # is available: varlen + block_table (the path vLLM uses ->
+        # cudnnMHAVarlenForward*, which works and is cuda-graph-capturable).
+        # All tensors are fixed-shape; seqused_k carries per-seq lengths as a
+        # runtime value; max_seqlen_k is a shape-derived upper bound (no .item()
+        # host-sync) so this path stays graph-safe. The .so is built from source
+        # (Route B, scripts/dl/build_dlin_vllm_flash_attn.sh).
+        if (
+            _dlin_vllm_flash_attn_ok()
+            and page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and _seqq == 1
+            and k is None
+            and v is None
+        ):
+            import vllm_flash_attn as _vfa
+
+            _cu_q = torch.arange(
+                0, _batch + 1, dtype=torch.int32, device=q.device
+            )
+            _max_k_ub = page_table.shape[1] * k_cache.shape[1]  # upper bound
+            _o = _vfa.flash_attn_varlen_func(
+                q=q,
+                k=k_cache,
+                v=v_cache,
+                max_seqlen_q=1,
+                cu_seqlens_q=_cu_q,
+                max_seqlen_k=_max_k_ub,
+                seqused_k=cache_seqlens,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=list(window_size) if window_size is not None else None,
+                block_table=page_table,
+            )
+            if out is not None:
+                out.copy_(_o)
+                return out
+            return _o
+
+        # Graph-safe custom paged-decode attention kernel (sgl_kernel). Reads the
+        # paged KV cache DIRECTLY (no gather/scatter/packing) via page_table +
+        # seqlens. Single kernel launch -> captures + replays cleanly under cuda
+        # graph. All inputs are sglang's own fixed-shape tensors (graph pool).
+        # Validated EXACT vs torch SDPA (max_err=0). This is the PRIMARY DLIN
+        # decode path -- it unblocks cuda graph without needing vllm_flash_attn.
+        # DL begin — disabled: paged_decode_attn kernel crashes DLEOL JIT
+        # (pymain_main.llvm SIGSEGV) on sdk_dlop_20260713. Fall through to the
+        # varlen gather path below which works.
+        if False and (
+            page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and _seqq == 1
+            and k is None
+            and v is None
+        ):
+            _scale = softmax_scale if softmax_scale is not None else (q.shape[-1] ** -0.5)
+            if out is None:
+                out = torch.empty_like(q)
+            torch.ops.sgl_kernel.paged_decode_attn(
+                q, k_cache, v_cache, page_table, cache_seqlens, out, _scale
+            )
+            return out
+        # DL end
+
+        # Workaround when no compiled DLIN vllm_flash_attn: pack the paged KV
+        # cache into a varlen layout and call flash_attn_varlen_func (plain
+        # flash_attn pkg). dleol's paged-DECODE kernel (flash_attn_with_kvcache)
+        # crashes ("to bc failed"); the prefill varlen kernel works.
+        # NOTE: the boolean-index gather (_gk[_mask]) and the int(_sl.max().item())
+        # host-sync make this path NOT cuda-graph-capturable (capture fails with
+        # "operation not permitted when stream is capturing"). A graph-safe
+        # scatter-packing variant was prototyped (scripts/dl/test_graphsafe_packed_
+        # decode.py) and CAPTURE succeeds with it, but it produced wrong output
+        # under the model (correctness bug, root cause not pinpointed) -- so the
+        # correct-but-non-graph gather is kept as the default until the DLIN
+        # vllm_flash_attn wheel lands (clean varlen+block_table, graph-safe).
+        if (
+            page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and _seqq == 1
+            and k is None
+            and v is None
+        ):
+            # DL begin — varlen decode fallback; head_dim>128 uses torch SDPA
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa2_varlen
+            _Pg = k_cache.shape[1]
+            _Hkv = k_cache.shape[2]
+            _Dm = k_cache.shape[3]
+            _max_blocks = page_table.shape[1]
+            _sl = cache_seqlens.long()
+            _gk = k_cache[page_table].reshape(_batch, _max_blocks * _Pg, _Hkv, _Dm)
+            _gv = v_cache[page_table].reshape(_batch, _max_blocks * _Pg, _Hkv, _Dm)
+            _pos = torch.arange(
+                _max_blocks * _Pg, device=k_cache.device
+            ).unsqueeze(0)
+            _mask = _pos < _sl.unsqueeze(1)  # [batch, max_blocks*Pg]
+            _k_packed = _gk[_mask]  # [total_k, Hkv, D]
+            _v_packed = _gv[_mask]
+            _cu_k = torch.zeros(_batch + 1, dtype=torch.int32, device=k_cache.device)
+            _cu_k[1:] = _sl.cumsum(0)
+            _cu_q = torch.arange(
+                0, _batch + 1, dtype=torch.int32, device=k_cache.device
+            )  # 1 q token / seq
+            _max_k = int(_sl.max().item())
+            # DL: cuDNN flash_attn only supports head_dim ≤ 128. GDN layers use
+            # head_dim=256. Use torch SDPA for those.
+            if _Dm > 128:
+                import torch.nn.functional as F
+                _Hq = q.shape[1]
+                _gqr = _Hq // _Hkv
+                _k_exp = _k_packed.unsqueeze(1).expand(-1, _gqr, -1, -1).reshape(-1, _Hq, _Dm) if _gqr > 1 else _k_packed.expand(-1, _Hq, -1)
+                _v_exp = _v_packed.unsqueeze(1).expand(-1, _gqr, -1, -1).reshape(-1, _Hq, _Dm) if _gqr > 1 else _v_packed.expand(-1, _Hq, -1)
+                # For batch=1 decode, just do simple attention
+                _o = F.scaled_dot_product_attention(
+                    q.unsqueeze(0).transpose(1, 2),
+                    _k_exp.unsqueeze(0).transpose(1, 2),
+                    _v_exp.unsqueeze(0).transpose(1, 2),
+                    scale=softmax_scale,
+                    is_causal=False,
+                ).transpose(1, 2).squeeze(0)
+            else:
+                _o = _fa2_varlen(
+                    q,
+                    _k_packed,
+                    _v_packed,
+                    _cu_q,
+                    _cu_k,
+                    max_seqlen_q=1,
+                    max_seqlen_k=_max_k,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                    window_size=(-1, -1),
+                )
+            # DL end
+            if out is not None:
+                out.copy_(_o)
+                return out
+            return _o
+
+        # DL begin — VERIFY (target_verify, _seqq > 1): loop the EXACT DL decode
+        # kernel (paged_decode_attn, validated vs SDPA max_err=0) per tree token
+        # with causal cache_seqlens, instead of the FA2 paged fallback below.
+        # DL: disabled — paged_decode_attn crashes DLEOL JIT on sdk_dlop_20260713.
+        # Falls through to the varlen extend path below.
+        if False and (
+            _seqq > 1
+            and page_table is not None
+            and torch.is_tensor(cache_seqlens)
+            and k is None
+            and v is None
+            and causal
+        ):
+            _scale = (
+                softmax_scale if softmax_scale is not None else (q.shape[-1] ** -0.5)
+            )
+            if out is None:
+                out = torch.empty_like(q)
+            _q_r = q.reshape(_batch, _seqq, q.shape[1], q.shape[2])
+            _o_r = out.reshape(_batch, _seqq, q.shape[1], q.shape[2])
+            _base = cache_seqlens.long() - _seqq  # prompt length per req [batch]
+            for _i in range(_seqq):
+                _cs = (_base + _i + 1).to(torch.int32)  # causal KV len for token _i
+                _o_i = torch.empty_like(_q_r[:, _i])
+                torch.ops.sgl_kernel.paged_decode_attn(
+                    _q_r[:, _i].contiguous(),
+                    k_cache,
+                    v_cache,
+                    page_table,
+                    _cs,
+                    _o_i,
+                    _scale,
+                )
+                _o_r[:, _i] = _o_i
+            return out
+        # DL end
+
+        # DL begin — varlen extend: flash_attn_kvcache_mha_op crashes DLEOL LLVM
+        # JIT ("to bc failed" → SIGSEGV). Route extend through varlen which works.
+        # Gather paged KV, pack per-seq into varlen layout, call flash_attn_varlen_func.
+        if page_table is not None and torch.is_tensor(cache_seqlens):
+            from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa2_varlen
+
+            _Pg = k_cache.shape[1]
+            _Hkv = k_cache.shape[2]
+            _Dm = k_cache.shape[3]
+            _max_blocks = page_table.shape[1]
+            _sl = cache_seqlens.long()
+            _gk = k_cache[page_table].reshape(_batch, _max_blocks * _Pg, _Hkv, _Dm)
+            _gv = v_cache[page_table].reshape(_batch, _max_blocks * _Pg, _Hkv, _Dm)
+            _pos = torch.arange(
+                _max_blocks * _Pg, device=k_cache.device
+            ).unsqueeze(0)
+            _mask = _pos < _sl.unsqueeze(1)
+            _k_packed = _gk[_mask]
+            _v_packed = _gv[_mask]
+            _cu_k = torch.zeros(_batch + 1, dtype=torch.int32, device=k_cache.device)
+            _cu_k[1:] = _sl.cumsum(0)
+            _cu_q = torch.zeros(_batch + 1, dtype=torch.int32, device=q.device)
+            _seqlens_q = torch.full((_batch,), _seqq, dtype=torch.int32, device=q.device)
+            _cu_q[1:] = _seqlens_q.cumsum(0)
+            _max_k = int(_sl.max().item())
+            _o = _fa2_varlen(
+                q,
+                _k_packed,
+                _v_packed,
+                _cu_q,
+                _cu_k,
+                max_seqlen_q=_seqq,
+                max_seqlen_k=_max_k,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+            )
+            if out is not None:
+                out.copy_(_o)
+                return out
+            return _o
+        # DL end
+
+        # DL begin — catch-all: route ANY remaining kvcache call through dl_flash_attn
+        # varlen (never call the native flash_attn_with_kvcache which crashes DLEOL).
+        from sglang.srt.layers.attention.dl_flash_attn import (
+            flash_attn_with_kvcache as _dl_fa_kvcache,
+        )
+
+        _o = _dl_fa_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            k=k,
+            v=v,
+            out=out,
+        )
+        if out is not None:
+            return out
+        return _o
+        # DL end
+    # DL end
+
     if ver == 3:
         return fa3_flash_attn_with_kvcache(
             q,
@@ -254,6 +529,32 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
 ):
+
+    # DL begin
+    # DLIN: call FA2 (flash_attn pkg) directly for the prefill/varlen path.
+    from sglang.srt.utils.common import is_dlin as _is_dlin
+
+    if _is_dlin():
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func as _fa2_varlen
+
+        _o = _fa2_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        if out is not None:
+            out.copy_(_o)
+            return out
+        return _o
+    # DL end
 
     if ver == 3:
         return fa3_flash_attn_varlen_func(
