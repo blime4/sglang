@@ -651,6 +651,13 @@ class MambaAttnBackendBase(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
 
+    # DL begin — keep prefix-cache state scatter OUT of the compiled graph. This
+    # indexed state copy is not CUDA-graph-capturable; the old code accidentally
+    # kept it eager via an __import__("os") graph break at the call site, and
+    # removing that break deadlocked CG capture. torch.compiler.disable makes the
+    # break explicit+clean, and is a no-op when torch.compile is off (eager serving).
+    @torch.compiler.disable
+    # DL end
     def _track_mamba_state_decode(
         self,
         forward_batch: ForwardBatch,
@@ -672,6 +679,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 check_freed_slots=self.enable_unified_memory,
             )
 
+    # DL begin — same as decode: extend-time state scatter must run eager under
+    # torch.compile (not CG-capturable). No-op when compile is off.
+    @torch.compiler.disable
+    # DL end
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,

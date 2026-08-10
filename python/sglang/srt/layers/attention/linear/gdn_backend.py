@@ -32,6 +32,14 @@ if is_cuda() or is_hip():
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
+# DL begin — cache SGLANG_DL_SKIP_TRACK_MAMBA once at module load. The forward
+# previously read it via __import__("os").environ.get(...) inline, which dynamo
+# cannot trace (builtins.__import__ → graph break, 56+ breaks/compile). A plain
+# bool read at import is compile-friendly; semantically identical for a launch flag.
+import os as _dl_os
+_DL_SKIP_TRACK_MAMBA = bool(_dl_os.environ.get("SGLANG_DL_SKIP_TRACK_MAMBA"))
+# DL end
+
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
@@ -107,6 +115,31 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
+
+        # DL begin — DLIN compiled GDN decode+extend (vLLM _dl_C ops)
+        # Opt-in via SGLANG_DL_GDN_DLIN=1 on DLIN. decode=dl_recurrent_gated_delta_rule,
+        # extend=dl_chunk_gated_delta_rule (replaces sglang triton chunk which uses a
+        # custom initial_state_indices path that diverges from vLLM → wrong first token).
+        # verify stays on triton. EXTEND defaults to "1" (dl_chunk) since 2026-07-28:
+        # 8x faster prefill + correct output + sglang beats vLLM. Set EXTEND=0 to
+        # fall back to triton for debugging/rollback.
+        import os as _os
+        from sglang.srt.utils.common import is_dlin as _is_dlin
+        if _is_dlin() and _os.environ.get("SGLANG_DL_GDN_DLIN") == "1":
+            from sglang.srt.layers.attention.linear.kernels.gdn_dlin import DLinGDNKernel
+
+            self.decode_kernel = DLinGDNKernel()
+            _dl_extend = _os.environ.get("SGLANG_DL_GDN_DLIN_EXTEND", "1") == "1"
+            self.extend_kernel = DLinGDNKernel() if _dl_extend else triton_kernel
+            self.verify_kernel = triton_kernel
+            self.supports_packed_decode = False
+            rank0_log(
+                f"GDN kernel dispatcher: decode=DLinGDNKernel, "
+                f"extend={'DLinGDNKernel(dl_chunk)' if _dl_extend else 'TritonGDNKernel'}, "
+                f"verify=TritonGDNKernel packed_decode=False"
+            )
+            return
+        # DL end
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
@@ -351,6 +384,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ]
             )
 
+    # DL begin — the GDN recurrent decode kernel mutates ssm_states IN-PLACE;
+    # under torch.compile, Inductor's functionalization pass clones the entire
+    # ~1.7 GiB state before each mutation (×30 GDN layers → ~15 GiB → OOM at CG
+    # capture). Keep the GDN decode forward EAGER to avoid the clone (no-op when
+    # compile is off). Finer-grained: disable only the recurrent kernel call to
+    # preserve projection/norm fusion (Stage-1 refinement).
+    @torch.compiler.disable
+    # DL end
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -407,9 +448,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
-            self._track_mamba_state_decode(
-                forward_batch, conv_states, ssm_states, cache_indices
-            )
+            # DL begin — skip track_mamba when env set (saves 1 Triton kernel/layer)
+            if not _DL_SKIP_TRACK_MAMBA:
+                self._track_mamba_state_decode(
+                    forward_batch, conv_states, ssm_states, cache_indices
+                )
+            # DL end
             return core_attn_out
 
         query, key, value = torch.split(
@@ -436,9 +480,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
+        # DL begin
+        if not _DL_SKIP_TRACK_MAMBA:
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
+        # DL end
 
         return core_attn_out
 
