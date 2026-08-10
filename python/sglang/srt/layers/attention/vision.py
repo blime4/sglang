@@ -35,6 +35,10 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
+# DL begin
+from sglang.srt.utils.common import is_dlin
+# DL end
+
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
@@ -44,7 +48,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+    # DL begin
+    # DLIN is CUDA-shaped (is_cuda() is True) but ships no flashinfer package.
+    # Skip this import so eagerly importing multimodal models (e.g. via
+    # launch_server's model registry) does not crash with ModuleNotFoundError.
+    if not is_dlin():
+        from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
+    # DL end
 
     from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 
