@@ -363,6 +363,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture()
 
         self.raw_num_tokens = 0
+        self._dl_captured_attn_metadata = None  # DL: saved capture-time attn metadata for NO_BREAK CG
+        self._dl_captured_attn_metadata_list = []  # DL: per-inner-backend saved metadata (legacy)
+        self._dl_captured_attn_metadata_dict = {}  # DL: per-num_tokens saved metadata dict
         self.raw_bs = 0
 
     def _is_mamba_track_enabled(self) -> bool:
@@ -607,6 +610,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         attn_backend = self.model_runner.attn_backend
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
+            # DL begin — save the capture-time forward_metadata from each inner backend
+            # (HybridLinearAttnBackend has attn_backend_list, not forward_metadata itself).
+            # At replay, copy_ fresh values INTO these captured addresses.
+            inner_backends = getattr(attn_backend, "attn_backend_list", [attn_backend])
+            # DL: save metadata on the attn_backend (persists between capture/replay;
+            # the runner instance's state may not survive multiprocessing).
+            if not hasattr(attn_backend, "_dl_saved_meta_per_nt"):
+                attn_backend._dl_saved_meta_per_nt = {}
+            attn_backend._dl_saved_meta_per_nt[num_tokens] = [
+                getattr(ib, "forward_metadata", None) for ib in inner_backends
+            ]
+            import os as _dl_os3
+            if _dl_os3.environ.get("SGLANG_DL_CG_META_DEBUG") == "1":
+                print(f"[CG-META-CAPTURE] saved {len(attn_backend._dl_saved_meta_per_nt[num_tokens])} metadata objects "
+                      f"for num_tokens={num_tokens}, types={[type(m).__name__ if m else None for m in attn_backend._dl_saved_meta_per_nt[num_tokens]]}", flush=True)
+            # DL end
             return
         metadata = attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
             forward_batch
@@ -647,7 +666,61 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
+            # DL begin — NO_BREAK CG metadata fix. init_forward_metadata creates NEW tensor
+            # objects → captured graph reads stale addresses → garbled. Fix: call
+            # init_forward_metadata (builds fresh values), then copy_ each tensor field INTO
+            # the capture-time addresses saved in _dl_captured_attn_metadata_list.
+            # Traverse HybridLinearAttnBackend.attn_backend_list (wrapper has no forward_metadata).
+            # For tensors where fresh.shape != captured.shape (e.g. page_table depends on
+            # max_seq_len_k), copy into the captured tensor's leading slice and zero-pad.
             attn_backend.init_forward_metadata(forward_batch)
+            import torch as _dl_torch
+            inner_backends = getattr(attn_backend, "attn_backend_list", [attn_backend])
+            saved_list = getattr(attn_backend, "_dl_saved_meta_per_nt", {}).get(num_tokens, [])
+            import os as _dl_os4
+            if _dl_os4.environ.get("SGLANG_DL_CG_META_DEBUG") == "1":
+                _dl_dict = getattr(attn_backend, "_dl_saved_meta_per_nt", {})
+                print(f"[CG-META-REPLAY] num_tokens={num_tokens} saved_list len={len(saved_list)} "
+                      f"dict_keys={list(_dl_dict.keys())[:5]}", flush=True)
+            # DL: hardcode the tensor field names to avoid expensive dir() iteration.
+            _DL_META_TENSOR_FIELDS = (
+                "cache_seqlens_int32", "cu_seqlens_q", "cu_seqlens_k",
+                "fa_skip_cu_seqlens_q", "page_table", "swa_page_table",
+                "swa_out_cache_loc", "scheduler_metadata",
+                "encoder_cu_seqlens_k", "encoder_lens_int32", "encoder_page_table",
+            )
+            _DL_META_SCALAR_FIELDS = (
+                "max_seq_len_q", "max_seq_len_k", "fa_skip_max_seqlen_q",
+                "window_size", "encoder_max_seq_len_k",
+            )
+            for idx, inner in enumerate(inner_backends):
+                fresh = getattr(inner, "forward_metadata", None)
+                if idx < len(saved_list) and fresh is not None and saved_list[idx] is not None:
+                    captured = saved_list[idx]
+                    if fresh is not captured:
+                        for name in _DL_META_TENSOR_FIELDS:
+                            val = getattr(fresh, name, None)
+                            cap = getattr(captured, name, None)
+                            if isinstance(val, _dl_torch.Tensor) and isinstance(cap, _dl_torch.Tensor) and val.dtype == cap.dtype:
+                                if val.shape == cap.shape:
+                                    cap.copy_(val, non_blocking=True)
+                                elif val.ndim == cap.ndim and val.shape[0] == cap.shape[0]:
+                                    min_cols = min(val.shape[1] if val.ndim > 1 else 1,
+                                                   cap.shape[1] if cap.ndim > 1 else 1)
+                                    cap.zero_()
+                                    if val.ndim > 1:
+                                        cap[:, :min_cols].copy_(val[:, :min_cols], non_blocking=True)
+                                    else:
+                                        cap[:min_cols].copy_(val[:min_cols], non_blocking=True)
+                        for name in _DL_META_SCALAR_FIELDS:
+                            val = getattr(fresh, name, None)
+                            if val is not None:
+                                try:
+                                    object.__setattr__(captured, name, val)
+                                except Exception:
+                                    pass
+                        inner.forward_metadata = captured
+            # DL end
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
@@ -740,24 +813,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         start_loc_cpu = [0] + [num_tokens] * (bs - 1)
 
         with torch.device(self.device):
+            # DL begin — capture with seq_lens = context_length so the baked-in
+            # max_seq_len_k covers any real request. extend_seq_lens stays = num_tokens
+            # (query length = bucket). cu_seqlens_k (from copy_) bounds actual attention.
+            _dl_ctx = self.model_runner.server_args.context_length
             shape_inputs = {
                 "req_pool_indices": torch.arange(bs, device=self.device),
-                "seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "orig_seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "extend_seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "extend_prefix_lens": torch.zeros((bs,), dtype=torch.int64),
-                "extend_start_loc": torch.tensor(start_loc_cpu, device=self.device),
+                "seq_lens": torch.tensor([_dl_ctx], device=self.device),
+                "orig_seq_lens": torch.tensor([_dl_ctx], device=self.device),
+                "extend_seq_lens": torch.tensor([num_tokens], device=self.device),
+                "extend_prefix_lens": torch.tensor([0], device=self.device),
+                "extend_start_loc": torch.tensor([0], device=self.device),
             }
         if self._prefill_static_buffers is not None:
             s = self._prefill_static_buffers
-            s["seq_lens"][:bs].copy_(shape_inputs["seq_lens"])
-            s["extend_seq_lens"][:bs].copy_(shape_inputs["extend_seq_lens"])
+            s["seq_lens"][:bs].fill_(_dl_ctx)
+            s["extend_seq_lens"][:bs].fill_(num_tokens)
             s["extend_prefix_lens"][:bs].zero_()
             s["extend_start_loc"][:bs].copy_(shape_inputs["extend_start_loc"])
             s["req_pool_indices"][:bs].copy_(
                 torch.arange(bs, device=s["req_pool_indices"].device)
             )
-            s["orig_seq_lens"][:bs].copy_(shape_inputs["orig_seq_lens"])
+            s["orig_seq_lens"][:bs].fill_(_dl_ctx)
+            # DL end
             for name in _PREFILL_STATIC_FIELDS:
                 shape_inputs[name] = s[name][:bs]
 
@@ -1220,8 +1298,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def execute(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        # DL begin — timing instrumentation for CG replay breakdown
+        import os as _dl_exec_os, time as _dl_exec_time
+        _dl_timing = _dl_exec_os.environ.get("SGLANG_DL_CG_TIMING") == "1"
+        # DL end
         with self.backend.replay_session():
+            # DL begin
+            _dl_t0 = _dl_exec_time.perf_counter() if _dl_timing else 0
+            # DL end
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
+            # DL begin
+            _dl_t1 = _dl_exec_time.perf_counter() if _dl_timing else 0
+            # DL end
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
 
