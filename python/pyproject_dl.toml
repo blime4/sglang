@@ -28,7 +28,7 @@ runtime_common = [
   "aiohttp",
   "anthropic>=0.20.0",
   "apache-tvm-ffi==0.1.12",  # DL: pin to the version the dlcc patch (scripts/dl/tvm_ffi_cpp_extension_dl.patch) is cut against. Bump together with the patch + the dl_patch_tvm_ffi version guard.
-  "av",
+  "av ; platform_machine != 'loongarch64'",  # DL: no loong wheel + ffmpeg-devel unavailable on loong CI → exclude (video/multimedia not exercised by loong smoke gate)
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",

@@ -1,0 +1,17 @@
+# loongarch64-only constraints for the smoke install.
+# The LATEST version of many packages has no prebuilt loongarch64 wheel on
+# dl-virtual-loongarch64, so uv source-builds them — slow and sometimes
+# arch-incompatible (grpcio/BoringSSL). Each of these packages DOES ship a
+# loong wheel at a slightly older version, so pin to the newest wheeled version.
+# Applied only on loongarch64 (see install_sglang_wheel in
+# scripts/run/inside_container/utils.sh). Verified against the loong mirror.
+#
+# Still source-built (no loong wheel for any version): outlines-core (rust),
+# torchao (gcc), xgrammar (cmake) — toolchain installed via
+# ensure_loong_native_builddeps.
+
+grpcio==1.80.0      # 1.83 source-build fails (BoringSSL arch incompat). wheel @ 1.80.0
+pyarrow==24.0.0     # 25.0 has no loong wheel. wheel @ 24.0.0
+scipy==1.17.1       # 1.18 has no loong wheel (avoids the openblas source-build). wheel @ 1.17.1
+pillow==12.2.0      # 12.3 has no loong wheel. wheel @ 12.2.0
+tiktoken==0.13.0    # latest has no loong wheel. wheel @ 0.13.0

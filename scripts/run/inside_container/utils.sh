@@ -20,6 +20,82 @@ install_container_missing_wheels() {
   uv pip install ${sdk_path}/python/pynvml-1.0.0-py3-none-any.whl
 }
 
+# DL begin
+# loongarch64 has no prebuilt dl-virtual wheels for several native sglang
+# runtime deps (outlines-core, tiktoken, xgrammar, pillow, ...), so uv builds
+# them from source. av/PyAV is platform-gated off loong (no ffmpeg-devel in the
+# OpenCloudOS base repos). Install the system build deps the rest need:
+# cargo/rustc (outlines-core, tiktoken), pkgconfig + cmake (xgrammar, general),
+# gfortran + openblas (scipy), image codec devel libs (pillow). No-op on
+# x86_64/aarch64 (prebuilt wheels).
+ensure_loong_native_builddeps() {
+  if [[ "$(uname -m)" != "loongarch64" ]]; then
+    return 0
+  fi
+  # Curated set; installed individually so one missing pkg doesn't abort others.
+  local -a deps=(rust cargo pkgconfig cmake gcc-gfortran openblas-devel \
+    zlib-devel libjpeg-turbo-devel freetype-devel libtiff-devel libwebp-devel)
+  local mgr
+  if command -v dnf >/dev/null 2>&1; then mgr=dnf
+  elif command -v yum >/dev/null 2>&1; then mgr=yum
+  else echo "[warn] no dnf/yum — cannot install loong native build deps"; return 0; fi
+  echo "[info] loongarch64: installing native build deps via $mgr (best-effort per pkg)"
+  local p
+  for p in "${deps[@]}"; do
+    case "$p" in
+      pkgconfig) $mgr install -y pkgconfig pkgconf-pkg-config 2>/dev/null || echo "[warn] $mgr install 'pkgconfig' failed" ;;
+      *) $mgr install -y "$p" 2>/dev/null || echo "[warn] $mgr install '$p' failed" ;;
+    esac
+  done
+  # rustup fallback if the system package lacked rust+cargo.
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "[info] trying rustup fallback (sh.rustup.rs)"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs 2>/dev/null \
+      | sh -s -- -y --profile minimal --default-toolchain stable \
+      || echo "[warn] rustup failed — outlines-core/tiktoken source builds will fail"
+    # shellcheck disable=SC1091
+    source "${HOME}/.cargo/env" 2>/dev/null || true
+    export PATH="${HOME}/.cargo/bin:${PATH}"
+  fi
+  command -v cargo >/dev/null 2>&1 && echo "[info] rust ready: $(rustc --version 2>/dev/null)" \
+    || echo "[warn] rust still missing"
+  # scipy's meson resolves OpenBLAS via pkg-config. OpenCloudOS's openblas-devel
+  # ships libopenblas.so but NO openblas.pc, so scipy fails ('OpenBLAS not
+  # found'). If pkg-config can't see openblas, generate a minimal openblas.pc
+  # pointing at the installed lib. (Durable fix: bake into image — see
+  # docs/dl/ci-loongarch64-native-deps.md.)
+  if pkg-config --exists openblas 2>/dev/null; then
+    echo "[info] openblas visible to pkg-config ($(pkg-config --modversion openblas 2>/dev/null))"
+  else
+    local libso libdir pcdir incdir oblaver
+    libso="$(find /usr/lib* -name 'libopenblas.so' 2>/dev/null | head -1)"
+    pcdir="$(find /usr/lib* -type d -name pkgconfig 2>/dev/null | head -1)"
+    incdir="$(dirname "$(find /usr/include -name 'cblas.h' 2>/dev/null | head -1)" 2>/dev/null)"
+    libdir="$(dirname "${libso:-/usr/lib64/libopenblas.so}")"
+    oblaver="$(rpm -q --qf '%{VERSION}' openblas-devel 2>/dev/null | head -1)"; oblaver="${oblaver:-0.3.26}"
+    if [ -n "$libso" ] && [ -n "$pcdir" ]; then
+      cat > "${pcdir}/openblas.pc" <<EOF
+prefix=/usr
+exec_prefix=\${prefix}
+libdir=${libdir}
+includedir=${incdir:-/usr/include}
+
+Name: OpenBLAS
+Description: OpenBLAS shim (OpenCloudOS openblas-devel ships no .pc)
+Version: ${oblaver}
+Libs: -L\${libdir} -lopenblas
+Cflags: -I\${includedir}
+EOF
+      pkg-config --exists openblas 2>/dev/null \
+        && echo "[info] generated ${pcdir}/openblas.pc -> openblas visible ($(pkg-config --libs openblas 2>/dev/null))" \
+        || echo "[warn] generated openblas.pc but pkg-config --exists openblas still fails"
+    else
+      echo "[warn] libopenblas.so ($libso) or pkgconfig dir ($pcdir) not found — scipy build will fail"
+    fi
+  fi
+}
+# DL end
+
 install_build_dependencies() {
   echo "[info] install build wheels"
   : "${VIRTUAL_ENV:?VIRTUAL_ENV must be set for build dependency installation}"
@@ -54,7 +130,13 @@ install_sglang_wheel() {
   # Install the built wheel WITH the srt_dl extra: sglang's heavy runtime deps
   # (orjson/aiohttp/pydantic/...) live in extras (runtime_common), not the
   # wheel's core requires, so a bare wheel install omits them.
-  uv pip install -c "${test_requirements}" "${1}[srt_dl]"
+  local -a constraint_args=(-c "${test_requirements}")
+  if [[ "${ARCH}" == "loongarch64" ]]; then
+    # loong-only pins: some packages' latest version has no loong wheel and
+    # fails to source-build; pin to a version that ships a loong wheel.
+    constraint_args+=(-c "${repo_path}/requirements/test/dl_loongarch64.txt")
+  fi
+  uv pip install "${constraint_args[@]}" "${1}[srt_dl]"
 }
 
 install_config_env_specified_dependencies() {
@@ -106,6 +188,7 @@ install_config_env_specified_dependencies() {
 }
 
 install_wheels() {
+  ensure_loong_native_builddeps
   if [[ "$case_type" == "build" ]]; then
     install_build_dependencies
   else

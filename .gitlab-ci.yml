@@ -118,11 +118,14 @@ compile_test_sglang_loongarch64:
   stage: compile_test_sglang
   tags:
     - build-loongarch64
-  # loongarch64 is best-effort for now: sglang[srt_dl] pulls outlines →
-  # outlines-core, a Rust extension with no prebuilt loongarch64 wheel on
-  # dl-virtual, and the runtime image has no Rust compiler, so the wheel build
-  # fails ('can't find Rust compiler'). x86_64 + aarch64 fully gate the MR.
-  # Flip to required once outlines-core (or a loong Rust toolchain) is available.
+  # loongarch64 smoke is GREEN (pipeline #20361). Bridged the loong wheel gap
+  # in-job: scripts/run/inside_container/utils.sh ensure_loong_native_builddeps()
+  # installs rust/gfortran/openblas/cmake/image-codec-devel + generates
+  # openblas.pc, and requirements/test/dl_loongarch64.txt pins heavy deps to
+  # versions that ship loong wheels (grpcio/pyarrow/scipy/pillow/tiktoken).
+  # Kept allow_failure:true for now (the in-job path is slower ~20min and more
+  # fragile than wheels-in-image); flip to required once the c-41 image bakes
+  # the toolchain + wheels (see docs/dl/loongarch64-ci-image-requirements.md).
   allow_failure: true
   rules:
     - when: on_success
